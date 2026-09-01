@@ -1,0 +1,18 @@
+[package]
+name = "music-editor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+mega-audio = { path = "../../../rust_lib/mega/audio" }
+mega-ui = { path = "../../../rust_lib/mega/ui", features = ["wgpu"] }
+glam = "0.33.2"
+wgpu = "30"
+winit = "0.30"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+env_logger = "0.11"
+arboard = "3"
+
+[target.'cfg(windows)'.dependencies]
+windows = "0.62"
