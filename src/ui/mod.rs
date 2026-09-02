@@ -35,14 +35,20 @@ impl Scene for App {
         _viewport: Vec2,
         _dt: f32,
         _stats: DrawStats,
-        _keys: &KeyEvents,
+        keys: &KeyEvents,
     ) -> bool {
+        if keys.save {
+            state.save();
+        }
         ui.menu_bar(|ui| {
             ui.menu("Graph", |ui| {
-                if ui.menu_item("Open JSON...").clicked() {
+                if ui.menu_item("Open...").clicked() {
                     state.open_dialog();
                 }
-                if ui.menu_item("Save JSON...").clicked() {
+                if ui.menu_item("Save").clicked() {
+                    state.save();
+                }
+                if ui.menu_item("Save As...").clicked() {
                     state.save_dialog();
                 }
                 ui.separator();

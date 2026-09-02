@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use mega_audio::events::{event_channel, EventSender};
@@ -5,7 +6,7 @@ use mega_audio::{AudioEngine, GraphSetup};
 use mega_ui::DockState;
 
 use crate::compile::{Live, Patch};
-use crate::graph::GraphDoc;
+use crate::graph::{with_graph_ext, FILE_EXT, GraphDoc};
 use crate::monitor::Monitor;
 use crate::ui::default_dock;
 
@@ -15,6 +16,7 @@ pub struct App {
     pub playing: bool,
     pub monitor: Arc<Monitor>,
     pub status: String,
+    current_path: Option<PathBuf>,
     last_fp: u64,
     last_playing: bool,
     last_seek_gen: u64,
@@ -53,6 +55,7 @@ impl App {
             playing: false,
             monitor,
             status: String::new(),
+            current_path: None,
             tx,
             _engine: engine,
         })
@@ -72,26 +75,45 @@ impl App {
         let _ = self.tx.send(Patch::from_doc(&self.graph, self.playing));
     }
 
+    pub fn save(&mut self) {
+        if let Some(path) = self.current_path.clone() {
+            self.write_to(path);
+        } else {
+            self.save_dialog();
+        }
+    }
+
     pub fn save_dialog(&mut self) {
+        let fallback = format!("graph.{FILE_EXT}");
+        let name = self
+            .current_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or(&fallback);
         let path = rfd::FileDialog::new()
-            .add_filter("Music graph", &["json"])
-            .set_file_name("graph.json")
+            .add_filter("Music graph", &[FILE_EXT, "json"])
+            .set_file_name(name)
             .save_file();
-        let Some(mut path) = path else {
+        let Some(path) = path else {
             return;
         };
-        if path.extension().is_none() {
-            path.set_extension("json");
-        }
+        self.write_to(with_graph_ext(path));
+    }
+
+    fn write_to(&mut self, path: PathBuf) {
         match self.graph.save_to_path(&path) {
-            Ok(()) => self.status = format!("Saved {}", path.display()),
+            Ok(()) => {
+                self.status = format!("Saved {}", path.display());
+                self.current_path = Some(path);
+            }
             Err(e) => self.status = format!("Save failed: {e}"),
         }
     }
 
     pub fn open_dialog(&mut self) {
         let path = rfd::FileDialog::new()
-            .add_filter("Music graph", &["json"])
+            .add_filter("Music graph", &[FILE_EXT, "json"])
             .pick_file();
         let Some(path) = path else {
             return;
@@ -100,6 +122,7 @@ impl App {
             Ok(graph) => {
                 self.graph = graph;
                 self.playing = false;
+                self.current_path = Some(path.clone());
                 self.status = format!("Opened {}", path.display());
             }
             Err(e) => self.status = format!("Open failed: {e}"),

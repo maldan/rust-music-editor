@@ -1,11 +1,15 @@
 use std::sync::Arc;
 
 use glam::Vec2;
-use mega_ui::{NodePortSide, PlotView, Ui};
+use mega_ui::{
+    AnimationCurve, CurvePoint, CurvePreset, NodePortSide, PlotView, Ui, flat_pass_curve,
+};
 
 use crate::compile::WAVEFORMS;
+use crate::fft::{freq_ticks, SPEC_BINS, SPEC_COLS};
 use crate::graph::{
-    port, GraphDoc, GraphNode, NodeKind, NOTE_JOIN_INS, SEQ_MAX_BARS, SEQ_OCTAVE_MIN,
+    port, ARP_NAMES, CHORD_NAMES, EqPt, GraphDoc, GraphNode, NodeKind, MIX_INS, NOTE_JOIN_INS,
+    SEQ_MAX_BARS, SEQ_OCTAVE_MIN,
 };
 use crate::monitor::Monitor;
 
@@ -18,7 +22,7 @@ pub fn draw(ui: &mut Ui, doc: &mut GraphDoc, monitor: &Arc<Monitor>) -> bool {
 
     let mut spawn_at: Option<(NodeKind, Vec2)> = None;
 
-    {
+    let (bg, world, opened) = {
         let space = &mut doc.space;
         let nodes = &mut doc.nodes;
 
@@ -46,13 +50,22 @@ pub fn draw(ui: &mut Ui, doc: &mut GraphDoc, monitor: &Arc<Monitor>) -> bool {
 
         let bg = space.background_hovered;
         let world = space.context_world.unwrap_or(Vec2::new(80.0, 80.0));
-        let mut spawn_kind = None;
-        ui.context_menu("music_spawn", bg, |ui| {
-            spawn_kind = spawn_menu(ui);
-        });
-        if let Some(kind) = spawn_kind {
-            spawn_at = Some((kind, world));
-        }
+        let opened = space.context_menu_request;
+        (bg, world, opened)
+    };
+
+    if opened {
+        doc.spawn_menu_page = 0;
+    }
+    let mut spawn_kind = None;
+    ui.context_menu("music_spawn", bg, |ui| {
+        spawn_kind = spawn_menu(ui, &mut doc.spawn_menu_page);
+    });
+    if !ui.context_menu_open() {
+        doc.spawn_menu_page = 0;
+    }
+    if let Some(kind) = spawn_kind {
+        spawn_at = Some((kind, world));
     }
 
     if let Some((kind, world)) = spawn_at {
@@ -63,64 +76,77 @@ pub fn draw(ui: &mut Ui, doc: &mut GraphDoc, monitor: &Arc<Monitor>) -> bool {
     keep
 }
 
-fn spawn_menu(ui: &mut Ui) -> Option<NodeKind> {
-    let mut kind = None;
-    if ui.menu_item("Clock").clicked() {
-        kind = Some(NodeKind::Clock);
+fn spawn_menu(ui: &mut Ui, page: &mut u8) -> Option<NodeKind> {
+    const ROOT: u8 = 0;
+    const NOTES: u8 = 1;
+    const SOUND: u8 = 2;
+    const FX: u8 = 3;
+    const MATH: u8 = 4;
+
+    fn leaf(ui: &mut Ui, label: &str, kind: NodeKind) -> Option<NodeKind> {
+        ui.menu_item(label).clicked().then_some(kind)
     }
-    if ui.menu_item("Sequencer").clicked() {
-        kind = Some(NodeKind::Sequencer);
+    fn go(ui: &mut Ui, label: &str, page: &mut u8, to: u8) {
+        if ui.menu_item_submenu(label).clicked() {
+            *page = to;
+        }
     }
-    if ui.menu_item("Voice").clicked() {
-        kind = Some(NodeKind::Voice);
+    fn back(ui: &mut Ui, page: &mut u8) {
+        if ui.menu_item_keep_open("Back").clicked() {
+            *page = ROOT;
+        }
     }
-    if ui.menu_item("Join Notes").clicked() {
-        kind = Some(NodeKind::NoteJoin);
+
+    match *page {
+        NOTES => {
+            back(ui, page);
+            ui.separator();
+            leaf(ui, "Clock", NodeKind::Clock)
+                .or_else(|| leaf(ui, "Sequencer", NodeKind::Sequencer))
+                .or_else(|| leaf(ui, "Voice", NodeKind::Voice))
+                .or_else(|| leaf(ui, "Join Notes", NodeKind::NoteJoin))
+                .or_else(|| leaf(ui, "Transpose", NodeKind::Transpose))
+                .or_else(|| leaf(ui, "Chord", NodeKind::Chord))
+                .or_else(|| leaf(ui, "Arp", NodeKind::Arp))
+                .or_else(|| leaf(ui, "Notes", NodeKind::NoteScope))
+        }
+        SOUND => {
+            back(ui, page);
+            ui.separator();
+            leaf(ui, "Oscillator", NodeKind::Osc)
+                .or_else(|| leaf(ui, "LFO", NodeKind::Lfo))
+                .or_else(|| leaf(ui, "Filter", NodeKind::Filter))
+                .or_else(|| leaf(ui, "Gain", NodeKind::Gain))
+                .or_else(|| leaf(ui, "Join Audio", NodeKind::Mix))
+                .or_else(|| leaf(ui, "Mixer", NodeKind::Mixer))
+                .or_else(|| leaf(ui, "Waveform", NodeKind::Scope))
+                .or_else(|| leaf(ui, "Spectrum", NodeKind::Spectrum))
+                .or_else(|| leaf(ui, "Spectrogram", NodeKind::Spectrogram))
+        }
+        FX => {
+            back(ui, page);
+            ui.separator();
+            leaf(ui, "Delay / Echo", NodeKind::Delay)
+                .or_else(|| leaf(ui, "Distortion", NodeKind::Distortion))
+                .or_else(|| leaf(ui, "Chorus", NodeKind::Chorus))
+                .or_else(|| leaf(ui, "Flanger", NodeKind::Flanger))
+                .or_else(|| leaf(ui, "EQ Curve", NodeKind::Eq))
+        }
+        MATH => {
+            back(ui, page);
+            ui.separator();
+            leaf(ui, "Multiply", NodeKind::Mul)
+                .or_else(|| leaf(ui, "Clamp", NodeKind::Clamp))
+                .or_else(|| leaf(ui, "Remap", NodeKind::Remap))
+        }
+        _ => {
+            go(ui, "Notes", page, NOTES);
+            go(ui, "Sound", page, SOUND);
+            go(ui, "Effects", page, FX);
+            go(ui, "Math", page, MATH);
+            None
+        }
     }
-    if ui.menu_item("Transpose").clicked() {
-        kind = Some(NodeKind::Transpose);
-    }
-    if ui.menu_item("Notes").clicked() {
-        kind = Some(NodeKind::NoteScope);
-    }
-    ui.separator();
-    if ui.menu_item("Oscillator").clicked() {
-        kind = Some(NodeKind::Osc);
-    }
-    if ui.menu_item("LFO").clicked() {
-        kind = Some(NodeKind::Lfo);
-    }
-    if ui.menu_item("Filter").clicked() {
-        kind = Some(NodeKind::Filter);
-    }
-    if ui.menu_item("Gain").clicked() {
-        kind = Some(NodeKind::Gain);
-    }
-    if ui.menu_item("Join Audio").clicked() {
-        kind = Some(NodeKind::Mix);
-    }
-    if ui.menu_item("Waveform").clicked() {
-        kind = Some(NodeKind::Scope);
-    }
-    if ui.menu_item("Delay / Echo").clicked() {
-        kind = Some(NodeKind::Delay);
-    }
-    if ui.menu_item("Distortion").clicked() {
-        kind = Some(NodeKind::Distortion);
-    }
-    if ui.menu_item("Chorus").clicked() {
-        kind = Some(NodeKind::Chorus);
-    }
-    if ui.menu_item("Multiply").clicked() {
-        kind = Some(NodeKind::Mul);
-    }
-    if ui.menu_item("Clamp").clicked() {
-        kind = Some(NodeKind::Clamp);
-    }
-    if ui.menu_item("Remap").clicked() {
-        kind = Some(NodeKind::Remap);
-    }
-    kind
 }
 
 fn draw_body(ui: &mut Ui, node: &mut GraphNode, monitor: &Monitor) {
@@ -185,6 +211,17 @@ fn draw_body(ui: &mut Ui, node: &mut GraphNode, monitor: &Monitor) {
             labeled_slider(ui, "Resonance", &mut node.q, 0.3..=8.0);
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
+        NodeKind::Eq => {
+            ui.node_port(NodePortSide::Input, "in", port::AUDIO);
+            ui.label("Pass (top) / cut (bottom)");
+            let mut curve = eq_to_curve(&node.eq_pts);
+            let ticks = freq_ticks(48_000.0);
+            let resp = ui.eq_curve_editor("eq", &mut curve, Vec2::new(320.0, 140.0), &ticks);
+            if resp.changed {
+                node.eq_pts = curve_to_eq(&curve);
+            }
+            ui.node_port(NodePortSide::Output, "out", port::AUDIO);
+        }
         NodeKind::Gain => {
             ui.node_port(NodePortSide::Input, "in", port::AUDIO);
             labeled_slider(ui, "Volume", &mut node.gain, 0.0..=1.5);
@@ -206,6 +243,23 @@ fn draw_body(ui: &mut Ui, node: &mut GraphNode, monitor: &Monitor) {
             ui.drag_float("t_steps", &mut node.transpose_steps, 0.25);
             ui.node_port(NodePortSide::Output, "out", port::NOTES);
         }
+        NodeKind::Chord => {
+            ui.node_port(NodePortSide::Input, "in", port::NOTES);
+            ui.select("chord", &mut node.chord_kind, &CHORD_NAMES);
+            node.chord_kind = node.chord_kind.min(CHORD_NAMES.len() - 1);
+            ui.node_port(NodePortSide::Output, "out", port::NOTES);
+        }
+        NodeKind::Arp => {
+            ui.node_port(NodePortSide::Input, "in", port::NOTES);
+            ui.select("chord", &mut node.chord_kind, &CHORD_NAMES);
+            node.chord_kind = node.chord_kind.min(CHORD_NAMES.len() - 1);
+            ui.select("arp_dir", &mut node.arp_mode, &ARP_NAMES);
+            node.arp_mode = node.arp_mode.min(ARP_NAMES.len() - 1);
+            ui.label("Rate, 16ths");
+            ui.drag_float("arp_rate", &mut node.arp_rate, 0.25);
+            node.arp_rate = node.arp_rate.clamp(0.25, 8.0);
+            ui.node_port(NodePortSide::Output, "out", port::NOTES);
+        }
         NodeKind::Mix => {
             ui.node_port(NodePortSide::Input, "a", port::AUDIO);
             ui.node_port(NodePortSide::Input, "b", port::AUDIO);
@@ -213,11 +267,43 @@ fn draw_body(ui: &mut Ui, node: &mut GraphNode, monitor: &Monitor) {
             labeled_slider(ui, "Volume B", &mut node.mix_b, 0.0..=1.5);
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
+        NodeKind::Mixer => {
+            node.ensure_mix_strips();
+            for (i, name) in MIX_INS.iter().enumerate() {
+                ui.node_port(NodePortSide::Input, name, port::AUDIO);
+                ui.row(|ui| {
+                    labeled_slider(ui, &format!("Vol {name}"), &mut node.mix_strips[i].vol, 0.0..=1.5);
+                    labeled_slider(ui, &format!("Pan {name}"), &mut node.mix_strips[i].pan, -1.0..=1.0);
+                });
+            }
+            ui.node_port(NodePortSide::Output, "out", port::AUDIO);
+        }
         NodeKind::Scope => {
             ui.node_port(NodePortSide::Input, "in", port::AUDIO);
             let samples = monitor.scope_samples(&node.id);
             let view = PlotView::new(0.0, 1.0, -1.0, 1.0);
             ui.plot_with_view("wave", Vec2::new(0.0, 72.0), &samples, &view);
+            ui.node_port(NodePortSide::Output, "out", port::AUDIO);
+        }
+        NodeKind::Spectrum => {
+            ui.node_port(NodePortSide::Input, "in", port::AUDIO);
+            let bins = monitor.spectrum(&node.id);
+            let ticks = freq_ticks(48_000.0);
+            ui.plot_bars("fft", Vec2::new(320.0, 96.0), &bins, &ticks);
+            ui.node_port(NodePortSide::Output, "out", port::AUDIO);
+        }
+        NodeKind::Spectrogram => {
+            ui.node_port(NodePortSide::Input, "in", port::AUDIO);
+            let cells = monitor.spectrogram(&node.id);
+            let ticks = freq_ticks(48_000.0);
+            ui.plot_heatmap(
+                "gram",
+                Vec2::new(400.0, 140.0),
+                SPEC_COLS,
+                SPEC_BINS,
+                &cells,
+                &ticks,
+            );
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
         NodeKind::NoteScope => {
@@ -251,6 +337,22 @@ fn draw_body(ui: &mut Ui, node: &mut GraphNode, monitor: &Monitor) {
             ui.label("Mix");
             ui.drag_float("ch_mix", &mut node.chorus_mix, 0.05);
             node.chorus_mix = node.chorus_mix.clamp(0.0, 1.0);
+            ui.node_port(NodePortSide::Output, "out", port::AUDIO);
+        }
+        NodeKind::Flanger => {
+            ui.node_port(NodePortSide::Input, "in", port::AUDIO);
+            ui.label("Rate, Hz");
+            ui.drag_float("fl_rate", &mut node.flange_rate, 0.05);
+            node.flange_rate = node.flange_rate.max(0.01);
+            ui.label("Depth");
+            ui.drag_float("fl_depth", &mut node.flange_depth, 0.05);
+            node.flange_depth = node.flange_depth.clamp(0.0, 1.0);
+            ui.label("Feedback");
+            ui.drag_float("fl_fb", &mut node.flange_feedback, 0.05);
+            node.flange_feedback = node.flange_feedback.clamp(0.0, 0.95);
+            ui.label("Mix");
+            ui.drag_float("fl_mix", &mut node.flange_mix, 0.05);
+            node.flange_mix = node.flange_mix.clamp(0.0, 1.0);
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
         NodeKind::Mul => {
@@ -301,4 +403,32 @@ fn roll_chrome(ui: &mut Ui, node: &mut GraphNode) {
 fn labeled_slider(ui: &mut Ui, name: &str, value: &mut f32, range: std::ops::RangeInclusive<f32>) {
     ui.label(name);
     ui.slider(name, value, range);
+}
+
+fn eq_to_curve(pts: &[EqPt]) -> AnimationCurve {
+    if pts.len() < 2 {
+        return flat_pass_curve();
+    }
+    AnimationCurve {
+        points: pts
+            .iter()
+            .map(|p| CurvePoint {
+                t: p.t.clamp(0.0, 1.0),
+                v: p.v.clamp(0.0, 1.0),
+                tangent_out: 0.0,
+            })
+            .collect(),
+        preset: CurvePreset::Custom,
+    }
+}
+
+fn curve_to_eq(curve: &AnimationCurve) -> Vec<EqPt> {
+    curve
+        .points
+        .iter()
+        .map(|p| EqPt {
+            t: p.t.clamp(0.0, 1.0),
+            v: p.v.clamp(0.0, 1.0),
+        })
+        .collect()
 }

@@ -15,6 +15,8 @@ pub struct GraphDoc {
     pub play_from: i32,
     pub seek_gen: u64,
     pub seek_beats: f64,
+    /// Drill-down page of the node spawn context menu (0 = root).
+    pub spawn_menu_page: u8,
 }
 
 impl GraphDoc {
@@ -33,6 +35,7 @@ impl GraphDoc {
             play_from: 1,
             seek_gen: 0,
             seek_beats: 0.0,
+            spawn_menu_page: 0,
         }
     }
 
@@ -207,8 +210,17 @@ impl GraphDoc {
             n.chorus_rate.to_bits().hash(&mut h);
             n.chorus_depth.to_bits().hash(&mut h);
             n.chorus_mix.to_bits().hash(&mut h);
+            n.flange_rate.to_bits().hash(&mut h);
+            n.flange_depth.to_bits().hash(&mut h);
+            n.flange_feedback.to_bits().hash(&mut h);
+            n.flange_mix.to_bits().hash(&mut h);
             n.mix_a.to_bits().hash(&mut h);
             n.mix_b.to_bits().hash(&mut h);
+            n.mix_strips.len().hash(&mut h);
+            for s in &n.mix_strips {
+                s.vol.to_bits().hash(&mut h);
+                s.pan.to_bits().hash(&mut h);
+            }
             n.seq_when.hash(&mut h);
             n.seq_loop_bars.hash(&mut h);
             n.notes.len().hash(&mut h);
@@ -220,10 +232,18 @@ impl GraphDoc {
             n.transpose_notes.hash(&mut h);
             n.transpose_octaves.hash(&mut h);
             n.transpose_steps.to_bits().hash(&mut h);
+            n.chord_kind.hash(&mut h);
+            n.arp_mode.hash(&mut h);
+            n.arp_rate.to_bits().hash(&mut h);
             n.adsr_attack.to_bits().hash(&mut h);
             n.adsr_decay.to_bits().hash(&mut h);
             n.adsr_sustain.to_bits().hash(&mut h);
             n.adsr_release.to_bits().hash(&mut h);
+            n.eq_pts.len().hash(&mut h);
+            for p in &n.eq_pts {
+                p.t.to_bits().hash(&mut h);
+                p.v.to_bits().hash(&mut h);
+            }
         }
         self.bpm.to_bits().hash(&mut h);
         h.finish()

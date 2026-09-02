@@ -4,6 +4,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::fft::{SPEC_BINS, SPEC_COLS};
+
 pub const SCOPE_LEN: usize = 512;
 
 pub struct ScopeBuf {
@@ -33,6 +35,73 @@ impl ScopeBuf {
         for i in 0..SCOPE_LEN {
             let idx = (w + i) % SCOPE_LEN;
             out[i] = f32::from_bits(self.samples[idx].load(Ordering::Relaxed));
+        }
+        out
+    }
+}
+
+/// Latest log-FFT column plus a time ring for spectrogram.
+pub struct FftBuf {
+    latest: Box<[AtomicU32]>,
+    cells: Box<[AtomicU32]>,
+    write: AtomicUsize,
+}
+
+impl FftBuf {
+    fn new() -> Self {
+        Self {
+            latest: (0..SPEC_BINS)
+                .map(|_| AtomicU32::new(0))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            cells: (0..SPEC_COLS * SPEC_BINS)
+                .map(|_| AtomicU32::new(0))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            write: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn push_bins(&self, bins: &[f32]) {
+        let n = bins.len().min(SPEC_BINS);
+        for i in 0..n {
+            self.latest[i].store(bins[i].to_bits(), Ordering::Relaxed);
+        }
+        let c = self.write.fetch_add(1, Ordering::Relaxed) % SPEC_COLS;
+        let base = c * SPEC_BINS;
+        for i in 0..n {
+            self.cells[base + i].store(bins[i].to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    pub fn spectrum(&self) -> Vec<f32> {
+        self.latest
+            .iter()
+            .map(|a| f32::from_bits(a.load(Ordering::Relaxed)))
+            .collect()
+    }
+
+    pub fn spectrogram(&self) -> Vec<f32> {
+        let w = self.write.load(Ordering::Relaxed);
+        let mut out = vec![0.0; SPEC_COLS * SPEC_BINS];
+        let filled = w.min(SPEC_COLS);
+        if filled == 0 {
+            return out;
+        }
+        for t in 0..SPEC_COLS {
+            let src_col = if w < SPEC_COLS {
+                if t < SPEC_COLS - filled {
+                    continue;
+                }
+                t - (SPEC_COLS - filled)
+            } else {
+                (w + t) % SPEC_COLS
+            };
+            let src = src_col * SPEC_BINS;
+            let dst = t * SPEC_BINS;
+            for i in 0..SPEC_BINS {
+                out[dst + i] = f32::from_bits(self.cells[src + i].load(Ordering::Relaxed));
+            }
         }
         out
     }
@@ -85,6 +154,7 @@ impl PitchSet {
 pub struct Monitor {
     playheads: Mutex<HashMap<String, Arc<AtomicU32>>>,
     scopes: Mutex<HashMap<String, Arc<ScopeBuf>>>,
+    ffts: Mutex<HashMap<String, Arc<FftBuf>>>,
     notes: Mutex<HashMap<String, Arc<PitchSet>>>,
     song_beats: AtomicU64,
 }
@@ -125,6 +195,29 @@ impl Monitor {
         buf.map(|b| b.snapshot()).unwrap_or_default()
     }
 
+    pub fn fft_buf(&self, id: &str) -> Arc<FftBuf> {
+        let mut m = self.ffts.lock().unwrap_or_else(|e| e.into_inner());
+        m.entry(id.to_string())
+            .or_insert_with(|| Arc::new(FftBuf::new()))
+            .clone()
+    }
+
+    pub fn spectrum(&self, id: &str) -> Vec<f32> {
+        let buf = {
+            let m = self.ffts.lock().unwrap_or_else(|e| e.into_inner());
+            m.get(id).cloned()
+        };
+        buf.map(|b| b.spectrum()).unwrap_or_default()
+    }
+
+    pub fn spectrogram(&self, id: &str) -> Vec<f32> {
+        let buf = {
+            let m = self.ffts.lock().unwrap_or_else(|e| e.into_inner());
+            m.get(id).cloned()
+        };
+        buf.map(|b| b.spectrogram()).unwrap_or_default()
+    }
+
     pub fn note_slot(&self, id: &str) -> Arc<PitchSet> {
         let mut m = self.notes.lock().unwrap_or_else(|e| e.into_inner());
         m.entry(id.to_string())
@@ -138,5 +231,28 @@ impl Monitor {
             m.get(id).cloned()
         };
         slot.map(|s| s.load()).unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fft::SPEC_BINS;
+
+    #[test]
+    fn spectrogram_pads_left_newest_right() {
+        let b = FftBuf::new();
+        let mut a = vec![0.0; SPEC_BINS];
+        a[0] = 1.0;
+        b.push_bins(&a);
+        let mut c = vec![0.0; SPEC_BINS];
+        c[3] = 1.0;
+        b.push_bins(&c);
+        let g = b.spectrogram();
+        let last = (SPEC_COLS - 1) * SPEC_BINS;
+        let prev = (SPEC_COLS - 2) * SPEC_BINS;
+        assert_eq!(g[last + 3], 1.0);
+        assert_eq!(g[prev], 1.0);
+        assert_eq!(g[0], 0.0);
     }
 }

@@ -17,6 +17,7 @@ pub const BEATS_PER_STEP: f32 = 0.25;
 /// 16 sixteenths = 4 beats = 1 bar in 4/4.
 pub const BEATS_PER_BAR: f32 = SEQ_STEPS as f32 * BEATS_PER_STEP;
 pub const NOTE_JOIN_INS: [&str; 8] = ["1", "2", "3", "4", "5", "6", "7", "8"];
+pub const MIX_INS: [&str; 8] = NOTE_JOIN_INS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct SeqNote {
@@ -33,15 +34,22 @@ pub enum NodeKind {
     Filter,
     Gain,
     Mix,
+    Mixer,
     NoteJoin,
     Transpose,
+    Chord,
+    Arp,
     Delay,
     Distortion,
     Chorus,
+    Flanger,
+    Eq,
     Mul,
     Clamp,
     Remap,
     Scope,
+    Spectrum,
+    Spectrogram,
     NoteScope,
     Clock,
     Sequencer,
@@ -57,15 +65,22 @@ impl NodeKind {
             Self::Filter => "Filter",
             Self::Gain => "Gain",
             Self::Mix => "Join Audio",
+            Self::Mixer => "Mixer",
             Self::NoteJoin => "Join Notes",
             Self::Transpose => "Transpose",
+            Self::Chord => "Chord",
+            Self::Arp => "Arp",
             Self::Delay => "Delay / Echo",
             Self::Distortion => "Distortion",
             Self::Chorus => "Chorus",
+            Self::Flanger => "Flanger",
+            Self::Eq => "EQ Curve",
             Self::Mul => "Multiply",
             Self::Clamp => "Clamp",
             Self::Remap => "Remap",
             Self::Scope => "Waveform",
+            Self::Spectrum => "Spectrum",
+            Self::Spectrogram => "Spectrogram",
             Self::NoteScope => "Notes",
             Self::Clock => "Clock",
             Self::Sequencer => "Sequencer",
@@ -90,6 +105,8 @@ pub fn output_port_type(kind: NodeKind, port: &str) -> u16 {
         (NodeKind::Sequencer, "notes")
         | (NodeKind::NoteJoin, "out")
         | (NodeKind::Transpose, "out")
+        | (NodeKind::Chord, "out")
+        | (NodeKind::Arp, "out")
         | (NodeKind::NoteScope, "out") => port::NOTES,
         _ => port::AUDIO,
     }
@@ -144,10 +161,21 @@ pub struct GraphNode {
     pub chorus_depth: f32,
     #[serde(default = "default_chorus_mix")]
     pub chorus_mix: f32,
+    #[serde(default = "default_flange_rate")]
+    pub flange_rate: f32,
+    #[serde(default = "default_flange_depth")]
+    pub flange_depth: f32,
+    #[serde(default = "default_flange_feedback")]
+    pub flange_feedback: f32,
+    #[serde(default = "default_flange_mix")]
+    pub flange_mix: f32,
     #[serde(default = "default_mix")]
     pub mix_a: f32,
     #[serde(default = "default_mix")]
     pub mix_b: f32,
+    /// 8 mixer strips (vol + pan). Empty on Join Audio / old files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mix_strips: Vec<MixStrip>,
     #[serde(default = "default_bpm")]
     pub bpm: f32,
     /// Play windows: `1 3 8` (one bar each) or `1-2 5-1` (start-length). Empty = always.
@@ -173,6 +201,13 @@ pub struct GraphNode {
     /// Time shift in sequencer cells (1 = one 16th). Fractions allowed.
     #[serde(default)]
     pub transpose_steps: f32,
+    /// Index into [`CHORD_NAMES`].
+    #[serde(default)]
+    pub chord_kind: usize,
+    #[serde(default)]
+    pub arp_mode: usize,
+    #[serde(default = "default_arp_rate")]
+    pub arp_rate: f32,
     #[serde(default = "default_adsr_attack")]
     pub adsr_attack: f32,
     #[serde(default = "default_adsr_decay")]
@@ -181,6 +216,22 @@ pub struct GraphNode {
     pub adsr_sustain: f32,
     #[serde(default = "default_adsr_release")]
     pub adsr_release: f32,
+    #[serde(default = "default_eq_pts")]
+    pub eq_pts: Vec<EqPt>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EqPt {
+    pub t: f32,
+    pub v: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MixStrip {
+    #[serde(default = "default_mix")]
+    pub vol: f32,
+    #[serde(default)]
+    pub pan: f32,
 }
 
 fn default_freq() -> f32 {
@@ -243,6 +294,21 @@ fn default_chorus_depth() -> f32 {
 fn default_chorus_mix() -> f32 {
     0.45
 }
+fn default_flange_rate() -> f32 {
+    0.25
+}
+fn default_flange_depth() -> f32 {
+    0.7
+}
+fn default_flange_feedback() -> f32 {
+    0.55
+}
+fn default_flange_mix() -> f32 {
+    0.5
+}
+fn default_arp_rate() -> f32 {
+    1.0
+}
 fn default_mix() -> f32 {
     1.0
 }
@@ -266,6 +332,9 @@ fn default_adsr_sustain() -> f32 {
 }
 fn default_adsr_release() -> f32 {
     0.2
+}
+fn default_eq_pts() -> Vec<EqPt> {
+    vec![EqPt { t: 0.0, v: 1.0 }, EqPt { t: 1.0, v: 1.0 }]
 }
 
 impl GraphNode {
@@ -299,8 +368,16 @@ impl GraphNode {
             chorus_rate: 0.8,
             chorus_depth: 0.35,
             chorus_mix: 0.45,
+            flange_rate: 0.25,
+            flange_depth: 0.7,
+            flange_feedback: 0.55,
+            flange_mix: 0.5,
             mix_a: 1.0,
             mix_b: 1.0,
+            mix_strips: match kind {
+                NodeKind::Mixer => vec![MixStrip { vol: 1.0, pan: 0.0 }; MIX_INS.len()],
+                _ => Vec::new(),
+            },
             bpm: 120.0,
             seq_when: String::new(),
             seq_start: 0.0,
@@ -314,10 +391,14 @@ impl GraphNode {
             transpose_notes: 0,
             transpose_octaves: 0,
             transpose_steps: 0.0,
+            chord_kind: 0,
+            arp_mode: 0,
+            arp_rate: 1.0,
             adsr_attack: 0.01,
             adsr_decay: 0.1,
             adsr_sustain: 0.7,
             adsr_release: 0.2,
+            eq_pts: default_eq_pts(),
         }
     }
 
@@ -336,6 +417,86 @@ impl GraphNode {
 
     pub fn time_shift_beats(&self) -> f64 {
         self.transpose_steps as f64 * BEATS_PER_STEP as f64
+    }
+
+    pub fn chord_intervals(&self) -> &'static [i32] {
+        chord_intervals(self.chord_kind)
+    }
+
+    pub fn arp_step_beats(&self) -> f64 {
+        self.arp_rate.clamp(0.25, 8.0) as f64 * BEATS_PER_STEP as f64
+    }
+
+    /// Root `pitch` (semitone offset) → staggered chord tones.
+    pub fn arp_events(&self, pitch: i32, delay: f64) -> Vec<(i32, f64)> {
+        let mut tones: Vec<i32> = self.chord_intervals().iter().map(|iv| pitch + iv).collect();
+        match self.arp_mode {
+            1 => tones.reverse(),
+            2 => {
+                let mut down = tones.clone();
+                down.reverse();
+                if down.len() > 1 {
+                    down.remove(0);
+                }
+                tones.extend(down);
+            }
+            _ => {}
+        }
+        let step = self.arp_step_beats();
+        tones
+            .into_iter()
+            .enumerate()
+            .map(|(i, p)| (p, delay + i as f64 * step))
+            .collect()
+    }
+
+    /// Files saved while Join Audio was the 8-strip mixer keep `kind: mix` plus strips.
+    pub fn migrate_mixer_kind(&mut self) {
+        if self.kind == NodeKind::Mix && !self.mix_strips.is_empty() {
+            self.kind = NodeKind::Mixer;
+        }
+        if self.kind == NodeKind::Mixer {
+            self.ensure_mix_strips();
+        }
+    }
+
+    pub fn mix_strip(&self, i: usize) -> MixStrip {
+        if let Some(s) = self.mix_strips.get(i) {
+            return *s;
+        }
+        MixStrip {
+            vol: match i {
+                0 => self.mix_a,
+                1 => self.mix_b,
+                _ => 1.0,
+            },
+            pan: 0.0,
+        }
+    }
+
+    pub fn ensure_mix_strips(&mut self) {
+        if self.mix_strips.len() == MIX_INS.len() {
+            return;
+        }
+        let mut strips = vec![MixStrip { vol: 1.0, pan: 0.0 }; MIX_INS.len()];
+        if self.mix_strips.is_empty() {
+            strips[0].vol = self.mix_a;
+            strips[1].vol = self.mix_b;
+        } else {
+            for (i, s) in self.mix_strips.iter().take(MIX_INS.len()).enumerate() {
+                strips[i] = *s;
+            }
+        }
+        self.mix_strips = strips;
+    }
+
+    pub fn eq_pairs(&self) -> Vec<(f32, f32)> {
+        let mut pts: Vec<(f32, f32)> = self.eq_pts.iter().map(|p| (p.t, p.v)).collect();
+        if pts.len() < 2 {
+            pts = vec![(0.0, 1.0), (1.0, 1.0)];
+        }
+        pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        pts
     }
 
     pub fn loop_bars(&self) -> u32 {
@@ -409,6 +570,26 @@ impl GraphNode {
 
 pub fn midi_shift(pitch: u8, semitones: i32) -> u8 {
     (pitch as i32 + semitones).clamp(0, 127) as u8
+}
+
+pub const CHORD_NAMES: [&str; 9] = [
+    "Major", "Minor", "Sus2", "Sus4", "Maj7", "Min7", "Dom7", "Power", "Octave",
+];
+
+pub const ARP_NAMES: [&str; 3] = ["Up", "Down", "UpDown"];
+
+pub fn chord_intervals(kind: usize) -> &'static [i32] {
+    match kind {
+        1 => &[0, 3, 7],
+        2 => &[0, 2, 7],
+        3 => &[0, 5, 7],
+        4 => &[0, 4, 7, 11],
+        5 => &[0, 3, 7, 10],
+        6 => &[0, 4, 7, 10],
+        7 => &[0, 7],
+        8 => &[0, 12],
+        _ => &[0, 4, 7],
+    }
 }
 
 /// Beat ranges `[start, end)`. Empty means always (from beat 0).
@@ -631,5 +812,61 @@ mod tests {
         assert!(NodeKind::Voice.can_bypass());
         assert!(!NodeKind::Output.can_bypass());
         assert!(!NodeKind::NoteJoin.can_bypass());
+        assert!(NodeKind::Chord.can_bypass());
+        assert!(NodeKind::Eq.can_bypass());
+    }
+
+    #[test]
+    fn eq_defaults_flat_pass() {
+        let n = GraphNode::new("eq".into(), NodeKind::Eq, Vec2::ZERO);
+        let pts = n.eq_pairs();
+        assert_eq!(pts.len(), 2);
+        assert!((pts[0].1 - 1.0).abs() < 1e-6);
+        assert!((pts[1].1 - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn chord_intervals_major_minor() {
+        let mut n = GraphNode::new("c".into(), NodeKind::Chord, Vec2::ZERO);
+        assert_eq!(n.chord_intervals(), &[0, 4, 7]);
+        n.chord_kind = 1;
+        assert_eq!(n.chord_intervals(), &[0, 3, 7]);
+        n.chord_kind = 6;
+        assert_eq!(n.chord_intervals(), &[0, 4, 7, 10]);
+    }
+
+    #[test]
+    fn arp_staggers_major_up() {
+        let n = GraphNode::new("a".into(), NodeKind::Arp, Vec2::ZERO);
+        let ev = n.arp_events(0, 0.0);
+        assert_eq!(ev.len(), 3);
+        assert_eq!(ev[0], (0, 0.0));
+        assert_eq!(ev[1].0, 4);
+        assert!((ev[1].1 - BEATS_PER_STEP as f64).abs() < 1e-9);
+        assert_eq!(ev[2].0, 7);
+    }
+
+    #[test]
+    fn mix_strips_fill_from_legacy_ab() {
+        let mut n = GraphNode::new("m".into(), NodeKind::Mixer, Vec2::ZERO);
+        n.mix_strips.clear();
+        n.mix_a = 0.25;
+        n.mix_b = 0.75;
+        n.ensure_mix_strips();
+        assert_eq!(n.mix_strips.len(), 8);
+        assert!((n.mix_strips[0].vol - 0.25).abs() < 1e-6);
+        assert!((n.mix_strips[1].vol - 0.75).abs() < 1e-6);
+        assert!((n.mix_strips[0].pan).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mix_without_strips_stays_join() {
+        let mut n = GraphNode::new("j".into(), NodeKind::Mix, Vec2::ZERO);
+        assert!(n.mix_strips.is_empty());
+        n.migrate_mixer_kind();
+        assert_eq!(n.kind, NodeKind::Mix);
+        n.mix_strips = vec![MixStrip { vol: 1.0, pan: -0.5 }; 8];
+        n.migrate_mixer_kind();
+        assert_eq!(n.kind, NodeKind::Mixer);
     }
 }

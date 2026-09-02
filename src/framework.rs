@@ -29,6 +29,7 @@ pub struct KeyEvents {
     /// вроде клавиш пианино, где `Response::clicked` из `ui.button` не подходит —
     /// он срабатывает только один раз на отпускание).
     pub mouse_down: bool,
+    pub save: bool,
 }
 
 struct Gpu {
@@ -309,6 +310,7 @@ impl<S: Scene> Host<S> {
         );
         self.key_events.pressed.clear();
         self.key_events.released.clear();
+        self.key_events.save = false;
         let out = self.ui.end_frame();
         let needs_repaint = out.needs_repaint || keep;
 
@@ -532,6 +534,7 @@ impl<S: Scene> ApplicationHandler for Host<S> {
                         "x" => self.input.key_cut = true,
                         "a" => self.input.key_select_all = true,
                         "d" => self.input.key_duplicate = true,
+                        "s" => self.key_events.save = true,
                         _ => {}
                     },
                     _ => {}
@@ -545,6 +548,7 @@ impl<S: Scene> ApplicationHandler for Host<S> {
                             KeyCode::KeyX => self.input.key_cut = true,
                             KeyCode::KeyA => self.input.key_select_all = true,
                             KeyCode::KeyD => self.input.key_duplicate = true,
+                            KeyCode::KeyS => self.key_events.save = true,
                             _ => {}
                         }
                     }

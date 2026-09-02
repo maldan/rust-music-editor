@@ -7,18 +7,21 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use mega_audio::dsp::{
-    AdsrParams, BiquadFilter, Chorus, Clamp, Delay, Distortion, FilterKind, GainCv, Mixer, Mul,
-    Oscillator, Remap, Waveform,
+    AdsrParams, BiquadFilter, Chorus, Clamp, Delay, Distortion, FilterKind, Flanger, GainCv, Mixer,
+    Mul, Oscillator, Remap, StereoGain, StereoMixer, Waveform,
 };
 use mega_audio::graph::{Bypass, Graph, Node, NodeId, ProcessContext};
 use mega_audio::instrument::PolyphonicInstrument;
 use mega_audio::note::NoteEvent;
 
+use crate::fft::{
+    eq_bin_gains, fft_radix2, fold_log_bins, hann, ifft_radix2, EQ_HOP, FFT_HOP, FFT_N, SPEC_BINS,
+};
 use crate::graph::{
     midi_shift, output_port_type, parse_seq_when, port, seq_window, GraphDoc, NodeKind, SeqNote,
-    BEATS_PER_BAR, BEATS_PER_STEP, NOTE_JOIN_INS,
+    BEATS_PER_BAR, BEATS_PER_STEP, MIX_INS, NOTE_JOIN_INS,
 };
-use crate::monitor::{Monitor, ScopeBuf};
+use crate::monitor::{FftBuf, Monitor, ScopeBuf};
 
 pub const WAVEFORMS: [(&str, Waveform); 5] = [
     ("Sine", Waveform::Sine),
@@ -111,13 +114,18 @@ fn dsp_bypass(kind: NodeKind) -> Bypass {
         NodeKind::Filter
         | NodeKind::Gain
         | NodeKind::Mix
+        | NodeKind::Mixer
         | NodeKind::Delay
         | NodeKind::Distortion
         | NodeKind::Chorus
+        | NodeKind::Flanger
+        | NodeKind::Eq
         | NodeKind::Mul
         | NodeKind::Clamp
         | NodeKind::Remap
-        | NodeKind::Scope => Bypass::Thru,
+        | NodeKind::Scope
+        | NodeKind::Spectrum
+        | NodeKind::Spectrogram => Bypass::Thru,
         _ => Bypass::Off,
     }
 }
@@ -130,13 +138,18 @@ fn dsp_kind(kind: NodeKind) -> bool {
             | NodeKind::Filter
             | NodeKind::Gain
             | NodeKind::Mix
+            | NodeKind::Mixer
             | NodeKind::Delay
             | NodeKind::Distortion
             | NodeKind::Chorus
+            | NodeKind::Flanger
+            | NodeKind::Eq
             | NodeKind::Mul
             | NodeKind::Clamp
             | NodeKind::Remap
             | NodeKind::Scope
+            | NodeKind::Spectrum
+            | NodeKind::Spectrogram
             | NodeKind::Voice
     )
 }
@@ -164,6 +177,8 @@ pub fn build_graph(patch: &Patch, sample_rate: f32, monitor: &Monitor) -> Build 
             | NodeKind::Sequencer
             | NodeKind::NoteJoin
             | NodeKind::Transpose
+            | NodeKind::Chord
+            | NodeKind::Arp
             | NodeKind::NoteScope => {}
             NodeKind::Voice => {
                 let wf = WAVEFORMS.get(n.waveform).map(|w| w.1).unwrap_or(Waveform::Saw);
@@ -217,6 +232,14 @@ pub fn build_graph(patch: &Patch, sample_rate: f32, monitor: &Monitor) -> Build 
                 in_port.insert((n.id.clone(), "cutoff".into()), (id, 1));
                 out_port.insert((n.id.clone(), "out".into()), (id, 0));
             }
+            NodeKind::Eq => {
+                let mut eq = CurveEq::new(sample_rate);
+                eq.set_curve(&n.eq_pairs());
+                let id = graph.add_node(Box::new(eq));
+                dsp.insert(n.id.clone(), id);
+                in_port.insert((n.id.clone(), "in".into()), (id, 0));
+                out_port.insert((n.id.clone(), "out".into()), (id, 0));
+            }
             NodeKind::Gain => {
                 let mut mix = Mixer::new(1);
                 mix.gains[0] = n.gain;
@@ -235,10 +258,35 @@ pub fn build_graph(patch: &Patch, sample_rate: f32, monitor: &Monitor) -> Build 
                 in_port.insert((n.id.clone(), "b".into()), (id, 1));
                 out_port.insert((n.id.clone(), "out".into()), (id, 0));
             }
+            NodeKind::Mixer => {
+                let mut mix = StereoMixer::new(MIX_INS.len());
+                for i in 0..MIX_INS.len() {
+                    let s = n.mix_strip(i);
+                    mix.gains[i] = s.vol.clamp(0.0, 1.5);
+                    mix.pans[i] = s.pan.clamp(-1.0, 1.0);
+                }
+                let id = graph.add_node(Box::new(mix));
+                dsp.insert(n.id.clone(), id);
+                for (i, p) in MIX_INS.iter().enumerate() {
+                    in_port.insert((n.id.clone(), (*p).into()), (id, i));
+                }
+                in_port.insert((n.id.clone(), "a".into()), (id, 0));
+                in_port.insert((n.id.clone(), "b".into()), (id, 1));
+                out_port.insert((n.id.clone(), "L".into()), (id, 0));
+                out_port.insert((n.id.clone(), "R".into()), (id, 1));
+                out_port.insert((n.id.clone(), "out".into()), (id, 2));
+            }
             NodeKind::Scope => {
                 let tap = ScopeTap {
                     buf: monitor.scope_buf(&n.id),
                 };
+                let id = graph.add_node(Box::new(tap));
+                dsp.insert(n.id.clone(), id);
+                in_port.insert((n.id.clone(), "in".into()), (id, 0));
+                out_port.insert((n.id.clone(), "out".into()), (id, 0));
+            }
+            NodeKind::Spectrum | NodeKind::Spectrogram => {
+                let tap = FftTap::new(monitor.fft_buf(&n.id), sample_rate);
                 let id = graph.add_node(Box::new(tap));
                 dsp.insert(n.id.clone(), id);
                 in_port.insert((n.id.clone(), "in".into()), (id, 0));
@@ -266,6 +314,17 @@ pub fn build_graph(patch: &Patch, sample_rate: f32, monitor: &Monitor) -> Build 
                 ch.depth = n.chorus_depth.clamp(0.0, 1.0);
                 ch.mix = n.chorus_mix.clamp(0.0, 1.0);
                 let id = graph.add_node(Box::new(ch));
+                dsp.insert(n.id.clone(), id);
+                in_port.insert((n.id.clone(), "in".into()), (id, 0));
+                out_port.insert((n.id.clone(), "out".into()), (id, 0));
+            }
+            NodeKind::Flanger => {
+                let mut fl = Flanger::new(sample_rate);
+                fl.rate = n.flange_rate.max(0.01);
+                fl.depth = n.flange_depth.clamp(0.0, 1.0);
+                fl.feedback = n.flange_feedback.clamp(0.0, 0.95);
+                fl.mix = n.flange_mix.clamp(0.0, 1.0);
+                let id = graph.add_node(Box::new(fl));
                 dsp.insert(n.id.clone(), id);
                 in_port.insert((n.id.clone(), "in".into()), (id, 0));
                 out_port.insert((n.id.clone(), "out".into()), (id, 0));
@@ -310,8 +369,7 @@ pub fn build_graph(patch: &Patch, sample_rate: f32, monitor: &Monitor) -> Build 
         graph.connect(src, sp, dst, dp);
     }
 
-    let mut master = Mixer::new(1);
-    master.gains[0] = if patch.playing { MASTER_GAIN } else { 0.0 };
+    let master = StereoGain::new(if patch.playing { MASTER_GAIN } else { 0.0 });
     let master_id = graph.add_node(Box::new(master));
 
     if let Some((from, from_p, _, _)) = patch
@@ -319,8 +377,21 @@ pub fn build_graph(patch: &Patch, sample_rate: f32, monitor: &Monitor) -> Build 
         .iter()
         .find(|(_, _, to, to_p)| to == &patch.output_id && to_p == "in")
     {
-        if let Some(&(src, sp)) = out_port.get(&(from.clone(), from_p.clone())) {
+        let from_kind = patch
+            .nodes
+            .iter()
+            .find(|n| n.id == *from)
+            .map(|n| n.kind);
+        if from_kind == Some(NodeKind::Mixer) {
+            if let Some(&(src, sp)) = out_port.get(&(from.clone(), "L".into())) {
+                graph.connect(src, sp, master_id, 0);
+            }
+            if let Some(&(src, sp)) = out_port.get(&(from.clone(), "R".into())) {
+                graph.connect(src, sp, master_id, 1);
+            }
+        } else if let Some(&(src, sp)) = out_port.get(&(from.clone(), from_p.clone())) {
             graph.connect(src, sp, master_id, 0);
+            graph.connect(src, sp, master_id, 1);
         }
     }
 
@@ -439,6 +510,7 @@ impl Live {
                     slot: slot.clone(),
                     pitch: t.pitch,
                     delay: t.delay,
+                    gate: t.gate,
                 });
             }
             let prev = self.seqs.remove(&n.id);
@@ -555,6 +627,11 @@ impl Live {
                         f.q = n.q.max(0.1);
                     }
                 }
+                NodeKind::Eq => {
+                    if let Some(eq) = graph.node_mut::<CurveEq>(id) {
+                        eq.set_curve(&n.eq_pairs());
+                    }
+                }
                 NodeKind::Gain => {
                     if let Some(mix) = graph.node_mut::<Mixer>(id) {
                         mix.gains[0] = n.gain;
@@ -572,10 +649,27 @@ impl Live {
                         c.mix = n.chorus_mix.clamp(0.0, 1.0);
                     }
                 }
+                NodeKind::Flanger => {
+                    if let Some(f) = graph.node_mut::<Flanger>(id) {
+                        f.rate = n.flange_rate.max(0.01);
+                        f.depth = n.flange_depth.clamp(0.0, 1.0);
+                        f.feedback = n.flange_feedback.clamp(0.0, 0.95);
+                        f.mix = n.flange_mix.clamp(0.0, 1.0);
+                    }
+                }
                 NodeKind::Mix => {
                     if let Some(mix) = graph.node_mut::<Mixer>(id) {
                         mix.gains[0] = n.mix_a;
                         mix.gains[1] = n.mix_b;
+                    }
+                }
+                NodeKind::Mixer => {
+                    if let Some(mix) = graph.node_mut::<StereoMixer>(id) {
+                        for i in 0..mix.gains.len() {
+                            let s = n.mix_strip(i);
+                            mix.gains[i] = s.vol.clamp(0.0, 1.5);
+                            mix.pans[i] = s.pan.clamp(-1.0, 1.0);
+                        }
                     }
                 }
                 _ => {}
@@ -630,8 +724,8 @@ impl Live {
         }
         self.sync_dsp(graph, &patch);
 
-        if let Some(mixer) = graph.node_mut::<Mixer>(self.master) {
-            mixer.gains[0] = if patch.playing { MASTER_GAIN } else { 0.0 };
+        if let Some(gain) = graph.node_mut::<StereoGain>(self.master) {
+            gain.gain = if patch.playing { MASTER_GAIN } else { 0.0 };
         }
 
         self.bpm = patch.bpm.max(1.0);
@@ -765,8 +859,9 @@ fn collect_now(seq: &mut SeqRun, song: f64, loop_len: f64) {
         if note.step as u32 >= max_step {
             continue;
         }
-        let dur = note.len.max(1) as f64 * BEATS_PER_STEP as f64;
+        let note_dur = note.len.max(1) as f64 * BEATS_PER_STEP as f64;
         for t in &seq.targets {
+            let dur = if t.gate > 1e-9 { t.gate } else { note_dur };
             let on = (note.step as f64 * BEATS_PER_STEP as f64 + t.delay).rem_euclid(loop_len);
             let off = (on + dur).rem_euclid(loop_len);
             if sounding_at(song, on, off, loop_len, dur) {
@@ -777,6 +872,7 @@ fn collect_now(seq: &mut SeqRun, song: f64, loop_len: f64) {
             }
         }
         for t in &seq.taps {
+            let dur = if t.gate > 1e-9 { t.gate } else { note_dur };
             let on = (note.step as f64 * BEATS_PER_STEP as f64 + t.delay).rem_euclid(loop_len);
             let off = (on + dur).rem_euclid(loop_len);
             if sounding_at(song, on, off, loop_len, dur) {
@@ -886,6 +982,181 @@ impl Node for ScopeTap {
     }
 }
 
+struct FftTap {
+    buf: Arc<FftBuf>,
+    sr: f32,
+    ring: Vec<f32>,
+    write: usize,
+    seen: usize,
+    re: Vec<f32>,
+    im: Vec<f32>,
+    bins: Vec<f32>,
+}
+
+impl FftTap {
+    fn new(buf: Arc<FftBuf>, sample_rate: f32) -> Self {
+        Self {
+            buf,
+            sr: sample_rate.max(1.0),
+            ring: vec![0.0; FFT_N],
+            write: 0,
+            seen: 0,
+            re: vec![0.0; FFT_N],
+            im: vec![0.0; FFT_N],
+            bins: vec![0.0; SPEC_BINS],
+        }
+    }
+
+    fn hop(&mut self) {
+        let start = self.write;
+        for i in 0..FFT_N {
+            self.re[i] = self.ring[(start + i) % FFT_N] * hann(i, FFT_N);
+            self.im[i] = 0.0;
+        }
+        crate::fft::fft_radix2(&mut self.re, &mut self.im);
+        fold_log_bins(&self.re, &self.im, self.sr, &mut self.bins);
+        self.buf.push_bins(&self.bins);
+    }
+}
+
+impl Node for FftTap {
+    fn num_inputs(&self) -> usize {
+        1
+    }
+
+    fn num_outputs(&self) -> usize {
+        1
+    }
+
+    fn process(&mut self, ctx: &ProcessContext, inputs: &[&[f32]], outputs: &mut [&mut [f32]]) {
+        let n = ctx.block_size;
+        outputs[0][..n].copy_from_slice(&inputs[0][..n]);
+        for &s in &inputs[0][..n] {
+            self.ring[self.write] = s;
+            self.write = (self.write + 1) % FFT_N;
+            self.seen += 1;
+            if self.seen >= FFT_N && (self.seen - FFT_N) % FFT_HOP == 0 {
+                self.hop();
+            }
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "FftTap"
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+struct CurveEq {
+    sr: f32,
+    ring: Vec<f32>,
+    write: usize,
+    seen: usize,
+    ola: Vec<f32>,
+    pending: Vec<f32>,
+    pend_r: usize,
+    pend_w: usize,
+    re: Vec<f32>,
+    im: Vec<f32>,
+    gain: Vec<f32>,
+}
+
+impl CurveEq {
+    fn new(sample_rate: f32) -> Self {
+        let mut s = Self {
+            sr: sample_rate.max(1.0),
+            ring: vec![0.0; FFT_N],
+            write: 0,
+            seen: 0,
+            ola: vec![0.0; FFT_N],
+            pending: vec![0.0; EQ_HOP * 4],
+            pend_r: 0,
+            pend_w: 0,
+            re: vec![0.0; FFT_N],
+            im: vec![0.0; FFT_N],
+            gain: vec![1.0; FFT_N],
+        };
+        s.set_curve(&[(0.0, 1.0), (1.0, 1.0)]);
+        s
+    }
+
+    fn set_curve(&mut self, pts: &[(f32, f32)]) {
+        eq_bin_gains(pts, self.sr, &mut self.gain);
+    }
+
+    fn hop(&mut self) {
+        let start = self.write;
+        for i in 0..FFT_N {
+            self.re[i] = self.ring[(start + i) % FFT_N] * hann(i, FFT_N);
+            self.im[i] = 0.0;
+        }
+        fft_radix2(&mut self.re, &mut self.im);
+        multiply_gains(&mut self.re, &mut self.im, &self.gain);
+        ifft_radix2(&mut self.re, &mut self.im);
+        for i in 0..FFT_N {
+            self.ola[i] += self.re[i];
+        }
+        let cap = self.pending.len();
+        for i in 0..EQ_HOP {
+            self.pending[self.pend_w % cap] = self.ola[i];
+            self.pend_w += 1;
+        }
+        self.ola.copy_within(EQ_HOP..FFT_N, 0);
+        self.ola[FFT_N - EQ_HOP..].fill(0.0);
+    }
+
+    fn push_sample(&mut self, x: f32) -> f32 {
+        self.ring[self.write] = x;
+        self.write = (self.write + 1) % FFT_N;
+        self.seen += 1;
+        if self.seen >= FFT_N && (self.seen - FFT_N) % EQ_HOP == 0 {
+            self.hop();
+        }
+        if self.pend_r == self.pend_w {
+            return 0.0;
+        }
+        let cap = self.pending.len();
+        let y = self.pending[self.pend_r % cap];
+        self.pend_r += 1;
+        y
+    }
+}
+
+fn multiply_gains(re: &mut [f32], im: &mut [f32], gain: &[f32]) {
+    for k in 0..re.len() {
+        re[k] *= gain[k];
+        im[k] *= gain[k];
+    }
+}
+
+impl Node for CurveEq {
+    fn num_inputs(&self) -> usize {
+        1
+    }
+
+    fn num_outputs(&self) -> usize {
+        1
+    }
+
+    fn process(&mut self, ctx: &ProcessContext, inputs: &[&[f32]], outputs: &mut [&mut [f32]]) {
+        let n = ctx.block_size;
+        for i in 0..n {
+            outputs[0][i] = self.push_sample(inputs[0][i]);
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "Eq"
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
 fn seq_clock_id(patch: &Patch, seq_id: &str) -> Option<String> {
     let kind_of = |id: &str| {
         patch
@@ -916,6 +1187,8 @@ struct SeqTarget {
     voice: NodeId,
     pitch: i32,
     delay: f64,
+    /// >0: note length in beats (arp). 0 = sequencer cell length.
+    gate: f64,
 }
 
 #[derive(Clone)]
@@ -923,6 +1196,7 @@ struct TapRun {
     slot: Arc<crate::monitor::PitchSet>,
     pitch: i32,
     delay: f64,
+    gate: f64,
 }
 
 #[derive(Clone, PartialEq)]
@@ -930,6 +1204,7 @@ struct TapTarget {
     id: String,
     pitch: i32,
     delay: f64,
+    gate: f64,
 }
 
 fn seq_routes(
@@ -941,10 +1216,10 @@ fn seq_routes(
     let kind_of = |id: &str| node(id).map(|n| n.kind);
     let mut out = Vec::new();
     let mut taps = Vec::new();
-    let mut stack = vec![(seq_id.to_string(), "notes".to_string(), 0_i32, 0.0_f64)];
+    let mut stack = vec![(seq_id.to_string(), "notes".to_string(), 0_i32, 0.0_f64, 0.0_f64)];
     let mut seen = HashSet::new();
-    while let Some((from, from_p, pitch, delay)) = stack.pop() {
-        if !seen.insert((from.clone(), from_p.clone(), pitch, delay.to_bits())) {
+    while let Some((from, from_p, pitch, delay, gate)) = stack.pop() {
+        if !seen.insert((from.clone(), from_p.clone(), pitch, delay.to_bits(), gate.to_bits())) {
             continue;
         }
         for (f, fp, to, to_p) in &patch.links {
@@ -958,11 +1233,12 @@ fn seq_routes(
                             voice: id,
                             pitch,
                             delay,
+                            gate,
                         });
                     }
                 }
                 (Some(NodeKind::NoteJoin), p) if NOTE_JOIN_INS.contains(&p) => {
-                    stack.push((to.clone(), "out".into(), pitch, delay));
+                    stack.push((to.clone(), "out".into(), pitch, delay, gate));
                 }
                 (Some(NodeKind::NoteScope), "in") => {
                     let bypass = node(to).is_some_and(|n| n.bypass);
@@ -971,9 +1247,10 @@ fn seq_routes(
                             id: to.clone(),
                             pitch,
                             delay,
+                            gate,
                         });
                     }
-                    stack.push((to.clone(), "out".into(), pitch, delay));
+                    stack.push((to.clone(), "out".into(), pitch, delay, gate));
                 }
                 (Some(NodeKind::Transpose), "in") => {
                     let n = node(to);
@@ -988,7 +1265,31 @@ fn seq_routes(
                     } else {
                         delay + n.map(|n| n.time_shift_beats()).unwrap_or(0.0)
                     };
-                    stack.push((to.clone(), "out".into(), pitch, delay));
+                    stack.push((to.clone(), "out".into(), pitch, delay, gate));
+                }
+                (Some(NodeKind::Chord), "in") => {
+                    let n = node(to);
+                    let bypass = n.is_some_and(|n| n.bypass);
+                    let ivs: &[i32] = if bypass {
+                        &[0]
+                    } else {
+                        n.map(|n| n.chord_intervals()).unwrap_or(&[0])
+                    };
+                    for &iv in ivs {
+                        stack.push((to.clone(), "out".into(), pitch + iv, delay, gate));
+                    }
+                }
+                (Some(NodeKind::Arp), "in") => {
+                    let n = node(to);
+                    let bypass = n.is_some_and(|n| n.bypass);
+                    if bypass {
+                        stack.push((to.clone(), "out".into(), pitch, delay, gate));
+                    } else if let Some(n) = n {
+                        let step = n.arp_step_beats();
+                        for (p, d) in n.arp_events(pitch, delay) {
+                            stack.push((to.clone(), "out".into(), p, d, step));
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -1217,5 +1518,164 @@ mod tests {
         let (targets, taps) = seq_routes(&patch, "seq", &voices);
         assert_eq!(targets.len(), 1);
         assert!(taps.is_empty());
+    }
+
+    #[test]
+    fn chord_fans_root_into_triad() {
+        let seq = crate::graph::GraphNode::new("seq".into(), NodeKind::Sequencer, glam::Vec2::ZERO);
+        let chord = crate::graph::GraphNode::new("ch".into(), NodeKind::Chord, glam::Vec2::ZERO);
+        let voice = crate::graph::GraphNode::new("voice".into(), NodeKind::Voice, glam::Vec2::ZERO);
+        let patch = patch_with(
+            vec![seq, chord, voice],
+            vec![
+                ("seq", "notes", "ch", "in"),
+                ("ch", "out", "voice", "notes"),
+            ],
+        );
+        let mon = Monitor::default();
+        let voices = build_graph(&patch, 48_000.0, &mon).voices;
+        let (mut targets, _) = seq_routes(&patch, "seq", &voices);
+        targets.sort_by_key(|t| t.pitch);
+        let pitches: Vec<i32> = targets.iter().map(|t| t.pitch).collect();
+        assert_eq!(pitches, vec![0, 4, 7]);
+        let mut bypassed = patch.clone();
+        bypassed.nodes.iter_mut().find(|n| n.id == "ch").unwrap().bypass = true;
+        let (t2, _) = seq_routes(&bypassed, "seq", &voices);
+        assert_eq!(t2.len(), 1);
+        assert_eq!(t2[0].pitch, 0);
+    }
+
+    #[test]
+    fn arp_staggers_voice_targets() {
+        let seq = crate::graph::GraphNode::new("seq".into(), NodeKind::Sequencer, glam::Vec2::ZERO);
+        let arp = crate::graph::GraphNode::new("arp".into(), NodeKind::Arp, glam::Vec2::ZERO);
+        let voice = crate::graph::GraphNode::new("voice".into(), NodeKind::Voice, glam::Vec2::ZERO);
+        let patch = patch_with(
+            vec![seq, arp, voice],
+            vec![
+                ("seq", "notes", "arp", "in"),
+                ("arp", "out", "voice", "notes"),
+            ],
+        );
+        let mon = Monitor::default();
+        let voices = build_graph(&patch, 48_000.0, &mon).voices;
+        let (mut targets, _) = seq_routes(&patch, "seq", &voices);
+        targets.sort_by_key(|t| t.delay.to_bits());
+        assert_eq!(targets.len(), 3);
+        assert_eq!(targets[0].pitch, 0);
+        assert_eq!(targets[1].pitch, 4);
+        assert_eq!(targets[2].pitch, 7);
+        assert!(targets[1].delay > targets[0].delay);
+        assert!(targets[0].gate > 0.0);
+    }
+
+    #[test]
+    fn spectrum_nodes_are_thru_dsp() {
+        assert!(dsp_kind(NodeKind::Spectrum));
+        assert!(dsp_kind(NodeKind::Spectrogram));
+        assert_eq!(dsp_bypass(NodeKind::Spectrum), Bypass::Thru);
+        assert_eq!(dsp_bypass(NodeKind::Spectrogram), Bypass::Thru);
+        let spec = crate::graph::GraphNode::new("s".into(), NodeKind::Spectrum, glam::Vec2::ZERO);
+        let gram = crate::graph::GraphNode::new("g".into(), NodeKind::Spectrogram, glam::Vec2::ZERO);
+        let patch = patch_with(vec![spec, gram], vec![]);
+        let mon = Monitor::default();
+        let build = build_graph(&patch, 48_000.0, &mon);
+        assert!(build.dsp.contains_key("s"));
+        assert!(build.dsp.contains_key("g"));
+    }
+
+    #[test]
+    fn fft_tap_copies_and_peaks_on_a440() {
+        let mon = Monitor::default();
+        let mut tap = FftTap::new(mon.fft_buf("spec"), 48_000.0);
+        let sr = 48_000.0;
+        let mut phase = 0.0f32;
+        let step = 2.0 * std::f32::consts::PI * 440.0 / sr;
+        let ctx = ProcessContext {
+            sample_rate: sr,
+            block_size: 256,
+        };
+        for _ in 0..8 {
+            let mut block = vec![0.0f32; 256];
+            for s in block.iter_mut() {
+                *s = phase.sin();
+                phase += step;
+            }
+            let mut out = vec![0.0f32; 256];
+            tap.process(&ctx, &[&block], &mut [&mut out[..]]);
+            assert_eq!(out, block);
+        }
+        let bins = mon.spectrum("spec");
+        let peak = crate::fft::peak_bin(&bins);
+        assert!(peak < crate::fft::SPEC_BINS / 2);
+        assert!(bins[peak] > 0.15);
+        let gram = mon.spectrogram("spec");
+        assert_eq!(gram.len(), crate::fft::SPEC_COLS * crate::fft::SPEC_BINS);
+        assert!(gram.iter().any(|v| *v > 0.15));
+    }
+
+    #[test]
+    fn eq_curve_cuts_when_gain_zero() {
+        let sr = 48_000.0;
+        let ctx = ProcessContext {
+            sample_rate: sr,
+            block_size: 1,
+        };
+        let mut pass = CurveEq::new(sr);
+        pass.set_curve(&[(0.0, 1.0), (1.0, 1.0)]);
+        let mut mute = CurveEq::new(sr);
+        mute.set_curve(&[(0.0, 0.0), (1.0, 0.0)]);
+        let step = 2.0 * std::f32::consts::PI * 440.0 / sr;
+        let mut phase = 0.0f32;
+        let mut pass_e = 0.0f32;
+        let mut mute_e = 0.0f32;
+        let n = FFT_N + EQ_HOP * 4;
+        for _ in 0..n {
+            let x = phase.sin();
+            phase += step;
+            let mut po = [0.0];
+            let mut mo = [0.0];
+            pass.process(&ctx, &[&[x]], &mut [&mut po]);
+            mute.process(&ctx, &[&[x]], &mut [&mut mo]);
+            pass_e += po[0] * po[0];
+            mute_e += mo[0] * mo[0];
+        }
+        assert!(pass_e > 1.0, "flat EQ should pass energy, got {pass_e}");
+        assert!(
+            mute_e < pass_e * 0.05,
+            "zero curve should kill the tone ({mute_e} vs {pass_e})"
+        );
+    }
+
+    #[test]
+    fn mixer_hard_pan_left_reaches_master() {
+        let osc = crate::graph::GraphNode::new("osc".into(), NodeKind::Osc, glam::Vec2::ZERO);
+        let mut mix = crate::graph::GraphNode::new("mix".into(), NodeKind::Mixer, glam::Vec2::ZERO);
+        let out = crate::graph::GraphNode::new("out".into(), NodeKind::Output, glam::Vec2::ZERO);
+        mix.ensure_mix_strips();
+        mix.mix_strips[0].pan = -1.0;
+        let mut patch = patch_with(
+            vec![osc, mix, out],
+            vec![
+                ("osc", "out", "mix", "1"),
+                ("mix", "out", "out", "in"),
+            ],
+        );
+        patch.playing = true;
+        let mon = Monitor::default();
+        let mut build = build_graph(&patch, 48_000.0, &mon);
+        let mut peak_l = 0.0f32;
+        let mut peak_r = 0.0f32;
+        for _ in 0..512 {
+            let _ = build.graph.process();
+            let (l, r) = build.graph.master_lr();
+            peak_l = peak_l.max(l.abs());
+            peak_r = peak_r.max(r.abs());
+        }
+        assert!(peak_l > 0.01, "left silent {peak_l}");
+        assert!(
+            peak_r < peak_l * 0.05,
+            "right leaked {peak_r} vs left {peak_l}"
+        );
     }
 }

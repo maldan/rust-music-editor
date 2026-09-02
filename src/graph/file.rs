@@ -7,6 +7,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 use super::doc::GraphDoc;
 use super::node::{parse_tick, GraphNode, NodeKind};
 
+/// On-disk extension; payload is still JSON.
+pub const FILE_EXT: &str = "megp";
+
 #[derive(Serialize, Deserialize)]
 struct GraphFile {
     version: u32,
@@ -82,6 +85,7 @@ impl GraphDoc {
         doc.nodes = file.nodes;
         for n in &mut doc.nodes {
             n.migrate_seq_when();
+            n.migrate_mixer_kind();
         }
         doc.next_serial = file.next_serial.max(1);
         doc.output_id = file.output_id;
@@ -101,7 +105,8 @@ impl GraphDoc {
             .unwrap_or(120.0);
         doc.play_from = file.play_from.max(1);
         for l in &file.links {
-            let _ = doc.connect(&l.from_node, &l.from_port, &l.to_node, &l.to_port);
+            let to_port = remap_mix_port(&doc.nodes, &l.to_node, &l.to_port);
+            let _ = doc.connect(&l.from_node, &l.from_port, &l.to_node, &to_port);
         }
         if !doc.nodes.iter().any(|n| n.id == doc.output_id && n.kind == NodeKind::Output)
         {
@@ -136,6 +141,27 @@ impl GraphDoc {
     }
 }
 
+pub fn with_graph_ext(mut path: std::path::PathBuf) -> std::path::PathBuf {
+    if path.extension().is_none() {
+        path.set_extension(FILE_EXT);
+    }
+    path
+}
+
+fn remap_mix_port(nodes: &[GraphNode], to_node: &str, to_port: &str) -> String {
+    let mix = nodes
+        .iter()
+        .any(|n| n.id == to_node && n.kind == NodeKind::Mixer);
+    if !mix {
+        return to_port.to_string();
+    }
+    match to_port {
+        "a" => "1".into(),
+        "b" => "2".into(),
+        other => other.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,5 +175,28 @@ mod tests {
         assert_eq!(a.space.links.len(), b.space.links.len());
         assert_eq!(a.output_id, b.output_id);
         assert_eq!(a.fingerprint(), b.fingerprint());
+    }
+
+    #[test]
+    fn mix_legacy_ab_ports_remap() {
+        let mut doc = GraphDoc::blank();
+        let osc = doc.spawn_node(NodeKind::Osc, Vec2::ZERO);
+        let mix = doc.spawn_node(NodeKind::Mixer, Vec2::ZERO);
+        let out = doc.spawn_node(NodeKind::Output, Vec2::ZERO);
+        doc.output_id = out;
+        doc.connect(&osc, "out", &mix, "1").unwrap();
+        let json = doc
+            .to_json()
+            .unwrap()
+            .replace("\"to_port\": \"1\"", "\"to_port\": \"a\"");
+        let loaded = GraphDoc::from_json(&json).unwrap();
+        assert!(
+            loaded
+                .space
+                .links
+                .iter()
+                .any(|l| l.to_node == mix && l.to_port == "1"),
+            "legacy mix port a should become 1"
+        );
     }
 }
