@@ -13,7 +13,7 @@ use mega_audio::graph::{Graph, Node, NodeId, ProcessContext};
 use mega_audio::instrument::PolyphonicInstrument;
 use mega_audio::note::NoteEvent;
 
-use crate::graph::{GraphDoc, NodeKind, SeqNote, BEATS_PER_BAR, BEATS_PER_STEP};
+use crate::graph::{GraphDoc, NodeKind, SeqNote, BEATS_PER_BAR, BEATS_PER_STEP, NOTE_JOIN_INS};
 use crate::monitor::{Monitor, ScopeBuf};
 
 pub const WAVEFORMS: [(&str, Waveform); 5] = [
@@ -219,16 +219,17 @@ pub fn build_graph(patch: &Patch, sample_rate: f32, monitor: &Monitor) -> Build 
 
 struct ClockRun {
     bpm: f32,
-    song_beats: f32,
+    song_beats: f64,
     out: Arc<AtomicU32>,
 }
 
 struct SeqRun {
     notes: Vec<SeqNote>,
     clock_id: String,
-    start_beats: f32,
-    end_beats: f32,
+    start_beats: f64,
+    end_beats: f64,
     playhead: f32,
+    pos: f64,
     playhead_out: Arc<AtomicU32>,
     voices: Vec<NodeId>,
     held: Vec<(u8, f32)>,
@@ -245,6 +246,7 @@ pub struct Live {
     master: NodeId,
     clocks: HashMap<String, ClockRun>,
     seqs: HashMap<String, SeqRun>,
+    voice_holds: HashMap<NodeId, HashMap<u8, u32>>,
     monitor: Arc<Monitor>,
 }
 
@@ -261,6 +263,7 @@ impl Live {
             master: build.master,
             clocks: HashMap::new(),
             seqs: HashMap::new(),
+            voice_holds: HashMap::new(),
             monitor,
         };
         live.rebuild_clocks(patch);
@@ -301,12 +304,12 @@ impl Live {
             if !self.clocks.contains_key(&clock_id) {
                 continue;
             }
-            let start = n.seq_start.max(0.0).floor() * BEATS_PER_BAR;
-            let bars = n.seq_bars.max(0.0).floor();
+            let start = n.seq_start.max(0.0).floor() as f64 * BEATS_PER_BAR as f64;
+            let bars = n.seq_bars.max(0.0).floor() as f64;
             let end = if bars < 1.0 {
-                f32::INFINITY
+                f64::INFINITY
             } else {
-                start + bars * BEATS_PER_BAR
+                start + bars * BEATS_PER_BAR as f64
             };
             let voices = seq_voices(patch, &n.id, &self.voices);
             let prev = self.seqs.remove(&n.id);
@@ -322,6 +325,7 @@ impl Live {
                     start_beats: start,
                     end_beats: end,
                     playhead: prev.as_ref().map(|p| p.playhead).unwrap_or(0.0),
+                    pos: prev.as_ref().map(|p| p.pos).unwrap_or(0.0),
                     playhead_out,
                     voices,
                     held: prev.as_ref().map(|p| p.held.clone()).unwrap_or_default(),
@@ -393,6 +397,7 @@ impl Live {
             self.lfo_mix = build.lfo_mix;
             self.master = build.master;
             self.topo = topo;
+            self.voice_holds.clear();
         }
         self.rebuild_clocks(&patch);
         self.rebuild_seqs(&patch);
@@ -403,18 +408,25 @@ impl Live {
         }
 
         if self.playing && !patch.playing {
+            let held: Vec<(NodeId, u8)> = self
+                .seqs
+                .values()
+                .flat_map(|seq| {
+                    seq.voices
+                        .iter()
+                        .flat_map(|&id| seq.held.iter().map(move |(p, _)| (id, *p)))
+                })
+                .collect();
+            for (id, pitch) in held {
+                voice_note(graph, &mut self.voice_holds, id, NoteEvent::NoteOff { note: pitch });
+            }
             for seq in self.seqs.values_mut() {
-                for &id in &seq.voices {
-                    if let Some(inst) = graph.node_mut::<PolyphonicInstrument>(id) {
-                        for &(pitch, _) in &seq.held {
-                            inst.handle_event(NoteEvent::NoteOff { note: pitch });
-                        }
-                    }
-                }
                 seq.held.clear();
                 seq.playhead = 0.0;
+                seq.pos = 0.0;
                 seq.was_active = false;
             }
+            self.voice_holds.clear();
             for clock in self.clocks.values_mut() {
                 clock.song_beats = 0.0;
             }
@@ -432,11 +444,13 @@ impl Live {
             }
             return;
         }
-        let dt = 1.0 / self.sample_rate / 60.0;
-        let loop_len = BEATS_PER_BAR;
+        let sr = self.sample_rate as f64;
+        let loop_len = BEATS_PER_BAR as f64;
         for clock in self.clocks.values_mut() {
-            clock.song_beats += clock.bpm * dt;
-            clock.out.store(clock.song_beats.to_bits(), Ordering::Relaxed);
+            clock.song_beats += clock.bpm as f64 / (sr * 60.0);
+            clock
+                .out
+                .store((clock.song_beats as f32).to_bits(), Ordering::Relaxed);
         }
         let seq_ids: Vec<String> = self.seqs.keys().cloned().collect();
         for sid in seq_ids {
@@ -448,14 +462,21 @@ impl Live {
             };
             let active = song >= seq.start_beats && song < seq.end_beats;
             if seq.was_active && !active {
-                for &id in &seq.voices {
-                    if let Some(inst) = graph.node_mut::<PolyphonicInstrument>(id) {
-                        for &(pitch, _) in &seq.held {
-                            inst.handle_event(NoteEvent::NoteOff { note: pitch });
-                        }
+                let pitches: Vec<u8> = seq.held.iter().map(|(p, _)| *p).collect();
+                let voice_ids = seq.voices.clone();
+                for id in voice_ids {
+                    for pitch in &pitches {
+                        voice_note(
+                            graph,
+                            &mut self.voice_holds,
+                            id,
+                            NoteEvent::NoteOff { note: *pitch },
+                        );
                     }
                 }
                 seq.held.clear();
+                seq.playhead = 0.0;
+                seq.pos = 0.0;
                 seq.playhead_out.store(f32::NAN.to_bits(), Ordering::Relaxed);
                 seq.was_active = false;
                 continue;
@@ -464,12 +485,10 @@ impl Live {
                 seq.playhead_out.store(f32::NAN.to_bits(), Ordering::Relaxed);
                 continue;
             }
-            let now = (song - seq.start_beats) % loop_len;
-            let prev = if !seq.was_active {
-                (now - 1.0e-6 + loop_len) % loop_len
-            } else {
-                seq.playhead
-            };
+            let now_pos = song - seq.start_beats;
+            let prev_pos = if !seq.was_active { 0.0 } else { seq.pos };
+            seq.pos = now_pos;
+            let now = now_pos.rem_euclid(loop_len) as f32;
             seq.playhead = now;
             seq.playhead_out.store(now.to_bits(), Ordering::Relaxed);
             seq.was_active = true;
@@ -478,26 +497,63 @@ impl Live {
             }
             let mut events = Vec::new();
             for note in &seq.notes {
-                let on = note.step as f32 * BEATS_PER_STEP;
-                let off = (on + note.len.max(1) as f32 * BEATS_PER_STEP) % loop_len;
-                if crossed(prev, now, on) {
+                let on = note.step as f64 * BEATS_PER_STEP as f64;
+                let off = (on + note.len.max(1) as f64 * BEATS_PER_STEP as f64) % loop_len;
+                if crossed(prev_pos, now_pos, on, loop_len) {
                     events.push(NoteEvent::NoteOn {
                         note: note.pitch,
                         velocity: 0.8,
                     });
-                    seq.held.push((note.pitch, off));
+                    seq.held.push((note.pitch, off as f32));
                 }
-                if crossed(prev, now, off) {
+                if crossed(prev_pos, now_pos, off, loop_len) {
                     events.push(NoteEvent::NoteOff { note: note.pitch });
-                    seq.held.retain(|(p, _)| *p != note.pitch);
+                    let off_f = off as f32;
+                    if let Some(i) = seq
+                        .held
+                        .iter()
+                        .position(|(p, t)| *p == note.pitch && (*t - off_f).abs() < 1e-5)
+                    {
+                        seq.held.remove(i);
+                    }
                 }
             }
             let voice_ids = seq.voices.clone();
             for id in voice_ids {
+                for &e in &events {
+                    voice_note(graph, &mut self.voice_holds, id, e);
+                }
+            }
+        }
+    }
+}
+
+fn voice_note(
+    graph: &mut Graph,
+    holds: &mut HashMap<NodeId, HashMap<u8, u32>>,
+    id: NodeId,
+    event: NoteEvent,
+) {
+    let slot = holds.entry(id).or_default();
+    match event {
+        NoteEvent::NoteOn { note, velocity } => {
+            let count = slot.entry(note).or_insert(0);
+            *count += 1;
+            if *count == 1 {
                 if let Some(inst) = graph.node_mut::<PolyphonicInstrument>(id) {
-                    for &e in &events {
-                        inst.handle_event(e);
-                    }
+                    inst.handle_event(NoteEvent::NoteOn { note, velocity });
+                }
+            }
+        }
+        NoteEvent::NoteOff { note } => {
+            let count = slot.entry(note).or_insert(0);
+            if *count > 0 {
+                *count -= 1;
+            }
+            if *count == 0 {
+                slot.remove(&note);
+                if let Some(inst) = graph.node_mut::<PolyphonicInstrument>(id) {
+                    inst.handle_event(NoteEvent::NoteOff { note });
                 }
             }
         }
@@ -535,14 +591,28 @@ impl Node for ScopeTap {
 }
 
 fn seq_clock_id(patch: &Patch, seq_id: &str) -> Option<String> {
-    let clock_id = patch.links.iter().find_map(|(from, _, to, to_p)| {
-        (to == seq_id && to_p == "clock").then(|| from.clone())
-    })?;
-    patch
-        .nodes
-        .iter()
-        .find(|n| n.id == clock_id && n.kind == NodeKind::Clock)
-        .map(|n| n.id.clone())
+    let kind_of = |id: &str| {
+        patch
+            .nodes
+            .iter()
+            .find(|n| n.id == id)
+            .map(|n| n.kind)
+    };
+    let mut cur = seq_id.to_string();
+    let mut seen = HashSet::new();
+    loop {
+        if !seen.insert(cur.clone()) {
+            return None;
+        }
+        let (from, from_p) = patch.links.iter().find_map(|(from, from_p, to, to_p)| {
+            (to == &cur && to_p == "clock").then(|| (from.clone(), from_p.clone()))
+        })?;
+        match (kind_of(&from), from_p.as_str()) {
+            (Some(NodeKind::Clock), "clock") => return Some(from),
+            (Some(NodeKind::Sequencer), "clock") => cur = from,
+            _ => return None,
+        }
+    }
 }
 
 fn seq_voices(patch: &Patch, seq_id: &str, voices: &HashMap<String, NodeId>) -> Vec<NodeId> {
@@ -570,7 +640,7 @@ fn seq_voices(patch: &Patch, seq_id: &str, voices: &HashMap<String, NodeId>) -> 
                         out.push(id);
                     }
                 }
-                (Some(NodeKind::NoteJoin), "a" | "b") => {
+                (Some(NodeKind::NoteJoin), p) if NOTE_JOIN_INS.contains(&p) => {
                     stack.push((to.clone(), "out".into()));
                 }
                 _ => {}
@@ -586,10 +656,51 @@ fn seq_voices(patch: &Patch, seq_id: &str, voices: &HashMap<String, NodeId>) -> 
     uniq
 }
 
-fn crossed(prev: f32, now: f32, t: f32) -> bool {
-    if now >= prev {
-        t > prev && t <= now
-    } else {
-        t > prev || t <= now
+fn crossed(prev: f64, now: f64, t: f64, period: f64) -> bool {
+    if now <= prev || period <= 0.0 {
+        return false;
+    }
+    let lo = (prev - t) / period;
+    let hi = (now - t) / period;
+    lo.ceil() < hi
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BAR: f64 = 4.0;
+    const DT: f64 = 120.0 / 48_000.0 / 60.0;
+
+    #[test]
+    fn first_step_fires_on_play() {
+        assert!(crossed(0.0, DT, 0.0, BAR));
+        assert!(!crossed(DT, DT * 2.0, 0.0, BAR));
+    }
+
+    #[test]
+    fn wrap_fires_step0_once() {
+        assert!(crossed(BAR - DT, BAR + DT, 0.0, BAR));
+        assert!(!crossed(BAR + DT, BAR + DT * 2.0, 0.0, BAR));
+    }
+
+    #[test]
+    fn mid_grid_still_fires() {
+        assert!(crossed(0.24, 0.26, 0.25, BAR));
+        assert!(!crossed(0.26, 0.28, 0.25, BAR));
+    }
+
+    #[test]
+    fn long_play_still_advances() {
+        let sr = 48_000.0_f64;
+        let bpm = 120.0_f64;
+        let step = bpm / (sr * 60.0);
+        let mut beats = 4_096.0_f64;
+        beats += step;
+        assert!(beats > 4_096.0, "f64 still moves after many beats");
+        let mut f = 4_096.0_f32;
+        let before = f;
+        f += step as f32;
+        assert_eq!(f, before, "f32 already drops the sample step");
     }
 }

@@ -14,19 +14,22 @@ pub struct GraphDoc {
 }
 
 impl GraphDoc {
-    pub fn new_default() -> Self {
+    pub fn blank() -> Self {
         let mut space = NodeSpace::new();
         space.pan = Vec2::new(24.0, 24.0);
         space.register_type(port::AUDIO, "Audio", [0.35, 0.75, 0.95, 1.0]);
         space.register_type(port::CLOCK, "Clock", [0.95, 0.82, 0.28, 1.0]);
         space.register_type(port::NOTES, "Notes", [0.95, 0.55, 0.22, 1.0]);
-
-        let mut doc = Self {
+        Self {
             nodes: Vec::new(),
             space,
             next_serial: 1,
             output_id: String::new(),
-        };
+        }
+    }
+
+    pub fn new_default() -> Self {
+        let mut doc = Self::blank();
 
         let clock = doc.spawn_node(NodeKind::Clock, Vec2::new(40.0, 40.0));
         let seq_a = doc.spawn_node(NodeKind::Sequencer, Vec2::new(40.0, 180.0));
@@ -41,10 +44,10 @@ impl GraphDoc {
         let seq_b = doc.spawn_node(NodeKind::Sequencer, Vec2::new(40.0, 520.0));
         if let Some(n) = doc.nodes.iter_mut().find(|n| n.id == seq_b) {
             n.notes = vec![
-                SeqNote { step: 2, pitch: 72, len: 1 },
-                SeqNote { step: 6, pitch: 67, len: 1 },
-                SeqNote { step: 10, pitch: 72, len: 1 },
-                SeqNote { step: 14, pitch: 64, len: 1 },
+                SeqNote { step: 2, pitch: 62, len: 1 },
+                SeqNote { step: 6, pitch: 65, len: 1 },
+                SeqNote { step: 10, pitch: 69, len: 1 },
+                SeqNote { step: 14, pitch: 71, len: 1 },
             ];
         }
         let join = doc.spawn_node(NodeKind::NoteJoin, Vec2::new(320.0, 360.0));
@@ -57,8 +60,8 @@ impl GraphDoc {
 
         let _ = doc.connect(&clock, "clock", &seq_a, "clock");
         let _ = doc.connect(&clock, "clock", &seq_b, "clock");
-        let _ = doc.connect(&seq_a, "notes", &join, "a");
-        let _ = doc.connect(&seq_b, "notes", &join, "b");
+        let _ = doc.connect(&seq_a, "notes", &join, "1");
+        let _ = doc.connect(&seq_b, "notes", &join, "2");
         let _ = doc.connect(&join, "out", &voice, "notes");
         let _ = doc.connect(&voice, "out", &delay, "in");
         let _ = doc.connect(&delay, "out", &gain, "in");

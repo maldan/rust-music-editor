@@ -4,7 +4,7 @@ use glam::Vec2;
 use mega_ui::{NodePortSide, PlotView, Ui};
 
 use crate::compile::WAVEFORMS;
-use crate::graph::{port, GraphDoc, GraphNode, NodeKind, BEATS_PER_BAR};
+use crate::graph::{port, GraphDoc, GraphNode, NodeKind, BEATS_PER_BAR, NOTE_JOIN_INS};
 use crate::monitor::Monitor;
 
 use super::piano;
@@ -111,6 +111,7 @@ fn draw_body(ui: &mut Ui, node: &mut GraphNode, monitor: &Monitor, playing: bool
         }
         NodeKind::Sequencer => {
             ui.node_port(NodePortSide::Input, "clock", port::CLOCK);
+            ui.node_port(NodePortSide::Output, "clock", port::CLOCK);
             ui.label("Start bar");
             ui.drag_float("start", &mut node.seq_start, 1.0);
             node.seq_start = node.seq_start.max(0.0);
@@ -157,8 +158,9 @@ fn draw_body(ui: &mut Ui, node: &mut GraphNode, monitor: &Monitor, playing: bool
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
         NodeKind::NoteJoin => {
-            ui.node_port(NodePortSide::Input, "a", port::NOTES);
-            ui.node_port(NodePortSide::Input, "b", port::NOTES);
+            for p in NOTE_JOIN_INS {
+                ui.node_port(NodePortSide::Input, p, port::NOTES);
+            }
             ui.node_port(NodePortSide::Output, "out", port::NOTES);
         }
         NodeKind::Mix => {

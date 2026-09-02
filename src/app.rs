@@ -14,6 +14,7 @@ pub struct App {
     pub dock: DockState,
     pub playing: bool,
     pub monitor: Arc<Monitor>,
+    pub status: String,
     last_fp: u64,
     last_playing: bool,
     tx: EventSender<Patch>,
@@ -49,6 +50,7 @@ impl App {
             dock: default_dock(),
             playing: false,
             monitor,
+            status: String::new(),
             tx,
             _engine: engine,
         })
@@ -62,5 +64,39 @@ impl App {
         self.last_fp = fp;
         self.last_playing = self.playing;
         let _ = self.tx.send(Patch::from_doc(&self.graph, self.playing));
+    }
+
+    pub fn save_dialog(&mut self) {
+        let path = rfd::FileDialog::new()
+            .add_filter("Music graph", &["json"])
+            .set_file_name("graph.json")
+            .save_file();
+        let Some(mut path) = path else {
+            return;
+        };
+        if path.extension().is_none() {
+            path.set_extension("json");
+        }
+        match self.graph.save_to_path(&path) {
+            Ok(()) => self.status = format!("Saved {}", path.display()),
+            Err(e) => self.status = format!("Save failed: {e}"),
+        }
+    }
+
+    pub fn open_dialog(&mut self) {
+        let path = rfd::FileDialog::new()
+            .add_filter("Music graph", &["json"])
+            .pick_file();
+        let Some(path) = path else {
+            return;
+        };
+        match GraphDoc::load_from_path(&path) {
+            Ok(graph) => {
+                self.graph = graph;
+                self.playing = false;
+                self.status = format!("Opened {}", path.display());
+            }
+            Err(e) => self.status = format!("Open failed: {e}"),
+        }
     }
 }

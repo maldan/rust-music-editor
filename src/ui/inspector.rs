@@ -2,7 +2,7 @@ use mega_ui::Ui;
 
 use crate::graph::GraphDoc;
 
-pub fn draw(ui: &mut Ui, doc: &mut GraphDoc, playing: &mut bool) -> bool {
+pub fn draw(ui: &mut Ui, doc: &mut GraphDoc, playing: &mut bool, status: &str) -> bool {
     let play = if *playing { "Stop" } else { "Play" };
     if ui.button(play).clicked {
         *playing = !*playing;
@@ -49,6 +49,11 @@ pub fn draw(ui: &mut Ui, doc: &mut GraphDoc, playing: &mut bool) -> bool {
 
     if !can_act && selected.iter().any(|id| id == &doc.output_id) {
         ui.label("Output cannot be deleted.");
+    }
+
+    if !status.is_empty() {
+        ui.separator();
+        ui.label(status);
     }
 
     false

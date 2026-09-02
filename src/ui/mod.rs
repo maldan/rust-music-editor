@@ -39,6 +39,13 @@ impl Scene for App {
     ) -> bool {
         ui.menu_bar(|ui| {
             ui.menu("Graph", |ui| {
+                if ui.menu_item("Open JSON...").clicked() {
+                    state.open_dialog();
+                }
+                if ui.menu_item("Save JSON...").clicked() {
+                    state.save_dialog();
+                }
+                ui.separator();
                 if ui.menu_item("Fit view").clicked() {
                     state.graph.space.fit_view = true;
                 }
@@ -53,6 +60,7 @@ impl Scene for App {
             graph: doc,
             playing,
             monitor,
+            status,
             ..
         } = state;
 
@@ -61,7 +69,7 @@ impl Scene for App {
                 graph::draw(ui, doc, monitor, *playing);
             }
             "Inspector" => {
-                inspector::draw(ui, doc, playing);
+                inspector::draw(ui, doc, playing, status);
             }
             _ => {}
         });
