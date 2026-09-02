@@ -8,8 +8,8 @@ use mega_ui::{
 use crate::compile::WAVEFORMS;
 use crate::fft::{freq_ticks, SPEC_BINS, SPEC_COLS};
 use crate::graph::{
-    port, ARP_NAMES, CHORD_NAMES, EqPt, GraphDoc, GraphNode, NodeKind, MIX_INS, NOTE_JOIN_INS,
-    SEQ_MAX_BARS, SEQ_OCTAVE_MIN,
+    port, ARP_NAMES, CHORD_NAMES, EqPt, GraphDoc, GraphNode, NodeKind, MIX_INS, MIX_PAN_INS,
+    MIX_VOL_INS, NOTE_JOIN_INS, SEQ_MAX_BARS, SEQ_OCTAVE_MIN,
 };
 use crate::monitor::Monitor;
 
@@ -130,6 +130,8 @@ fn spawn_menu(ui: &mut Ui, page: &mut u8) -> Option<NodeKind> {
                 .or_else(|| leaf(ui, "Distortion", NodeKind::Distortion))
                 .or_else(|| leaf(ui, "Chorus", NodeKind::Chorus))
                 .or_else(|| leaf(ui, "Flanger", NodeKind::Flanger))
+                .or_else(|| leaf(ui, "Reverb", NodeKind::Reverb))
+                .or_else(|| leaf(ui, "Comp / Limit", NodeKind::Compressor))
                 .or_else(|| leaf(ui, "EQ Curve", NodeKind::Eq))
         }
         MATH => {
@@ -272,9 +274,11 @@ fn draw_body(ui: &mut Ui, node: &mut GraphNode, monitor: &Monitor) {
             for (i, name) in MIX_INS.iter().enumerate() {
                 ui.node_port(NodePortSide::Input, name, port::AUDIO);
                 ui.row(|ui| {
-                    labeled_slider(ui, &format!("Vol {name}"), &mut node.mix_strips[i].vol, 0.0..=1.5);
-                    labeled_slider(ui, &format!("Pan {name}"), &mut node.mix_strips[i].pan, -1.0..=1.0);
+                    ui.slider(&format!("mv{i}"), &mut node.mix_strips[i].vol, 0.0..=1.5);
+                    ui.slider(&format!("mp{i}"), &mut node.mix_strips[i].pan, -1.0..=1.0);
                 });
+                ui.node_port(NodePortSide::Input, MIX_VOL_INS[i], port::AUDIO);
+                ui.node_port(NodePortSide::Input, MIX_PAN_INS[i], port::AUDIO);
             }
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
@@ -353,6 +357,22 @@ fn draw_body(ui: &mut Ui, node: &mut GraphNode, monitor: &Monitor) {
             ui.label("Mix");
             ui.drag_float("fl_mix", &mut node.flange_mix, 0.05);
             node.flange_mix = node.flange_mix.clamp(0.0, 1.0);
+            ui.node_port(NodePortSide::Output, "out", port::AUDIO);
+        }
+        NodeKind::Reverb => {
+            ui.node_port(NodePortSide::Input, "in", port::AUDIO);
+            labeled_slider(ui, "Room", &mut node.rev_room, 0.0..=1.0);
+            labeled_slider(ui, "Damp", &mut node.rev_damp, 0.0..=1.0);
+            labeled_slider(ui, "Dry / Wet", &mut node.rev_mix, 0.0..=1.0);
+            ui.node_port(NodePortSide::Output, "out", port::AUDIO);
+        }
+        NodeKind::Compressor => {
+            ui.node_port(NodePortSide::Input, "in", port::AUDIO);
+            labeled_slider(ui, "Threshold", &mut node.comp_thresh, 0.05..=1.0);
+            labeled_slider(ui, "Ratio (20 = limit)", &mut node.comp_ratio, 1.0..=20.0);
+            labeled_slider(ui, "Attack, sec", &mut node.comp_attack, 0.001..=0.15);
+            labeled_slider(ui, "Release, sec", &mut node.comp_release, 0.02..=0.8);
+            labeled_slider(ui, "Makeup", &mut node.comp_makeup, 0.5..=4.0);
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
         NodeKind::Mul => {

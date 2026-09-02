@@ -214,6 +214,14 @@ impl GraphDoc {
             n.flange_depth.to_bits().hash(&mut h);
             n.flange_feedback.to_bits().hash(&mut h);
             n.flange_mix.to_bits().hash(&mut h);
+            n.rev_mix.to_bits().hash(&mut h);
+            n.rev_room.to_bits().hash(&mut h);
+            n.rev_damp.to_bits().hash(&mut h);
+            n.comp_thresh.to_bits().hash(&mut h);
+            n.comp_ratio.to_bits().hash(&mut h);
+            n.comp_attack.to_bits().hash(&mut h);
+            n.comp_release.to_bits().hash(&mut h);
+            n.comp_makeup.to_bits().hash(&mut h);
             n.mix_a.to_bits().hash(&mut h);
             n.mix_b.to_bits().hash(&mut h);
             n.mix_strips.len().hash(&mut h);

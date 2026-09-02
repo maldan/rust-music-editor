@@ -18,6 +18,8 @@ pub const BEATS_PER_STEP: f32 = 0.25;
 pub const BEATS_PER_BAR: f32 = SEQ_STEPS as f32 * BEATS_PER_STEP;
 pub const NOTE_JOIN_INS: [&str; 8] = ["1", "2", "3", "4", "5", "6", "7", "8"];
 pub const MIX_INS: [&str; 8] = NOTE_JOIN_INS;
+pub const MIX_VOL_INS: [&str; 8] = ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8"];
+pub const MIX_PAN_INS: [&str; 8] = ["p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct SeqNote {
@@ -43,6 +45,8 @@ pub enum NodeKind {
     Distortion,
     Chorus,
     Flanger,
+    Reverb,
+    Compressor,
     Eq,
     Mul,
     Clamp,
@@ -74,6 +78,8 @@ impl NodeKind {
             Self::Distortion => "Distortion",
             Self::Chorus => "Chorus",
             Self::Flanger => "Flanger",
+            Self::Reverb => "Reverb",
+            Self::Compressor => "Comp / Limit",
             Self::Eq => "EQ Curve",
             Self::Mul => "Multiply",
             Self::Clamp => "Clamp",
@@ -169,6 +175,22 @@ pub struct GraphNode {
     pub flange_feedback: f32,
     #[serde(default = "default_flange_mix")]
     pub flange_mix: f32,
+    #[serde(default = "default_rev_mix")]
+    pub rev_mix: f32,
+    #[serde(default = "default_rev_room")]
+    pub rev_room: f32,
+    #[serde(default = "default_rev_damp")]
+    pub rev_damp: f32,
+    #[serde(default = "default_comp_thresh")]
+    pub comp_thresh: f32,
+    #[serde(default = "default_comp_ratio")]
+    pub comp_ratio: f32,
+    #[serde(default = "default_comp_attack")]
+    pub comp_attack: f32,
+    #[serde(default = "default_comp_release")]
+    pub comp_release: f32,
+    #[serde(default = "default_comp_makeup")]
+    pub comp_makeup: f32,
     #[serde(default = "default_mix")]
     pub mix_a: f32,
     #[serde(default = "default_mix")]
@@ -306,6 +328,30 @@ fn default_flange_feedback() -> f32 {
 fn default_flange_mix() -> f32 {
     0.5
 }
+fn default_rev_mix() -> f32 {
+    0.35
+}
+fn default_rev_room() -> f32 {
+    0.7
+}
+fn default_rev_damp() -> f32 {
+    0.4
+}
+fn default_comp_thresh() -> f32 {
+    0.35
+}
+fn default_comp_ratio() -> f32 {
+    4.0
+}
+fn default_comp_attack() -> f32 {
+    0.012
+}
+fn default_comp_release() -> f32 {
+    0.12
+}
+fn default_comp_makeup() -> f32 {
+    1.4
+}
 fn default_arp_rate() -> f32 {
     1.0
 }
@@ -372,6 +418,14 @@ impl GraphNode {
             flange_depth: 0.7,
             flange_feedback: 0.55,
             flange_mix: 0.5,
+            rev_mix: 0.35,
+            rev_room: 0.7,
+            rev_damp: 0.4,
+            comp_thresh: 0.35,
+            comp_ratio: 4.0,
+            comp_attack: 0.012,
+            comp_release: 0.12,
+            comp_makeup: 1.4,
             mix_a: 1.0,
             mix_b: 1.0,
             mix_strips: match kind {
@@ -814,6 +868,8 @@ mod tests {
         assert!(!NodeKind::NoteJoin.can_bypass());
         assert!(NodeKind::Chord.can_bypass());
         assert!(NodeKind::Eq.can_bypass());
+        assert!(NodeKind::Reverb.can_bypass());
+        assert!(NodeKind::Compressor.can_bypass());
     }
 
     #[test]

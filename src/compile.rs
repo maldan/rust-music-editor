@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use mega_audio::dsp::{
-    AdsrParams, BiquadFilter, Chorus, Clamp, Delay, Distortion, FilterKind, Flanger, GainCv, Mixer,
-    Mul, Oscillator, Remap, StereoGain, StereoMixer, Waveform,
+    AdsrParams, BiquadFilter, Chorus, Clamp, Compressor, Delay, Distortion, FilterKind, Flanger,
+    GainCv, Mixer, Mul, Oscillator, Remap, Reverb, StereoGain, StereoMixer, Waveform,
 };
 use mega_audio::graph::{Bypass, Graph, Node, NodeId, ProcessContext};
 use mega_audio::instrument::PolyphonicInstrument;
@@ -19,7 +19,7 @@ use crate::fft::{
 };
 use crate::graph::{
     midi_shift, output_port_type, parse_seq_when, port, seq_window, GraphDoc, NodeKind, SeqNote,
-    BEATS_PER_BAR, BEATS_PER_STEP, MIX_INS, NOTE_JOIN_INS,
+    BEATS_PER_BAR, BEATS_PER_STEP, MIX_INS, MIX_PAN_INS, MIX_VOL_INS, NOTE_JOIN_INS,
 };
 use crate::monitor::{FftBuf, Monitor, ScopeBuf};
 
@@ -119,6 +119,8 @@ fn dsp_bypass(kind: NodeKind) -> Bypass {
         | NodeKind::Distortion
         | NodeKind::Chorus
         | NodeKind::Flanger
+        | NodeKind::Reverb
+        | NodeKind::Compressor
         | NodeKind::Eq
         | NodeKind::Mul
         | NodeKind::Clamp
@@ -143,6 +145,8 @@ fn dsp_kind(kind: NodeKind) -> bool {
             | NodeKind::Distortion
             | NodeKind::Chorus
             | NodeKind::Flanger
+            | NodeKind::Reverb
+            | NodeKind::Compressor
             | NodeKind::Eq
             | NodeKind::Mul
             | NodeKind::Clamp
@@ -152,6 +156,21 @@ fn dsp_kind(kind: NodeKind) -> bool {
             | NodeKind::Spectrogram
             | NodeKind::Voice
     )
+}
+
+fn port_wired(patch: &Patch, node: &str, port: &str) -> bool {
+    patch.links.iter().any(|l| l.2 == node && l.3 == port)
+}
+
+fn apply_mixer_strips(mix: &mut StereoMixer, n: &crate::graph::GraphNode, patch: &Patch) {
+    let strips = mix.gains.len().min(MIX_INS.len());
+    for i in 0..strips {
+        let s = n.mix_strip(i);
+        mix.gains[i] = s.vol.clamp(0.0, 1.5);
+        mix.pans[i] = s.pan.clamp(-1.0, 1.0);
+        mix.vol_from_cv[i] = port_wired(patch, &n.id, MIX_VOL_INS[i]);
+        mix.pan_from_cv[i] = port_wired(patch, &n.id, MIX_PAN_INS[i]);
+    }
 }
 
 pub struct Build {
@@ -259,16 +278,15 @@ pub fn build_graph(patch: &Patch, sample_rate: f32, monitor: &Monitor) -> Build 
                 out_port.insert((n.id.clone(), "out".into()), (id, 0));
             }
             NodeKind::Mixer => {
-                let mut mix = StereoMixer::new(MIX_INS.len());
-                for i in 0..MIX_INS.len() {
-                    let s = n.mix_strip(i);
-                    mix.gains[i] = s.vol.clamp(0.0, 1.5);
-                    mix.pans[i] = s.pan.clamp(-1.0, 1.0);
-                }
+                let n_strips = MIX_INS.len();
+                let mut mix = StereoMixer::new(n_strips);
+                apply_mixer_strips(&mut mix, n, patch);
                 let id = graph.add_node(Box::new(mix));
                 dsp.insert(n.id.clone(), id);
                 for (i, p) in MIX_INS.iter().enumerate() {
                     in_port.insert((n.id.clone(), (*p).into()), (id, i));
+                    in_port.insert((n.id.clone(), MIX_VOL_INS[i].into()), (id, n_strips + i));
+                    in_port.insert((n.id.clone(), MIX_PAN_INS[i].into()), (id, n_strips * 2 + i));
                 }
                 in_port.insert((n.id.clone(), "a".into()), (id, 0));
                 in_port.insert((n.id.clone(), "b".into()), (id, 1));
@@ -325,6 +343,28 @@ pub fn build_graph(patch: &Patch, sample_rate: f32, monitor: &Monitor) -> Build 
                 fl.feedback = n.flange_feedback.clamp(0.0, 0.95);
                 fl.mix = n.flange_mix.clamp(0.0, 1.0);
                 let id = graph.add_node(Box::new(fl));
+                dsp.insert(n.id.clone(), id);
+                in_port.insert((n.id.clone(), "in".into()), (id, 0));
+                out_port.insert((n.id.clone(), "out".into()), (id, 0));
+            }
+            NodeKind::Reverb => {
+                let mut rv = Reverb::new(sample_rate);
+                rv.room = n.rev_room.clamp(0.0, 1.0);
+                rv.damp = n.rev_damp.clamp(0.0, 1.0);
+                rv.mix = n.rev_mix.clamp(0.0, 1.0);
+                let id = graph.add_node(Box::new(rv));
+                dsp.insert(n.id.clone(), id);
+                in_port.insert((n.id.clone(), "in".into()), (id, 0));
+                out_port.insert((n.id.clone(), "out".into()), (id, 0));
+            }
+            NodeKind::Compressor => {
+                let mut c = Compressor::new(sample_rate);
+                c.threshold = n.comp_thresh.clamp(0.02, 1.0);
+                c.ratio = n.comp_ratio.clamp(1.0, 20.0);
+                c.attack = n.comp_attack.clamp(0.0005, 0.2);
+                c.release = n.comp_release.clamp(0.01, 1.5);
+                c.makeup = n.comp_makeup.clamp(0.25, 8.0);
+                let id = graph.add_node(Box::new(c));
                 dsp.insert(n.id.clone(), id);
                 in_port.insert((n.id.clone(), "in".into()), (id, 0));
                 out_port.insert((n.id.clone(), "out".into()), (id, 0));
@@ -657,6 +697,22 @@ impl Live {
                         f.mix = n.flange_mix.clamp(0.0, 1.0);
                     }
                 }
+                NodeKind::Reverb => {
+                    if let Some(r) = graph.node_mut::<Reverb>(id) {
+                        r.room = n.rev_room.clamp(0.0, 1.0);
+                        r.damp = n.rev_damp.clamp(0.0, 1.0);
+                        r.mix = n.rev_mix.clamp(0.0, 1.0);
+                    }
+                }
+                NodeKind::Compressor => {
+                    if let Some(c) = graph.node_mut::<Compressor>(id) {
+                        c.threshold = n.comp_thresh.clamp(0.02, 1.0);
+                        c.ratio = n.comp_ratio.clamp(1.0, 20.0);
+                        c.attack = n.comp_attack.clamp(0.0005, 0.2);
+                        c.release = n.comp_release.clamp(0.01, 1.5);
+                        c.makeup = n.comp_makeup.clamp(0.25, 8.0);
+                    }
+                }
                 NodeKind::Mix => {
                     if let Some(mix) = graph.node_mut::<Mixer>(id) {
                         mix.gains[0] = n.mix_a;
@@ -665,11 +721,7 @@ impl Live {
                 }
                 NodeKind::Mixer => {
                     if let Some(mix) = graph.node_mut::<StereoMixer>(id) {
-                        for i in 0..mix.gains.len() {
-                            let s = n.mix_strip(i);
-                            mix.gains[i] = s.vol.clamp(0.0, 1.5);
-                            mix.pans[i] = s.pan.clamp(-1.0, 1.0);
-                        }
+                        apply_mixer_strips(mix, n, patch);
                     }
                 }
                 _ => {}
@@ -1677,5 +1729,41 @@ mod tests {
             peak_r < peak_l * 0.05,
             "right leaked {peak_r} vs left {peak_l}"
         );
+    }
+
+    #[test]
+    fn mixer_wired_vol_cv_ignores_slider_flag() {
+        let osc = crate::graph::GraphNode::new("osc".into(), NodeKind::Osc, glam::Vec2::ZERO);
+        let mix = crate::graph::GraphNode::new("mix".into(), NodeKind::Mixer, glam::Vec2::ZERO);
+        let out = crate::graph::GraphNode::new("out".into(), NodeKind::Output, glam::Vec2::ZERO);
+        let patch = patch_with(
+            vec![osc, mix, out],
+            vec![
+                ("osc", "out", "mix", "1"),
+                ("osc", "out", "mix", "v1"),
+                ("mix", "out", "out", "in"),
+            ],
+        );
+        let mon = Monitor::default();
+        let mut build = build_graph(&patch, 48_000.0, &mon);
+        let id = *build.dsp.get("mix").unwrap();
+        let mix = build.graph.node_mut::<StereoMixer>(id).unwrap();
+        assert!(mix.vol_from_cv[0]);
+        assert!(!mix.pan_from_cv[0]);
+    }
+
+    #[test]
+    fn reverb_and_comp_are_dsp() {
+        assert!(dsp_kind(NodeKind::Reverb));
+        assert!(dsp_kind(NodeKind::Compressor));
+        assert_eq!(dsp_bypass(NodeKind::Reverb), Bypass::Thru);
+        assert_eq!(dsp_bypass(NodeKind::Compressor), Bypass::Thru);
+        let rv = crate::graph::GraphNode::new("rv".into(), NodeKind::Reverb, glam::Vec2::ZERO);
+        let cp = crate::graph::GraphNode::new("cp".into(), NodeKind::Compressor, glam::Vec2::ZERO);
+        let patch = patch_with(vec![rv, cp], vec![]);
+        let mon = Monitor::default();
+        let build = build_graph(&patch, 48_000.0, &mon);
+        assert!(build.dsp.contains_key("rv"));
+        assert!(build.dsp.contains_key("cp"));
     }
 }

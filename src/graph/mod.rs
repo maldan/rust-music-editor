@@ -7,5 +7,5 @@ pub use file::{with_graph_ext, FILE_EXT};
 pub use node::{
     beats_to_tick, midi_shift, output_port_type, parse_seq_when, port, seq_window, GraphNode,
     NodeKind, SeqNote, ARP_NAMES, BEATS_PER_BAR, BEATS_PER_STEP, CHORD_NAMES, EqPt, MIX_INS,
-    NOTE_JOIN_INS, SEQ_MAX_BARS, SEQ_OCTAVE_MIN, SEQ_PITCHES, SEQ_STEPS,
+    MIX_PAN_INS, MIX_VOL_INS, NOTE_JOIN_INS, SEQ_MAX_BARS, SEQ_OCTAVE_MIN, SEQ_PITCHES, SEQ_STEPS,
 };
