@@ -1,12 +1,38 @@
 use mega_ui::Ui;
 
-use crate::graph::GraphDoc;
+use crate::graph::{beats_to_tick, GraphDoc};
+use crate::monitor::Monitor;
 
-pub fn draw(ui: &mut Ui, doc: &mut GraphDoc, playing: &mut bool, status: &str) -> bool {
-    let play = if *playing { "Stop" } else { "Play" };
-    if ui.button(play).clicked {
-        *playing = !*playing;
-    }
+pub fn draw(
+    ui: &mut Ui,
+    doc: &mut GraphDoc,
+    playing: &mut bool,
+    monitor: &Monitor,
+    status: &str,
+) -> bool {
+    ui.horizontal(|ui| {
+        ui.label(&format!("Tick {}", beats_to_tick(monitor.song_beats())));
+        ui.label("From");
+        ui.drag_int("from", &mut doc.play_from, 1);
+        doc.play_from = doc.play_from.max(1);
+        ui.label("BPM");
+        ui.drag_float("bpm", &mut doc.bpm, 1.0);
+        doc.bpm = doc.bpm.clamp(40.0, 300.0);
+    });
+    ui.horizontal(|ui| {
+        let play = if *playing { "Stop" } else { "Play" };
+        if ui.button(play).clicked {
+            if *playing {
+                *playing = false;
+            } else {
+                doc.cue_play();
+                *playing = true;
+            }
+        }
+        if ui.button("Reset").clicked {
+            doc.reset_tick();
+        }
+    });
 
     ui.separator();
     ui.label("Selection");

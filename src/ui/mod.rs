@@ -32,7 +32,7 @@ impl Scene for App {
     fn build(
         ui: &mut Ui,
         state: &mut Self,
-        viewport: Vec2,
+        _viewport: Vec2,
         _dt: f32,
         _stats: DrawStats,
         _keys: &KeyEvents,
@@ -52,9 +52,6 @@ impl Scene for App {
             });
         });
 
-        let menu_h = 26.0 * ui.scale();
-        let dock_size = Vec2::new(viewport.x, (viewport.y - menu_h).max(1.0));
-
         let App {
             dock,
             graph: doc,
@@ -64,12 +61,15 @@ impl Scene for App {
             ..
         } = state;
 
+        let dock_size = ui.available_size();
+        let dock_size = Vec2::new(dock_size.x.max(1.0), dock_size.y.max(120.0));
+
         ui.dock_space("main", dock_size, dock, |ui, tab| match tab {
             "Graph" => {
-                graph::draw(ui, doc, monitor, *playing);
+                graph::draw(ui, doc, monitor);
             }
             "Inspector" => {
-                inspector::draw(ui, doc, playing, status);
+                inspector::draw(ui, doc, playing, monitor, status);
             }
             _ => {}
         });

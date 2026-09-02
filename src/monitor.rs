@@ -1,7 +1,7 @@
 //! Lock-free-ish UI meters: playhead bits and a sample ring for Scope nodes.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub const SCOPE_LEN: usize = 512;
@@ -42,9 +42,18 @@ impl ScopeBuf {
 pub struct Monitor {
     playheads: Mutex<HashMap<String, Arc<AtomicU32>>>,
     scopes: Mutex<HashMap<String, Arc<ScopeBuf>>>,
+    song_beats: AtomicU64,
 }
 
 impl Monitor {
+    pub fn set_song_beats(&self, beats: f64) {
+        self.song_beats.store(beats.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn song_beats(&self) -> f64 {
+        f64::from_bits(self.song_beats.load(Ordering::Relaxed))
+    }
+
     pub fn playhead_slot(&self, id: &str) -> Arc<AtomicU32> {
         let mut m = self.playheads.lock().unwrap_or_else(|e| e.into_inner());
         m.entry(id.to_string())

@@ -31,6 +31,7 @@ pub enum NodeKind {
     Gain,
     Mix,
     NoteJoin,
+    Transpose,
     Delay,
     Scope,
     Clock,
@@ -48,6 +49,7 @@ impl NodeKind {
             Self::Gain => "Gain",
             Self::Mix => "Join Audio",
             Self::NoteJoin => "Join Notes",
+            Self::Transpose => "Transpose",
             Self::Delay => "Delay / Echo",
             Self::Scope => "Waveform",
             Self::Clock => "Clock",
@@ -65,7 +67,9 @@ impl NodeKind {
 pub fn output_port_type(kind: NodeKind, port: &str) -> u16 {
     match (kind, port) {
         (NodeKind::Clock, "clock") | (NodeKind::Sequencer, "clock") => port::CLOCK,
-        (NodeKind::Sequencer, "notes") | (NodeKind::NoteJoin, "out") => port::NOTES,
+        (NodeKind::Sequencer, "notes")
+        | (NodeKind::NoteJoin, "out")
+        | (NodeKind::Transpose, "out") => port::NOTES,
         _ => port::AUDIO,
     }
 }
@@ -101,12 +105,23 @@ pub struct GraphNode {
     pub mix_b: f32,
     #[serde(default = "default_bpm")]
     pub bpm: f32,
+    /// Play windows: `1 3 8` (one bar each) or `1-2 5-1` (start-length). Empty = always.
+    /// Bar numbers are 1-based. Length `0` means from that bar onward.
     #[serde(default)]
+    pub seq_when: String,
+    #[serde(default, skip_serializing)]
     pub seq_start: f32,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub seq_bars: f32,
     #[serde(default)]
     pub notes: Vec<SeqNote>,
+    #[serde(default)]
+    pub transpose_notes: i32,
+    #[serde(default)]
+    pub transpose_octaves: i32,
+    /// Time shift in sequencer cells (1 = one 16th). Fractions allowed.
+    #[serde(default)]
+    pub transpose_steps: f32,
 }
 
 fn default_freq() -> f32 {
@@ -165,10 +180,38 @@ impl GraphNode {
             mix_a: 1.0,
             mix_b: 1.0,
             bpm: 120.0,
+            seq_when: String::new(),
             seq_start: 0.0,
             seq_bars: 0.0,
             notes: Vec::new(),
+            transpose_notes: 0,
+            transpose_octaves: 0,
+            transpose_steps: 0.0,
         }
+    }
+
+    pub fn pitch_shift(&self) -> i32 {
+        self.transpose_notes + self.transpose_octaves * 12
+    }
+
+    pub fn time_shift_beats(&self) -> f64 {
+        self.transpose_steps as f64 * BEATS_PER_STEP as f64
+    }
+
+    /// Lift old `seq_start` / `seq_bars` into `seq_when` after JSON load.
+    pub fn migrate_seq_when(&mut self) {
+        if !self.seq_when.trim().is_empty() {
+            return;
+        }
+        let start = self.seq_start.max(0.0).floor() as i32;
+        let bars = self.seq_bars.max(0.0).floor() as i32;
+        self.seq_when = if start == 0 && bars == 0 {
+            String::new()
+        } else if bars == 0 {
+            format!("{}-0", start + 1)
+        } else {
+            format!("{}-{}", start + 1, bars)
+        };
     }
 
     pub fn toggle_note(&mut self, step: u8, pitch: u8) {
@@ -185,5 +228,168 @@ impl GraphNode {
                 len: 1,
             });
         }
+    }
+}
+
+pub fn midi_shift(pitch: u8, semitones: i32) -> u8 {
+    (pitch as i32 + semitones).clamp(0, 127) as u8
+}
+
+/// Beat ranges `[start, end)`. Empty means always (from beat 0).
+pub fn parse_seq_when(src: &str) -> Vec<(f64, f64)> {
+    let bar = BEATS_PER_BAR as f64;
+    let mut out = Vec::new();
+    for raw in src.split(|c: char| c.is_whitespace() || c == ',') {
+        if raw.is_empty() {
+            continue;
+        }
+        let (start_s, len_s) = match raw.split_once('-') {
+            Some((a, b)) => (a, b),
+            None => (raw, "1"),
+        };
+        let Ok(start_bar) = start_s.parse::<i32>() else {
+            continue;
+        };
+        if start_bar < 1 {
+            continue;
+        }
+        let len_bars = if len_s.is_empty() {
+            0
+        } else {
+            match len_s.parse::<i32>() {
+                Ok(n) if n >= 0 => n,
+                _ => continue,
+            }
+        };
+        let start = (start_bar - 1) as f64 * bar;
+        let end = if len_bars == 0 {
+            f64::INFINITY
+        } else {
+            start + len_bars as f64 * bar
+        };
+        out.push((start, end));
+    }
+    out
+}
+
+pub fn seq_window(windows: &[(f64, f64)], song: f64) -> Option<(f64, f64)> {
+    if windows.is_empty() {
+        return Some((0.0, f64::INFINITY));
+    }
+    windows
+        .iter()
+        .copied()
+        .find(|(start, end)| song >= *start && song < *end)
+}
+
+pub fn parse_tick(src: &str) -> i32 {
+    src.split(|c: char| c.is_whitespace() || c == ',')
+        .find_map(|tok| tok.parse::<i32>().ok().filter(|&n| n >= 1))
+        .unwrap_or(1)
+}
+
+pub fn tick_to_beats(tick: i32) -> f64 {
+    (tick.max(1) - 1) as f64 * BEATS_PER_BAR as f64
+}
+
+pub fn beats_to_tick(beats: f64) -> i32 {
+    (beats.max(0.0) / BEATS_PER_BAR as f64).floor() as i32 + 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn beats(bar: i32) -> f64 {
+        (bar - 1) as f64 * BEATS_PER_BAR as f64
+    }
+
+    #[test]
+    fn empty_when_is_always() {
+        assert!(parse_seq_when("").is_empty());
+        assert!(parse_seq_when("   ").is_empty());
+    }
+
+    #[test]
+    fn list_is_one_bar_each() {
+        assert_eq!(
+            parse_seq_when("1 2 5 1"),
+            vec![
+                (beats(1), beats(2)),
+                (beats(2), beats(3)),
+                (beats(5), beats(6)),
+                (beats(1), beats(2)),
+            ]
+        );
+    }
+
+    #[test]
+    fn start_len_pairs() {
+        assert_eq!(
+            parse_seq_when("1-2 5-1"),
+            vec![(beats(1), beats(3)), (beats(5), beats(6))]
+        );
+    }
+
+    #[test]
+    fn zero_len_is_open_ended() {
+        assert_eq!(parse_seq_when("3-0"), vec![(beats(3), f64::INFINITY)]);
+        assert_eq!(parse_seq_when("3-"), vec![(beats(3), f64::INFINITY)]);
+    }
+
+    #[test]
+    fn commas_and_junk() {
+        assert_eq!(
+            parse_seq_when("1-2, foo, 5"),
+            vec![(beats(1), beats(3)), (beats(5), beats(6))]
+        );
+    }
+
+    #[test]
+    fn migrate_legacy_fields() {
+        let mut n = GraphNode::new("n1".into(), NodeKind::Sequencer, Vec2::ZERO);
+        n.seq_start = 2.0;
+        n.seq_bars = 4.0;
+        n.migrate_seq_when();
+        assert_eq!(n.seq_when, "3-4");
+        n.migrate_seq_when();
+        assert_eq!(n.seq_when, "3-4");
+    }
+
+    #[test]
+    fn tick_field_is_cue_not_clock() {
+        assert_eq!(parse_tick(""), 1);
+        assert_eq!(parse_tick("2"), 2);
+        assert_eq!(parse_tick("  5 extra"), 5);
+        assert_eq!(parse_tick("0"), 1);
+        assert_eq!(tick_to_beats(1), 0.0);
+        assert_eq!(tick_to_beats(2), BEATS_PER_BAR as f64);
+        assert_eq!(beats_to_tick(0.0), 1);
+        assert_eq!(beats_to_tick(BEATS_PER_BAR as f64), 2);
+    }
+
+    #[test]
+    fn seq_window_picks_first_match() {
+        let bar = BEATS_PER_BAR as f64;
+        let wins = vec![(0.0, bar * 2.0), (bar * 4.0, bar * 5.0)];
+        assert_eq!(seq_window(&wins, 0.0), Some((0.0, bar * 2.0)));
+        assert_eq!(seq_window(&wins, bar * 1.5), Some((0.0, bar * 2.0)));
+        assert_eq!(seq_window(&wins, bar * 2.0), None);
+        assert_eq!(seq_window(&wins, bar * 4.0), Some((bar * 4.0, bar * 5.0)));
+        assert_eq!(seq_window(&[], 99.0), Some((0.0, f64::INFINITY)));
+    }
+
+    #[test]
+    fn transpose_c4() {
+        let mut n = GraphNode::new("t".into(), NodeKind::Transpose, Vec2::ZERO);
+        n.transpose_notes = 1;
+        assert_eq!(midi_shift(60, n.pitch_shift()), 61);
+        n.transpose_notes = 0;
+        n.transpose_octaves = 1;
+        assert_eq!(midi_shift(60, n.pitch_shift()), 72);
+        n.transpose_notes = 1;
+        assert_eq!(midi_shift(60, n.pitch_shift()), 73);
+        n.transpose_steps = 0.5;
+        assert!((n.time_shift_beats() - BEATS_PER_STEP as f64 * 0.5).abs() < 1e-9);
     }
 }

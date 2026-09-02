@@ -13,7 +13,10 @@ use mega_audio::graph::{Graph, Node, NodeId, ProcessContext};
 use mega_audio::instrument::PolyphonicInstrument;
 use mega_audio::note::NoteEvent;
 
-use crate::graph::{GraphDoc, NodeKind, SeqNote, BEATS_PER_BAR, BEATS_PER_STEP, NOTE_JOIN_INS};
+use crate::graph::{
+    midi_shift, parse_seq_when, seq_window, GraphDoc, NodeKind, SeqNote, BEATS_PER_BAR,
+    BEATS_PER_STEP, NOTE_JOIN_INS,
+};
 use crate::monitor::{Monitor, ScopeBuf};
 
 pub const WAVEFORMS: [(&str, Waveform); 5] = [
@@ -29,6 +32,9 @@ pub const MASTER_GAIN: f32 = 0.18;
 #[derive(Clone)]
 pub struct Patch {
     pub playing: bool,
+    pub bpm: f32,
+    pub seek_gen: u64,
+    pub seek_beats: f64,
     pub output_id: String,
     pub nodes: Vec<crate::graph::GraphNode>,
     pub links: Vec<(String, String, String, String)>,
@@ -38,6 +44,9 @@ impl Patch {
     pub fn from_doc(doc: &GraphDoc, playing: bool) -> Self {
         Self {
             playing,
+            bpm: doc.bpm.max(1.0),
+            seek_gen: doc.seek_gen,
+            seek_beats: doc.seek_beats.max(0.0),
             output_id: doc.output_id.clone(),
             nodes: doc.nodes.clone(),
             links: doc
@@ -94,7 +103,11 @@ pub fn build_graph(patch: &Patch, sample_rate: f32, monitor: &Monitor) -> Build 
 
     for n in &patch.nodes {
         match n.kind {
-            NodeKind::Output | NodeKind::Clock | NodeKind::Sequencer | NodeKind::NoteJoin => {}
+            NodeKind::Output
+            | NodeKind::Clock
+            | NodeKind::Sequencer
+            | NodeKind::NoteJoin
+            | NodeKind::Transpose => {}
             NodeKind::Voice => {
                 let wf = WAVEFORMS.get(n.waveform).map(|w| w.1).unwrap_or(Waveform::Saw);
                 let id = graph.add_node(Box::new(PolyphonicInstrument::new(
@@ -218,21 +231,17 @@ pub fn build_graph(patch: &Patch, sample_rate: f32, monitor: &Monitor) -> Build 
 }
 
 struct ClockRun {
-    bpm: f32,
-    song_beats: f64,
     out: Arc<AtomicU32>,
 }
 
 struct SeqRun {
     notes: Vec<SeqNote>,
     clock_id: String,
-    start_beats: f64,
-    end_beats: f64,
-    playhead: f32,
+    windows: Vec<(f64, f64)>,
     pos: f64,
     playhead_out: Arc<AtomicU32>,
-    voices: Vec<NodeId>,
-    held: Vec<(u8, f32)>,
+    targets: Vec<SeqTarget>,
+    held: Vec<(NodeId, u8, f32)>,
     was_active: bool,
 }
 
@@ -248,6 +257,9 @@ pub struct Live {
     seqs: HashMap<String, SeqRun>,
     voice_holds: HashMap<NodeId, HashMap<u8, u32>>,
     monitor: Arc<Monitor>,
+    song_beats: f64,
+    bpm: f32,
+    seek_gen: u64,
 }
 
 impl Live {
@@ -265,6 +277,9 @@ impl Live {
             seqs: HashMap::new(),
             voice_holds: HashMap::new(),
             monitor,
+            song_beats: patch.seek_beats.max(0.0),
+            bpm: patch.bpm.max(1.0),
+            seek_gen: patch.seek_gen,
         };
         live.rebuild_clocks(patch);
         live.rebuild_seqs(patch);
@@ -281,8 +296,6 @@ impl Live {
             next.insert(
                 n.id.clone(),
                 ClockRun {
-                    bpm: n.bpm.max(1.0),
-                    song_beats: prev.as_ref().map(|c| c.song_beats).unwrap_or(0.0),
                     out: prev
                         .map(|c| c.out)
                         .unwrap_or_else(|| self.monitor.playhead_slot(&n.id)),
@@ -304,14 +317,7 @@ impl Live {
             if !self.clocks.contains_key(&clock_id) {
                 continue;
             }
-            let start = n.seq_start.max(0.0).floor() as f64 * BEATS_PER_BAR as f64;
-            let bars = n.seq_bars.max(0.0).floor() as f64;
-            let end = if bars < 1.0 {
-                f64::INFINITY
-            } else {
-                start + bars * BEATS_PER_BAR as f64
-            };
-            let voices = seq_voices(patch, &n.id, &self.voices);
+            let targets = seq_targets(patch, &n.id, &self.voices);
             let prev = self.seqs.remove(&n.id);
             let playhead_out = prev
                 .as_ref()
@@ -322,12 +328,10 @@ impl Live {
                 SeqRun {
                     notes: n.notes.clone(),
                     clock_id,
-                    start_beats: start,
-                    end_beats: end,
-                    playhead: prev.as_ref().map(|p| p.playhead).unwrap_or(0.0),
+                    windows: parse_seq_when(&n.seq_when),
                     pos: prev.as_ref().map(|p| p.pos).unwrap_or(0.0),
                     playhead_out,
-                    voices,
+                    targets,
                     held: prev.as_ref().map(|p| p.held.clone()).unwrap_or_default(),
                     was_active: prev.map(|p| p.was_active).unwrap_or(false),
                 },
@@ -407,125 +411,133 @@ impl Live {
             mixer.gains[0] = if patch.playing { MASTER_GAIN } else { 0.0 };
         }
 
-        if self.playing && !patch.playing {
-            let held: Vec<(NodeId, u8)> = self
-                .seqs
-                .values()
-                .flat_map(|seq| {
-                    seq.voices
-                        .iter()
-                        .flat_map(|&id| seq.held.iter().map(move |(p, _)| (id, *p)))
-                })
-                .collect();
-            for (id, pitch) in held {
-                voice_note(graph, &mut self.voice_holds, id, NoteEvent::NoteOff { note: pitch });
-            }
-            for seq in self.seqs.values_mut() {
-                seq.held.clear();
-                seq.playhead = 0.0;
-                seq.pos = 0.0;
-                seq.was_active = false;
-            }
-            self.voice_holds.clear();
-            for clock in self.clocks.values_mut() {
-                clock.song_beats = 0.0;
-            }
+        self.bpm = patch.bpm.max(1.0);
+        if patch.seek_gen != self.seek_gen {
+            self.song_beats = patch.seek_beats.max(0.0);
+            self.seek_gen = patch.seek_gen;
+            self.silence_seqs(graph);
+        } else if self.playing && !patch.playing {
+            self.silence_seqs(graph);
         }
         self.playing = patch.playing;
     }
 
+    fn silence_seqs(&mut self, graph: &mut Graph) {
+        let held: Vec<(NodeId, u8)> = self
+            .seqs
+            .values()
+            .flat_map(|seq| seq.held.iter().map(|(id, p, _)| (*id, *p)))
+            .collect();
+        for (id, pitch) in held {
+            voice_note(graph, &mut self.voice_holds, id, NoteEvent::NoteOff { note: pitch });
+        }
+        for seq in self.seqs.values_mut() {
+            seq.held.clear();
+            seq.was_active = false;
+        }
+        self.voice_holds.clear();
+    }
+
     pub fn tick(&mut self, graph: &mut Graph) {
-        if !self.playing {
-            for seq in self.seqs.values() {
-                seq.playhead_out.store(f32::NAN.to_bits(), Ordering::Relaxed);
-            }
-            for clock in self.clocks.values() {
-                clock.out.store(0, Ordering::Relaxed);
-            }
-            return;
-        }
-        let sr = self.sample_rate as f64;
         let loop_len = BEATS_PER_BAR as f64;
-        for clock in self.clocks.values_mut() {
-            clock.song_beats += clock.bpm as f64 / (sr * 60.0);
-            clock
-                .out
-                .store((clock.song_beats as f32).to_bits(), Ordering::Relaxed);
+        if self.playing {
+            let sr = self.sample_rate as f64;
+            let step = self.bpm as f64 / (sr * 60.0);
+            self.song_beats += step;
+            let song = self.song_beats;
+            let seq_ids: Vec<String> = self.seqs.keys().cloned().collect();
+            for sid in seq_ids {
+                let Some(seq) = self.seqs.get_mut(&sid) else {
+                    continue;
+                };
+                if !self.clocks.contains_key(&seq.clock_id) {
+                    continue;
+                }
+                let win = seq_window(&seq.windows, song);
+                if seq.was_active && win.is_none() {
+                    seq_release(graph, &mut self.voice_holds, seq);
+                }
+                if win.is_none() {
+                    continue;
+                }
+                let now_pos = song;
+                let prev_pos = if !seq.was_active { song - step } else { seq.pos };
+                seq.pos = now_pos;
+                seq.was_active = true;
+                if seq.targets.is_empty() {
+                    continue;
+                }
+                let targets = seq.targets.clone();
+                for note in &seq.notes {
+                    let dur = note.len.max(1) as f64 * BEATS_PER_STEP as f64;
+                    for t in &targets {
+                        let on = (note.step as f64 * BEATS_PER_STEP as f64 + t.delay)
+                            .rem_euclid(loop_len);
+                        let off = (on + dur).rem_euclid(loop_len);
+                        let pitch = midi_shift(note.pitch, t.pitch);
+                        if crossed(prev_pos, now_pos, on, loop_len) {
+                            voice_note(
+                                graph,
+                                &mut self.voice_holds,
+                                t.voice,
+                                NoteEvent::NoteOn {
+                                    note: pitch,
+                                    velocity: 0.8,
+                                },
+                            );
+                            seq.held.push((t.voice, pitch, off as f32));
+                        }
+                        if crossed(prev_pos, now_pos, off, loop_len) {
+                            voice_note(
+                                graph,
+                                &mut self.voice_holds,
+                                t.voice,
+                                NoteEvent::NoteOff { note: pitch },
+                            );
+                            let off_f = off as f32;
+                            if let Some(i) = seq.held.iter().position(|(vid, p, tm)| {
+                                *vid == t.voice && *p == pitch && (*tm - off_f).abs() < 1e-5
+                            }) {
+                                seq.held.remove(i);
+                            }
+                        }
+                    }
+                }
+            }
         }
-        let seq_ids: Vec<String> = self.seqs.keys().cloned().collect();
-        for sid in seq_ids {
-            let Some(seq) = self.seqs.get_mut(&sid) else {
-                continue;
-            };
-            let Some(song) = self.clocks.get(&seq.clock_id).map(|c| c.song_beats) else {
-                continue;
-            };
-            let active = song >= seq.start_beats && song < seq.end_beats;
-            if seq.was_active && !active {
-                let pitches: Vec<u8> = seq.held.iter().map(|(p, _)| *p).collect();
-                let voice_ids = seq.voices.clone();
-                for id in voice_ids {
-                    for pitch in &pitches {
-                        voice_note(
-                            graph,
-                            &mut self.voice_holds,
-                            id,
-                            NoteEvent::NoteOff { note: *pitch },
-                        );
-                    }
-                }
-                seq.held.clear();
-                seq.playhead = 0.0;
-                seq.pos = 0.0;
+        self.publish_time();
+    }
+
+    fn publish_time(&self) {
+        self.monitor.set_song_beats(self.song_beats);
+        let bits = (self.song_beats as f32).to_bits();
+        for clock in self.clocks.values() {
+            clock.out.store(bits, Ordering::Relaxed);
+        }
+        let loop_len = BEATS_PER_BAR as f64;
+        let song = self.song_beats;
+        for seq in self.seqs.values() {
+            if seq_window(&seq.windows, song).is_some() {
+                let now = song.rem_euclid(loop_len) as f32;
+                seq.playhead_out.store(now.to_bits(), Ordering::Relaxed);
+            } else {
                 seq.playhead_out.store(f32::NAN.to_bits(), Ordering::Relaxed);
-                seq.was_active = false;
-                continue;
-            }
-            if !active {
-                seq.playhead_out.store(f32::NAN.to_bits(), Ordering::Relaxed);
-                continue;
-            }
-            let now_pos = song - seq.start_beats;
-            let prev_pos = if !seq.was_active { 0.0 } else { seq.pos };
-            seq.pos = now_pos;
-            let now = now_pos.rem_euclid(loop_len) as f32;
-            seq.playhead = now;
-            seq.playhead_out.store(now.to_bits(), Ordering::Relaxed);
-            seq.was_active = true;
-            if seq.voices.is_empty() {
-                continue;
-            }
-            let mut events = Vec::new();
-            for note in &seq.notes {
-                let on = note.step as f64 * BEATS_PER_STEP as f64;
-                let off = (on + note.len.max(1) as f64 * BEATS_PER_STEP as f64) % loop_len;
-                if crossed(prev_pos, now_pos, on, loop_len) {
-                    events.push(NoteEvent::NoteOn {
-                        note: note.pitch,
-                        velocity: 0.8,
-                    });
-                    seq.held.push((note.pitch, off as f32));
-                }
-                if crossed(prev_pos, now_pos, off, loop_len) {
-                    events.push(NoteEvent::NoteOff { note: note.pitch });
-                    let off_f = off as f32;
-                    if let Some(i) = seq
-                        .held
-                        .iter()
-                        .position(|(p, t)| *p == note.pitch && (*t - off_f).abs() < 1e-5)
-                    {
-                        seq.held.remove(i);
-                    }
-                }
-            }
-            let voice_ids = seq.voices.clone();
-            for id in voice_ids {
-                for &e in &events {
-                    voice_note(graph, &mut self.voice_holds, id, e);
-                }
             }
         }
     }
+}
+
+fn seq_release(
+    graph: &mut Graph,
+    holds: &mut HashMap<NodeId, HashMap<u8, u32>>,
+    seq: &mut SeqRun,
+) {
+    let held: Vec<(NodeId, u8)> = seq.held.iter().map(|(id, p, _)| (*id, *p)).collect();
+    for (id, pitch) in held {
+        voice_note(graph, holds, id, NoteEvent::NoteOff { note: pitch });
+    }
+    seq.held.clear();
+    seq.was_active = false;
 }
 
 fn voice_note(
@@ -615,19 +627,21 @@ fn seq_clock_id(patch: &Patch, seq_id: &str) -> Option<String> {
     }
 }
 
-fn seq_voices(patch: &Patch, seq_id: &str, voices: &HashMap<String, NodeId>) -> Vec<NodeId> {
-    let kind_of = |id: &str| {
-        patch
-            .nodes
-            .iter()
-            .find(|n| n.id == id)
-            .map(|n| n.kind)
-    };
+#[derive(Clone, Copy, PartialEq)]
+struct SeqTarget {
+    voice: NodeId,
+    pitch: i32,
+    delay: f64,
+}
+
+fn seq_targets(patch: &Patch, seq_id: &str, voices: &HashMap<String, NodeId>) -> Vec<SeqTarget> {
+    let node = |id: &str| patch.nodes.iter().find(|n| n.id == id);
+    let kind_of = |id: &str| node(id).map(|n| n.kind);
     let mut out = Vec::new();
-    let mut stack = vec![(seq_id.to_string(), "notes".to_string())];
+    let mut stack = vec![(seq_id.to_string(), "notes".to_string(), 0_i32, 0.0_f64)];
     let mut seen = HashSet::new();
-    while let Some((from, from_p)) = stack.pop() {
-        if !seen.insert((from.clone(), from_p.clone())) {
+    while let Some((from, from_p, pitch, delay)) = stack.pop() {
+        if !seen.insert((from.clone(), from_p.clone(), pitch, delay.to_bits())) {
             continue;
         }
         for (f, fp, to, to_p) in &patch.links {
@@ -637,20 +651,30 @@ fn seq_voices(patch: &Patch, seq_id: &str, voices: &HashMap<String, NodeId>) -> 
             match (kind_of(to), to_p.as_str()) {
                 (Some(NodeKind::Voice), "notes") => {
                     if let Some(&id) = voices.get(to) {
-                        out.push(id);
+                        out.push(SeqTarget {
+                            voice: id,
+                            pitch,
+                            delay,
+                        });
                     }
                 }
                 (Some(NodeKind::NoteJoin), p) if NOTE_JOIN_INS.contains(&p) => {
-                    stack.push((to.clone(), "out".into()));
+                    stack.push((to.clone(), "out".into(), pitch, delay));
+                }
+                (Some(NodeKind::Transpose), "in") => {
+                    let n = node(to);
+                    let pitch = pitch + n.map(|n| n.pitch_shift()).unwrap_or(0);
+                    let delay = delay + n.map(|n| n.time_shift_beats()).unwrap_or(0.0);
+                    stack.push((to.clone(), "out".into(), pitch, delay));
                 }
                 _ => {}
             }
         }
     }
     let mut uniq = Vec::new();
-    for id in out {
-        if !uniq.contains(&id) {
-            uniq.push(id);
+    for t in out {
+        if !uniq.contains(&t) {
+            uniq.push(t);
         }
     }
     uniq

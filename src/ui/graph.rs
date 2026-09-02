@@ -4,12 +4,12 @@ use glam::Vec2;
 use mega_ui::{NodePortSide, PlotView, Ui};
 
 use crate::compile::WAVEFORMS;
-use crate::graph::{port, GraphDoc, GraphNode, NodeKind, BEATS_PER_BAR, NOTE_JOIN_INS};
+use crate::graph::{port, GraphDoc, GraphNode, NodeKind, NOTE_JOIN_INS};
 use crate::monitor::Monitor;
 
 use super::piano;
 
-pub fn draw(ui: &mut Ui, doc: &mut GraphDoc, monitor: &Arc<Monitor>, playing: bool) -> bool {
+pub fn draw(ui: &mut Ui, doc: &mut GraphDoc, monitor: &Arc<Monitor>) -> bool {
     let mut keep = false;
     let size = ui.available_size();
     let size = Vec2::new(size.x, size.y.max(120.0));
@@ -29,7 +29,7 @@ pub fn draw(ui: &mut Ui, doc: &mut GraphDoc, monitor: &Arc<Monitor>, playing: bo
                 let title = nodes[idx].kind.title().to_string();
                 let mut pos = nodes[idx].pos;
                 ui.node(&id, &title, &mut pos, |ui| {
-                    draw_body(ui, &mut nodes[idx], monitor, playing);
+                    draw_body(ui, &mut nodes[idx], monitor);
                 });
                 nodes[idx].pos = pos;
             }
@@ -68,6 +68,9 @@ fn spawn_menu(ui: &mut Ui) -> Option<NodeKind> {
     if ui.menu_item("Join Notes").clicked() {
         kind = Some(NodeKind::NoteJoin);
     }
+    if ui.menu_item("Transpose").clicked() {
+        kind = Some(NodeKind::Transpose);
+    }
     ui.separator();
     if ui.menu_item("Oscillator").clicked() {
         kind = Some(NodeKind::Osc);
@@ -93,37 +96,19 @@ fn spawn_menu(ui: &mut Ui) -> Option<NodeKind> {
     kind
 }
 
-fn draw_body(ui: &mut Ui, node: &mut GraphNode, monitor: &Monitor, playing: bool) {
+fn draw_body(ui: &mut Ui, node: &mut GraphNode, monitor: &Monitor) {
     let names: Vec<&str> = WAVEFORMS.iter().map(|(n, _)| *n).collect();
     match node.kind {
         NodeKind::Clock => {
             ui.node_port(NodePortSide::Output, "clock", port::CLOCK);
-            labeled_slider(ui, "BPM", &mut node.bpm, 40.0..=200.0);
-            let bar = if playing {
-                monitor
-                    .playhead(&node.id)
-                    .filter(|b| b.is_finite())
-                    .unwrap_or(0.0)
-            } else {
-                0.0
-            };
-            ui.label(&format!("Bar {}", (bar / BEATS_PER_BAR).floor() as i32));
         }
         NodeKind::Sequencer => {
             ui.node_port(NodePortSide::Input, "clock", port::CLOCK);
             ui.node_port(NodePortSide::Output, "clock", port::CLOCK);
-            ui.label("Start bar");
-            ui.drag_float("start", &mut node.seq_start, 1.0);
-            node.seq_start = node.seq_start.max(0.0);
-            ui.label("Bars (0 = forever)");
-            ui.drag_float("bars", &mut node.seq_bars, 1.0);
-            node.seq_bars = node.seq_bars.max(0.0);
+            ui.label("When");
+            ui.text_input("when", &mut node.seq_when);
             let id = node.id.clone();
-            let playhead = if playing {
-                monitor.playhead(&id).filter(|p| p.is_finite())
-            } else {
-                None
-            };
+            let playhead = monitor.playhead(&id).filter(|p| p.is_finite());
             piano::draw_in_node(ui, &id, node, playhead);
             ui.node_port(NodePortSide::Output, "notes", port::NOTES);
         }
@@ -161,6 +146,16 @@ fn draw_body(ui: &mut Ui, node: &mut GraphNode, monitor: &Monitor, playing: bool
             for p in NOTE_JOIN_INS {
                 ui.node_port(NodePortSide::Input, p, port::NOTES);
             }
+            ui.node_port(NodePortSide::Output, "out", port::NOTES);
+        }
+        NodeKind::Transpose => {
+            ui.node_port(NodePortSide::Input, "in", port::NOTES);
+            ui.label("Notes");
+            ui.drag_int("t_notes", &mut node.transpose_notes, 1);
+            ui.label("Octaves");
+            ui.drag_int("t_oct", &mut node.transpose_octaves, 1);
+            ui.label("Steps");
+            ui.drag_float("t_steps", &mut node.transpose_steps, 0.25);
             ui.node_port(NodePortSide::Output, "out", port::NOTES);
         }
         NodeKind::Mix => {

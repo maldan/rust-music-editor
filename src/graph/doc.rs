@@ -4,13 +4,17 @@ use std::hash::{Hash, Hasher};
 use glam::Vec2;
 use mega_ui::{NodeLink, NodeSpace};
 
-use super::node::{output_port_type, port, GraphNode, NodeKind, SeqNote};
+use super::node::{output_port_type, port, tick_to_beats, GraphNode, NodeKind, SeqNote};
 
 pub struct GraphDoc {
     pub nodes: Vec<GraphNode>,
     pub space: NodeSpace,
     pub next_serial: u64,
     pub output_id: String,
+    pub bpm: f32,
+    pub play_from: i32,
+    pub seek_gen: u64,
+    pub seek_beats: f64,
 }
 
 impl GraphDoc {
@@ -25,6 +29,10 @@ impl GraphDoc {
             space,
             next_serial: 1,
             output_id: String::new(),
+            bpm: 120.0,
+            play_from: 1,
+            seek_gen: 0,
+            seek_beats: 0.0,
         }
     }
 
@@ -155,6 +163,16 @@ impl GraphDoc {
         self.space.selected_link = None;
     }
 
+    pub fn cue_play(&mut self) {
+        self.seek_beats = tick_to_beats(self.play_from);
+        self.seek_gen = self.seek_gen.wrapping_add(1);
+    }
+
+    pub fn reset_tick(&mut self) {
+        self.seek_beats = 0.0;
+        self.seek_gen = self.seek_gen.wrapping_add(1);
+    }
+
     pub fn fingerprint(&self) -> u64 {
         let mut h = DefaultHasher::new();
         self.space.links.len().hash(&mut h);
@@ -179,16 +197,18 @@ impl GraphDoc {
             n.delay_mix.to_bits().hash(&mut h);
             n.mix_a.to_bits().hash(&mut h);
             n.mix_b.to_bits().hash(&mut h);
-            n.bpm.to_bits().hash(&mut h);
-            n.seq_start.to_bits().hash(&mut h);
-            n.seq_bars.to_bits().hash(&mut h);
+            n.seq_when.hash(&mut h);
             n.notes.len().hash(&mut h);
             for note in &n.notes {
                 note.step.hash(&mut h);
                 note.pitch.hash(&mut h);
                 note.len.hash(&mut h);
             }
+            n.transpose_notes.hash(&mut h);
+            n.transpose_octaves.hash(&mut h);
+            n.transpose_steps.to_bits().hash(&mut h);
         }
+        self.bpm.to_bits().hash(&mut h);
         h.finish()
     }
 }

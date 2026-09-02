@@ -2,10 +2,10 @@ use std::fs;
 use std::path::Path;
 
 use glam::Vec2;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use super::doc::GraphDoc;
-use super::node::{GraphNode, NodeKind};
+use super::node::{parse_tick, GraphNode, NodeKind};
 
 #[derive(Serialize, Deserialize)]
 struct GraphFile {
@@ -14,8 +14,29 @@ struct GraphFile {
     output_id: String,
     pan: [f32; 2],
     zoom: f32,
+    #[serde(default)]
+    bpm: Option<f32>,
+    #[serde(default = "default_play_from", deserialize_with = "de_play_from")]
+    play_from: i32,
     nodes: Vec<GraphNode>,
     links: Vec<FileLink>,
+}
+
+fn default_play_from() -> i32 {
+    1
+}
+
+fn de_play_from<'de, D: Deserializer<'de>>(d: D) -> Result<i32, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Tick {
+        N(i32),
+        S(String),
+    }
+    Ok(match Tick::deserialize(d)? {
+        Tick::N(n) => n.max(1),
+        Tick::S(s) => parse_tick(&s),
+    })
 }
 
 #[derive(Serialize, Deserialize)]
@@ -34,6 +55,8 @@ impl GraphDoc {
             output_id: self.output_id.clone(),
             pan: [self.space.pan.x, self.space.pan.y],
             zoom: self.space.zoom,
+            bpm: Some(self.bpm),
+            play_from: self.play_from.max(1),
             nodes: self.nodes.clone(),
             links: self
                 .space
@@ -57,12 +80,26 @@ impl GraphDoc {
         }
         let mut doc = Self::blank();
         doc.nodes = file.nodes;
+        for n in &mut doc.nodes {
+            n.migrate_seq_when();
+        }
         doc.next_serial = file.next_serial.max(1);
         doc.output_id = file.output_id;
         doc.space.pan = Vec2::new(file.pan[0], file.pan[1]);
         if file.zoom > 0.05 {
             doc.space.zoom = file.zoom;
         }
+        doc.bpm = file
+            .bpm
+            .filter(|b| *b >= 1.0)
+            .or_else(|| {
+                doc.nodes
+                    .iter()
+                    .find(|n| n.kind == NodeKind::Clock)
+                    .map(|n| n.bpm.max(1.0))
+            })
+            .unwrap_or(120.0);
+        doc.play_from = file.play_from.max(1);
         for l in &file.links {
             let _ = doc.connect(&l.from_node, &l.from_port, &l.to_node, &l.to_port);
         }

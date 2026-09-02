@@ -17,6 +17,7 @@ pub struct App {
     pub status: String,
     last_fp: u64,
     last_playing: bool,
+    last_seek_gen: u64,
     tx: EventSender<Patch>,
     _engine: AudioEngine,
 }
@@ -46,6 +47,7 @@ impl App {
         Ok(Self {
             last_fp: graph.fingerprint(),
             last_playing: false,
+            last_seek_gen: graph.seek_gen,
             graph,
             dock: default_dock(),
             playing: false,
@@ -58,11 +60,15 @@ impl App {
 
     pub fn sync_audio(&mut self) {
         let fp = self.graph.fingerprint();
-        if fp == self.last_fp && self.playing == self.last_playing {
+        if fp == self.last_fp
+            && self.playing == self.last_playing
+            && self.graph.seek_gen == self.last_seek_gen
+        {
             return;
         }
         self.last_fp = fp;
         self.last_playing = self.playing;
+        self.last_seek_gen = self.graph.seek_gen;
         let _ = self.tx.send(Patch::from_doc(&self.graph, self.playing));
     }
 
