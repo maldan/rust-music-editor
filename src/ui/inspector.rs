@@ -53,13 +53,13 @@ pub fn draw(
     if selected.is_empty() {
         ui.label("No selection");
     } else if selected.len() == 1 {
-        let title = doc
-            .nodes
-            .iter()
-            .find(|n| n.id == selected[0])
-            .map(|n| n.kind.title())
-            .unwrap_or("Node");
-        ui.label(title);
+        let id = selected[0].clone();
+        if let Some(n) = doc.nodes.iter_mut().find(|n| n.id == id) {
+            ui.label(n.kind.title());
+            if n.kind.can_bypass() {
+                ui.checkbox("Bypass", &mut n.bypass);
+            }
+        }
     } else {
         ui.label(&format!("{} nodes", selected.len()));
     }

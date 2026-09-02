@@ -185,6 +185,7 @@ impl GraphDoc {
         for n in &self.nodes {
             n.id.hash(&mut h);
             n.kind.hash(&mut h);
+            n.bypass.hash(&mut h);
             n.waveform.hash(&mut h);
             n.freq.to_bits().hash(&mut h);
             n.lfo_rate.to_bits().hash(&mut h);
@@ -192,9 +193,20 @@ impl GraphDoc {
             n.cutoff.to_bits().hash(&mut h);
             n.q.to_bits().hash(&mut h);
             n.gain.to_bits().hash(&mut h);
+            n.drive.to_bits().hash(&mut h);
+            n.pulse_width.to_bits().hash(&mut h);
+            n.clamp_min.to_bits().hash(&mut h);
+            n.clamp_max.to_bits().hash(&mut h);
+            n.map_in_min.to_bits().hash(&mut h);
+            n.map_in_max.to_bits().hash(&mut h);
+            n.map_out_min.to_bits().hash(&mut h);
+            n.map_out_max.to_bits().hash(&mut h);
             n.delay_time.to_bits().hash(&mut h);
             n.delay_feedback.to_bits().hash(&mut h);
             n.delay_mix.to_bits().hash(&mut h);
+            n.chorus_rate.to_bits().hash(&mut h);
+            n.chorus_depth.to_bits().hash(&mut h);
+            n.chorus_mix.to_bits().hash(&mut h);
             n.mix_a.to_bits().hash(&mut h);
             n.mix_b.to_bits().hash(&mut h);
             n.seq_when.hash(&mut h);
@@ -208,6 +220,10 @@ impl GraphDoc {
             n.transpose_notes.hash(&mut h);
             n.transpose_octaves.hash(&mut h);
             n.transpose_steps.to_bits().hash(&mut h);
+            n.adsr_attack.to_bits().hash(&mut h);
+            n.adsr_decay.to_bits().hash(&mut h);
+            n.adsr_sustain.to_bits().hash(&mut h);
+            n.adsr_release.to_bits().hash(&mut h);
         }
         self.bpm.to_bits().hash(&mut h);
         h.finish()

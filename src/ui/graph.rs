@@ -22,6 +22,13 @@ pub fn draw(ui: &mut Ui, doc: &mut GraphDoc, monitor: &Arc<Monitor>) -> bool {
         let space = &mut doc.space;
         let nodes = &mut doc.nodes;
 
+        space.bypassed_nodes.clear();
+        for n in nodes.iter() {
+            if n.bypass {
+                space.bypassed_nodes.insert(n.id.clone());
+            }
+        }
+
         ui.node_space("music_graph", size, space, |ui| {
             let ids: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
             for id in ids {
@@ -98,6 +105,21 @@ fn spawn_menu(ui: &mut Ui) -> Option<NodeKind> {
     if ui.menu_item("Delay / Echo").clicked() {
         kind = Some(NodeKind::Delay);
     }
+    if ui.menu_item("Distortion").clicked() {
+        kind = Some(NodeKind::Distortion);
+    }
+    if ui.menu_item("Chorus").clicked() {
+        kind = Some(NodeKind::Chorus);
+    }
+    if ui.menu_item("Multiply").clicked() {
+        kind = Some(NodeKind::Mul);
+    }
+    if ui.menu_item("Clamp").clicked() {
+        kind = Some(NodeKind::Clamp);
+    }
+    if ui.menu_item("Remap").clicked() {
+        kind = Some(NodeKind::Remap);
+    }
     kind
 }
 
@@ -120,20 +142,40 @@ fn draw_body(ui: &mut Ui, node: &mut GraphNode, monitor: &Monitor) {
         }
         NodeKind::Voice => {
             ui.node_port(NodePortSide::Input, "notes", port::NOTES);
+            ui.node_port(NodePortSide::Input, "pitch", port::AUDIO);
+            ui.node_port(NodePortSide::Input, "amp", port::AUDIO);
+            ui.node_port(NodePortSide::Input, "pwm", port::AUDIO);
             ui.label("Waveform");
             ui.select("wave", &mut node.waveform, &names);
+            ui.label("Pulse width");
+            ui.drag_float("pw", &mut node.pulse_width, 0.01);
+            node.pulse_width = node.pulse_width.clamp(0.02, 0.98);
+            labeled_slider(ui, "Attack, sec", &mut node.adsr_attack, 0.001..=2.0);
+            labeled_slider(ui, "Decay, sec", &mut node.adsr_decay, 0.01..=2.0);
+            labeled_slider(ui, "Sustain", &mut node.adsr_sustain, 0.0..=1.0);
+            labeled_slider(ui, "Release, sec", &mut node.adsr_release, 0.01..=4.0);
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
         NodeKind::Osc => {
             ui.node_port(NodePortSide::Input, "fm", port::AUDIO);
+            ui.node_port(NodePortSide::Input, "pwm", port::AUDIO);
             ui.label("Waveform");
             ui.select("wave", &mut node.waveform, &names);
             labeled_slider(ui, "Frequency, Hz", &mut node.freq, 40.0..=880.0);
+            ui.label("Pulse width");
+            ui.drag_float("pw", &mut node.pulse_width, 0.01);
+            node.pulse_width = node.pulse_width.clamp(0.02, 0.98);
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
         NodeKind::Lfo => {
-            labeled_slider(ui, "Rate, Hz", &mut node.lfo_rate, 0.1..=20.0);
-            labeled_slider(ui, "Depth, Hz", &mut node.lfo_depth, 0.0..=80.0);
+            ui.node_port(NodePortSide::Input, "rate", port::AUDIO);
+            ui.label("Rate, Hz");
+            ui.drag_float("lfo_rate", &mut node.lfo_rate, 0.1);
+            node.lfo_rate = node.lfo_rate.max(0.01);
+            ui.node_port(NodePortSide::Input, "depth", port::AUDIO);
+            ui.label("Depth");
+            ui.drag_float("lfo_depth", &mut node.lfo_depth, 1.0);
+            node.lfo_depth = node.lfo_depth.max(0.0);
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
         NodeKind::Filter => {
@@ -189,6 +231,51 @@ fn draw_body(ui: &mut Ui, node: &mut GraphNode, monitor: &Monitor) {
             labeled_slider(ui, "Delay time, sec", &mut node.delay_time, 0.05..=1.2);
             labeled_slider(ui, "Feedback", &mut node.delay_feedback, 0.0..=0.9);
             labeled_slider(ui, "Dry / Wet", &mut node.delay_mix, 0.0..=0.8);
+            ui.node_port(NodePortSide::Output, "out", port::AUDIO);
+        }
+        NodeKind::Distortion => {
+            ui.node_port(NodePortSide::Input, "in", port::AUDIO);
+            ui.label("Drive");
+            ui.drag_float("drive", &mut node.drive, 0.5);
+            node.drive = node.drive.max(0.05);
+            ui.node_port(NodePortSide::Output, "out", port::AUDIO);
+        }
+        NodeKind::Chorus => {
+            ui.node_port(NodePortSide::Input, "in", port::AUDIO);
+            ui.label("Rate, Hz");
+            ui.drag_float("ch_rate", &mut node.chorus_rate, 0.05);
+            node.chorus_rate = node.chorus_rate.max(0.01);
+            ui.label("Depth");
+            ui.drag_float("ch_depth", &mut node.chorus_depth, 0.05);
+            node.chorus_depth = node.chorus_depth.clamp(0.0, 1.0);
+            ui.label("Mix");
+            ui.drag_float("ch_mix", &mut node.chorus_mix, 0.05);
+            node.chorus_mix = node.chorus_mix.clamp(0.0, 1.0);
+            ui.node_port(NodePortSide::Output, "out", port::AUDIO);
+        }
+        NodeKind::Mul => {
+            ui.node_port(NodePortSide::Input, "a", port::AUDIO);
+            ui.node_port(NodePortSide::Input, "b", port::AUDIO);
+            ui.node_port(NodePortSide::Output, "out", port::AUDIO);
+        }
+        NodeKind::Clamp => {
+            ui.node_port(NodePortSide::Input, "in", port::AUDIO);
+            ui.label("Min");
+            ui.drag_float("cmin", &mut node.clamp_min, 0.1);
+            ui.label("Max");
+            ui.drag_float("cmax", &mut node.clamp_max, 0.1);
+            ui.node_port(NodePortSide::Output, "out", port::AUDIO);
+        }
+        NodeKind::Remap => {
+            ui.node_port(NodePortSide::Input, "in", port::AUDIO);
+            ui.label("In min");
+            ui.drag_float("imin", &mut node.map_in_min, 0.1);
+            ui.label("In max");
+            ui.drag_float("imax", &mut node.map_in_max, 0.1);
+            ui.label("Out min");
+            ui.drag_float("omin", &mut node.map_out_min, 0.1);
+            ui.label("Out max");
+            ui.drag_float("omax", &mut node.map_out_max, 0.1);
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
         NodeKind::Output => {

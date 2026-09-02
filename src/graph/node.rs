@@ -36,6 +36,11 @@ pub enum NodeKind {
     NoteJoin,
     Transpose,
     Delay,
+    Distortion,
+    Chorus,
+    Mul,
+    Clamp,
+    Remap,
     Scope,
     NoteScope,
     Clock,
@@ -55,6 +60,11 @@ impl NodeKind {
             Self::NoteJoin => "Join Notes",
             Self::Transpose => "Transpose",
             Self::Delay => "Delay / Echo",
+            Self::Distortion => "Distortion",
+            Self::Chorus => "Chorus",
+            Self::Mul => "Multiply",
+            Self::Clamp => "Clamp",
+            Self::Remap => "Remap",
             Self::Scope => "Waveform",
             Self::NoteScope => "Notes",
             Self::Clock => "Clock",
@@ -66,6 +76,11 @@ impl NodeKind {
 
     pub fn can_delete(self) -> bool {
         !matches!(self, Self::Output)
+    }
+
+    /// Inspector bypass: skip processing / pass signal through.
+    pub fn can_bypass(self) -> bool {
+        !matches!(self, Self::Output | Self::NoteJoin)
     }
 }
 
@@ -86,6 +101,8 @@ pub struct GraphNode {
     pub kind: NodeKind,
     pub pos: Vec2,
     #[serde(default)]
+    pub bypass: bool,
+    #[serde(default)]
     pub waveform: usize,
     #[serde(default = "default_freq")]
     pub freq: f32,
@@ -99,12 +116,34 @@ pub struct GraphNode {
     pub q: f32,
     #[serde(default = "default_gain")]
     pub gain: f32,
+    #[serde(default = "default_drive")]
+    pub drive: f32,
+    #[serde(default = "default_pulse_width")]
+    pub pulse_width: f32,
+    #[serde(default = "default_clamp_min")]
+    pub clamp_min: f32,
+    #[serde(default = "default_clamp_max")]
+    pub clamp_max: f32,
+    #[serde(default = "default_map_in_min")]
+    pub map_in_min: f32,
+    #[serde(default = "default_map_in_max")]
+    pub map_in_max: f32,
+    #[serde(default = "default_map_out_min")]
+    pub map_out_min: f32,
+    #[serde(default = "default_map_out_max")]
+    pub map_out_max: f32,
     #[serde(default = "default_delay_time")]
     pub delay_time: f32,
     #[serde(default = "default_delay_feedback")]
     pub delay_feedback: f32,
     #[serde(default = "default_delay_mix")]
     pub delay_mix: f32,
+    #[serde(default = "default_chorus_rate")]
+    pub chorus_rate: f32,
+    #[serde(default = "default_chorus_depth")]
+    pub chorus_depth: f32,
+    #[serde(default = "default_chorus_mix")]
+    pub chorus_mix: f32,
     #[serde(default = "default_mix")]
     pub mix_a: f32,
     #[serde(default = "default_mix")]
@@ -134,6 +173,14 @@ pub struct GraphNode {
     /// Time shift in sequencer cells (1 = one 16th). Fractions allowed.
     #[serde(default)]
     pub transpose_steps: f32,
+    #[serde(default = "default_adsr_attack")]
+    pub adsr_attack: f32,
+    #[serde(default = "default_adsr_decay")]
+    pub adsr_decay: f32,
+    #[serde(default = "default_adsr_sustain")]
+    pub adsr_sustain: f32,
+    #[serde(default = "default_adsr_release")]
+    pub adsr_release: f32,
 }
 
 fn default_freq() -> f32 {
@@ -154,6 +201,30 @@ fn default_q() -> f32 {
 fn default_gain() -> f32 {
     0.7
 }
+fn default_drive() -> f32 {
+    4.0
+}
+fn default_pulse_width() -> f32 {
+    0.5
+}
+fn default_clamp_min() -> f32 {
+    -1.0
+}
+fn default_clamp_max() -> f32 {
+    1.0
+}
+fn default_map_in_min() -> f32 {
+    -1.0
+}
+fn default_map_in_max() -> f32 {
+    1.0
+}
+fn default_map_out_min() -> f32 {
+    -1.0
+}
+fn default_map_out_max() -> f32 {
+    1.0
+}
 fn default_delay_time() -> f32 {
     0.28
 }
@@ -162,6 +233,15 @@ fn default_delay_feedback() -> f32 {
 }
 fn default_delay_mix() -> f32 {
     0.38
+}
+fn default_chorus_rate() -> f32 {
+    0.8
+}
+fn default_chorus_depth() -> f32 {
+    0.35
+}
+fn default_chorus_mix() -> f32 {
+    0.45
 }
 fn default_mix() -> f32 {
     1.0
@@ -175,6 +255,18 @@ fn default_seq_loop_bars() -> u32 {
 fn default_seq_octave() -> i32 {
     4
 }
+fn default_adsr_attack() -> f32 {
+    0.01
+}
+fn default_adsr_decay() -> f32 {
+    0.1
+}
+fn default_adsr_sustain() -> f32 {
+    0.7
+}
+fn default_adsr_release() -> f32 {
+    0.2
+}
 
 impl GraphNode {
     pub fn new(id: String, kind: NodeKind, pos: Vec2) -> Self {
@@ -182,6 +274,7 @@ impl GraphNode {
             id,
             kind,
             pos,
+            bypass: false,
             waveform: match kind {
                 NodeKind::Osc | NodeKind::Voice => 1,
                 _ => 0,
@@ -192,9 +285,20 @@ impl GraphNode {
             cutoff: 1200.0,
             q: 0.8,
             gain: 0.7,
+            drive: 4.0,
+            pulse_width: 0.5,
+            clamp_min: -1.0,
+            clamp_max: 1.0,
+            map_in_min: -1.0,
+            map_in_max: 1.0,
+            map_out_min: -1.0,
+            map_out_max: 1.0,
             delay_time: 0.28,
             delay_feedback: 0.42,
             delay_mix: 0.38,
+            chorus_rate: 0.8,
+            chorus_depth: 0.35,
+            chorus_mix: 0.45,
             mix_a: 1.0,
             mix_b: 1.0,
             bpm: 120.0,
@@ -210,7 +314,20 @@ impl GraphNode {
             transpose_notes: 0,
             transpose_octaves: 0,
             transpose_steps: 0.0,
+            adsr_attack: 0.01,
+            adsr_decay: 0.1,
+            adsr_sustain: 0.7,
+            adsr_release: 0.2,
         }
+    }
+
+    pub fn adsr_params(&self) -> (f32, f32, f32, f32) {
+        (
+            self.adsr_attack.clamp(0.001, 4.0),
+            self.adsr_decay.clamp(0.001, 4.0),
+            self.adsr_sustain.clamp(0.0, 1.0),
+            self.adsr_release.clamp(0.001, 6.0),
+        )
     }
 
     pub fn pitch_shift(&self) -> i32 {
@@ -478,5 +595,41 @@ mod tests {
         assert_eq!(p.view_octaves(), 3);
         assert_eq!(p.view_octave(), 3);
         assert_eq!(p.view_pitch_count(), 36);
+    }
+
+    #[test]
+    fn voice_adsr_defaults_and_clamp() {
+        let mut n = GraphNode::new("v".into(), NodeKind::Voice, Vec2::ZERO);
+        assert_eq!(n.adsr_params(), (0.01, 0.1, 0.7, 0.2));
+        n.adsr_attack = 0.0;
+        n.adsr_sustain = 2.0;
+        n.adsr_release = 99.0;
+        let (a, _, s, r) = n.adsr_params();
+        assert!(a >= 0.001);
+        assert_eq!(s, 1.0);
+        assert_eq!(r, 6.0);
+    }
+
+    #[test]
+    fn pulse_width_default() {
+        let n = GraphNode::new("o".into(), NodeKind::Osc, Vec2::ZERO);
+        assert!((n.pulse_width - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn distortion_drive_default() {
+        let n = GraphNode::new("d".into(), NodeKind::Distortion, Vec2::ZERO);
+        assert!((n.drive - 4.0).abs() < 1e-6);
+        let c = GraphNode::new("c".into(), NodeKind::Chorus, Vec2::ZERO);
+        assert!((c.chorus_rate - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn bypass_kinds() {
+        assert!(NodeKind::Filter.can_bypass());
+        assert!(NodeKind::Sequencer.can_bypass());
+        assert!(NodeKind::Voice.can_bypass());
+        assert!(!NodeKind::Output.can_bypass());
+        assert!(!NodeKind::NoteJoin.can_bypass());
     }
 }
