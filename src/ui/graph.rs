@@ -4,7 +4,9 @@ use glam::Vec2;
 use mega_ui::{NodePortSide, PlotView, Ui};
 
 use crate::compile::WAVEFORMS;
-use crate::graph::{port, GraphDoc, GraphNode, NodeKind, NOTE_JOIN_INS};
+use crate::graph::{
+    port, GraphDoc, GraphNode, NodeKind, NOTE_JOIN_INS, SEQ_MAX_BARS, SEQ_OCTAVE_MIN,
+};
 use crate::monitor::Monitor;
 
 use super::piano;
@@ -71,6 +73,9 @@ fn spawn_menu(ui: &mut Ui) -> Option<NodeKind> {
     if ui.menu_item("Transpose").clicked() {
         kind = Some(NodeKind::Transpose);
     }
+    if ui.menu_item("Notes").clicked() {
+        kind = Some(NodeKind::NoteScope);
+    }
     ui.separator();
     if ui.menu_item("Oscillator").clicked() {
         kind = Some(NodeKind::Osc);
@@ -107,6 +112,7 @@ fn draw_body(ui: &mut Ui, node: &mut GraphNode, monitor: &Monitor) {
             ui.node_port(NodePortSide::Output, "clock", port::CLOCK);
             ui.label("When");
             ui.text_input("when", &mut node.seq_when);
+            roll_chrome(ui, node);
             let id = node.id.clone();
             let playhead = monitor.playhead(&id).filter(|p| p.is_finite());
             piano::draw_in_node(ui, &id, node, playhead);
@@ -172,6 +178,12 @@ fn draw_body(ui: &mut Ui, node: &mut GraphNode, monitor: &Monitor) {
             ui.plot_with_view("wave", Vec2::new(0.0, 72.0), &samples, &view);
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
+        NodeKind::NoteScope => {
+            ui.node_port(NodePortSide::Input, "in", port::NOTES);
+            roll_chrome(ui, node);
+            piano::draw_preview(ui, node, monitor);
+            ui.node_port(NodePortSide::Output, "out", port::NOTES);
+        }
         NodeKind::Delay => {
             ui.node_port(NodePortSide::Input, "in", port::AUDIO);
             labeled_slider(ui, "Delay time, sec", &mut node.delay_time, 0.05..=1.2);
@@ -183,6 +195,20 @@ fn draw_body(ui: &mut Ui, node: &mut GraphNode, monitor: &Monitor) {
             ui.node_port(NodePortSide::Input, "in", port::AUDIO);
         }
     }
+}
+
+fn roll_chrome(ui: &mut Ui, node: &mut GraphNode) {
+    ui.horizontal(|ui| {
+        ui.label("Bars");
+        let mut bars = node.seq_loop_bars as i32;
+        ui.drag_int("bars", &mut bars, 1);
+        node.seq_loop_bars = bars.clamp(1, SEQ_MAX_BARS as i32) as u32;
+    });
+    ui.label("Octave");
+    let mut oct = node.seq_octave as f32;
+    let max = node.view_octave_max() as f32;
+    ui.slider_stepped("oct", &mut oct, SEQ_OCTAVE_MIN as f32..=max, 1.0);
+    node.seq_octave = oct.round() as i32;
 }
 
 fn labeled_slider(ui: &mut Ui, name: &str, value: &mut f32, range: std::ops::RangeInclusive<f32>) {

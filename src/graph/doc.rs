@@ -198,6 +198,7 @@ impl GraphDoc {
             n.mix_a.to_bits().hash(&mut h);
             n.mix_b.to_bits().hash(&mut h);
             n.seq_when.hash(&mut h);
+            n.seq_loop_bars.hash(&mut h);
             n.notes.len().hash(&mut h);
             for note in &n.notes {
                 note.step.hash(&mut h);

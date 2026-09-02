@@ -9,6 +9,9 @@ pub mod port {
 pub const SEQ_STEPS: u32 = 16;
 pub const SEQ_PITCHES: u32 = 12;
 pub const SEQ_BASE_PITCH: u8 = 60;
+pub const SEQ_MAX_BARS: u32 = 8;
+pub const SEQ_OCTAVE_MIN: i32 = 0;
+pub const SEQ_OCTAVE_MAX: i32 = 8;
 /// One sequencer cell = one 16th note (0.25 beat at 4/4).
 pub const BEATS_PER_STEP: f32 = 0.25;
 /// 16 sixteenths = 4 beats = 1 bar in 4/4.
@@ -34,6 +37,7 @@ pub enum NodeKind {
     Transpose,
     Delay,
     Scope,
+    NoteScope,
     Clock,
     Sequencer,
     Voice,
@@ -52,6 +56,7 @@ impl NodeKind {
             Self::Transpose => "Transpose",
             Self::Delay => "Delay / Echo",
             Self::Scope => "Waveform",
+            Self::NoteScope => "Notes",
             Self::Clock => "Clock",
             Self::Sequencer => "Sequencer",
             Self::Voice => "Voice",
@@ -69,7 +74,8 @@ pub fn output_port_type(kind: NodeKind, port: &str) -> u16 {
         (NodeKind::Clock, "clock") | (NodeKind::Sequencer, "clock") => port::CLOCK,
         (NodeKind::Sequencer, "notes")
         | (NodeKind::NoteJoin, "out")
-        | (NodeKind::Transpose, "out") => port::NOTES,
+        | (NodeKind::Transpose, "out")
+        | (NodeKind::NoteScope, "out") => port::NOTES,
         _ => port::AUDIO,
     }
 }
@@ -113,6 +119,12 @@ pub struct GraphNode {
     pub seq_start: f32,
     #[serde(default, skip_serializing)]
     pub seq_bars: f32,
+    /// Length of the piano-roll loop, in bars (1..=8).
+    #[serde(default = "default_seq_loop_bars")]
+    pub seq_loop_bars: u32,
+    /// Visible piano-roll octave (C0..=C8).
+    #[serde(default = "default_seq_octave")]
+    pub seq_octave: i32,
     #[serde(default)]
     pub notes: Vec<SeqNote>,
     #[serde(default)]
@@ -157,6 +169,12 @@ fn default_mix() -> f32 {
 fn default_bpm() -> f32 {
     120.0
 }
+fn default_seq_loop_bars() -> u32 {
+    1
+}
+fn default_seq_octave() -> i32 {
+    4
+}
 
 impl GraphNode {
     pub fn new(id: String, kind: NodeKind, pos: Vec2) -> Self {
@@ -183,6 +201,11 @@ impl GraphNode {
             seq_when: String::new(),
             seq_start: 0.0,
             seq_bars: 0.0,
+            seq_loop_bars: 1,
+            seq_octave: match kind {
+                NodeKind::NoteScope => 3,
+                _ => 4,
+            },
             notes: Vec::new(),
             transpose_notes: 0,
             transpose_octaves: 0,
@@ -196,6 +219,42 @@ impl GraphNode {
 
     pub fn time_shift_beats(&self) -> f64 {
         self.transpose_steps as f64 * BEATS_PER_STEP as f64
+    }
+
+    pub fn loop_bars(&self) -> u32 {
+        self.seq_loop_bars.clamp(1, SEQ_MAX_BARS)
+    }
+
+    pub fn loop_steps(&self) -> u32 {
+        SEQ_STEPS * self.loop_bars()
+    }
+
+    pub fn loop_beats(&self) -> f64 {
+        self.loop_bars() as f64 * BEATS_PER_BAR as f64
+    }
+
+    pub fn view_octave(&self) -> i32 {
+        self.seq_octave.clamp(SEQ_OCTAVE_MIN, self.view_octave_max())
+    }
+
+    pub fn view_octaves(&self) -> u32 {
+        match self.kind {
+            NodeKind::NoteScope => 3,
+            _ => 1,
+        }
+    }
+
+    pub fn view_octave_max(&self) -> i32 {
+        (SEQ_OCTAVE_MAX - self.view_octaves() as i32 + 1).max(SEQ_OCTAVE_MIN)
+    }
+
+    pub fn view_pitch_count(&self) -> u32 {
+        12 * self.view_octaves()
+    }
+
+    /// MIDI pitch of C at the bottom of the visible range (C4 = 60).
+    pub fn view_base_pitch(&self) -> u8 {
+        ((self.view_octave() + 1) * 12) as u8
     }
 
     /// Lift old `seq_start` / `seq_bars` into `seq_when` after JSON load.
@@ -357,6 +416,15 @@ mod tests {
     }
 
     #[test]
+    fn toggle_note_is_one_step() {
+        let mut n = GraphNode::new("n1".into(), NodeKind::Sequencer, Vec2::ZERO);
+        n.toggle_note(3, 60);
+        assert_eq!(n.notes, vec![SeqNote { step: 3, pitch: 60, len: 1 }]);
+        n.toggle_note(3, 60);
+        assert!(n.notes.is_empty());
+    }
+
+    #[test]
     fn tick_field_is_cue_not_clock() {
         assert_eq!(parse_tick(""), 1);
         assert_eq!(parse_tick("2"), 2);
@@ -391,5 +459,24 @@ mod tests {
         assert_eq!(midi_shift(60, n.pitch_shift()), 73);
         n.transpose_steps = 0.5;
         assert!((n.time_shift_beats() - BEATS_PER_STEP as f64 * 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn loop_and_octave() {
+        let mut n = GraphNode::new("s".into(), NodeKind::Sequencer, Vec2::ZERO);
+        assert_eq!(n.loop_steps(), SEQ_STEPS);
+        assert_eq!(n.view_base_pitch(), SEQ_BASE_PITCH);
+        n.seq_loop_bars = 3;
+        n.seq_octave = 5;
+        assert_eq!(n.loop_steps(), SEQ_STEPS * 3);
+        assert_eq!(n.view_base_pitch(), 72);
+        n.seq_loop_bars = 99;
+        n.seq_octave = -3;
+        assert_eq!(n.loop_bars(), SEQ_MAX_BARS);
+        assert_eq!(n.view_octave(), SEQ_OCTAVE_MIN);
+        let p = GraphNode::new("p".into(), NodeKind::NoteScope, Vec2::ZERO);
+        assert_eq!(p.view_octaves(), 3);
+        assert_eq!(p.view_octave(), 3);
+        assert_eq!(p.view_pitch_count(), 36);
     }
 }
