@@ -282,18 +282,12 @@ fn draw_body(
             ui.label("Pulse width");
             ui.drag_float("pw", &mut node.pulse_width, 0.01);
             node.pulse_width = node.pulse_width.clamp(0.02, 0.98);
-            labeled_slider(ui, "Attack, sec", &mut node.adsr_attack, 0.001..=2.0);
-            labeled_slider(ui, "Decay, sec", &mut node.adsr_decay, 0.01..=2.0);
-            labeled_slider(ui, "Sustain", &mut node.adsr_sustain, 0.0..=1.0);
-            labeled_slider(ui, "Release, sec", &mut node.adsr_release, 0.01..=4.0);
+            super::adsr::draw(ui, node);
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
         NodeKind::Guitar => {
             ui.node_port(NodePortSide::Input, "notes", port::NOTES);
-            labeled_slider(ui, "Attack, sec", &mut node.adsr_attack, 0.001..=2.0);
-            labeled_slider(ui, "Decay, sec", &mut node.adsr_decay, 0.01..=2.0);
-            labeled_slider(ui, "Sustain", &mut node.adsr_sustain, 0.0..=1.0);
-            labeled_slider(ui, "Release, sec", &mut node.adsr_release, 0.01..=4.0);
+            super::adsr::draw(ui, node);
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
         NodeKind::Osc => {

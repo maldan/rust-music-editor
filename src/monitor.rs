@@ -134,6 +134,14 @@ impl PitchSet {
         }
     }
 
+    pub fn remove(&self, p: u8) {
+        if p < 64 {
+            self.lo.fetch_and(!(1 << p), Ordering::Relaxed);
+        } else if p < 128 {
+            self.hi.fetch_and(!(1 << (p - 64)), Ordering::Relaxed);
+        }
+    }
+
     pub fn load(&self) -> HashSet<u8> {
         let lo = self.lo.load(Ordering::Relaxed);
         let hi = self.hi.load(Ordering::Relaxed);

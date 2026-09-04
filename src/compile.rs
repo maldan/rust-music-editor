@@ -573,9 +573,22 @@ struct SeqRun {
     playhead_out: Arc<AtomicU32>,
     targets: Vec<SeqTarget>,
     taps: Vec<TapRun>,
+    events: Vec<SeqEv>,
+    next_ev: usize,
+    counts: HashMap<(NodeId, u8), u32>,
+    tap_counts: HashMap<(u32, u8), u32>,
     held: Vec<(NodeId, u8)>,
-    want: Vec<(NodeId, u8)>,
     was_active: bool,
+    need_init: bool,
+}
+
+#[derive(Clone, Copy)]
+struct SeqEv {
+    t: f64,
+    on: bool,
+    voice: Option<NodeId>,
+    tap: Option<u32>,
+    pitch: u8,
 }
 
 pub struct Live {
@@ -591,6 +604,7 @@ pub struct Live {
     seqs: HashMap<String, SeqRun>,
     taps: HashMap<String, Arc<crate::monitor::PitchSet>>,
     voice_holds: HashMap<NodeId, HashMap<u8, u32>>,
+    tap_holds: HashMap<(usize, u8), u32>,
     monitor: Arc<Monitor>,
     song_beats: f64,
     bpm: f32,
@@ -626,6 +640,7 @@ impl Live {
             seqs: HashMap::new(),
             taps: HashMap::new(),
             voice_holds: HashMap::new(),
+            tap_holds: HashMap::new(),
             monitor,
             song_beats: patch.seek_beats.max(0.0),
             bpm: patch.bpm.max(1.0),
@@ -659,6 +674,9 @@ impl Live {
     }
 
     fn rebuild_seqs(&mut self, patch: &Patch, keep_held: bool) -> Vec<(NodeId, u8)> {
+        for seq in self.seqs.values_mut() {
+            seq_release_taps(&mut self.tap_holds, seq);
+        }
         let mut next = HashMap::new();
         for n in &patch.nodes {
             if n.kind != NodeKind::Sequencer || n.bypass {
@@ -695,20 +713,26 @@ impl Live {
             } else {
                 (Vec::new(), false)
             };
+            let loop_beats = n.loop_beats();
+            let events = compile_seq_events(&n.notes, &targets, &taps, loop_beats);
             next.insert(
                 n.id.clone(),
                 SeqRun {
                     notes: n.notes.clone(),
                     clock_id,
                     windows: parse_seq_when(&n.seq_when),
-                    loop_beats: n.loop_beats(),
+                    loop_beats,
                     pos,
                     playhead_out,
                     targets,
                     taps,
+                    events,
+                    next_ev: 0,
+                    counts: HashMap::new(),
+                    tap_counts: HashMap::new(),
                     held,
-                    want: Vec::new(),
                     was_active,
+                    need_init: true,
                 },
             );
         }
@@ -943,8 +967,11 @@ impl Live {
             voice_note(graph, &mut self.voice_holds, id, NoteEvent::NoteOff { note: pitch });
         }
         for seq in self.seqs.values_mut() {
+            seq_release_taps(&mut self.tap_holds, seq);
             seq.held.clear();
+            seq.counts.clear();
             seq.was_active = false;
+            seq.need_init = true;
         }
         self.voice_holds.clear();
     }
@@ -954,14 +981,22 @@ impl Live {
     }
 
     pub fn tick_block(&mut self, graph: &mut Graph, samples: usize) {
-        self.clear_taps();
         if self.playing {
             let step = self.bpm as f64 / (self.sample_rate as f64 * 60.0);
             self.song_beats += step * samples.max(1) as f64;
             let song = self.song_beats;
             for seq in self.seqs.values_mut() {
-                tick_seq(graph, &self.clocks, &mut self.voice_holds, seq, song);
+                tick_seq(
+                    graph,
+                    &self.clocks,
+                    &mut self.voice_holds,
+                    &mut self.tap_holds,
+                    seq,
+                    song,
+                );
             }
+        } else {
+            self.clear_taps();
         }
         self.publish_time();
     }
@@ -989,93 +1024,349 @@ fn tick_seq(
     graph: &mut Graph,
     clocks: &HashMap<String, ClockRun>,
     holds: &mut HashMap<NodeId, HashMap<u8, u32>>,
+    tap_holds: &mut HashMap<(usize, u8), u32>,
     seq: &mut SeqRun,
     song: f64,
 ) {
     if !clocks.contains_key(&seq.clock_id) {
         if seq.was_active {
-            seq_release(graph, holds, seq);
+            seq_release(graph, holds, tap_holds, seq);
         }
         return;
     }
     let win = seq_window(&seq.windows, song);
     if seq.was_active && win.is_none() {
-        seq_release(graph, holds, seq);
+        seq_release(graph, holds, tap_holds, seq);
         return;
     }
     if win.is_none() {
         return;
     }
+    let loop_len = seq.loop_beats.max(BEATS_PER_BAR as f64);
+    if seq.need_init || !seq.was_active {
+        seq_snapshot(graph, holds, tap_holds, seq, song, loop_len);
+        seq.was_active = true;
+        seq.need_init = false;
+        seq.pos = song;
+        return;
+    }
+    seq_catch_up(graph, holds, tap_holds, seq, seq.pos, song, loop_len);
     seq.pos = song;
     seq.was_active = true;
-    let loop_len = seq.loop_beats.max(BEATS_PER_BAR as f64);
-    collect_now(seq, song, loop_len);
-    let mut i = 0;
-    while i < seq.held.len() {
-        let (id, pitch) = seq.held[i];
-        if seq.want.contains(&(id, pitch)) {
-            i += 1;
-            continue;
-        }
-        voice_note(graph, holds, id, NoteEvent::NoteOff { note: pitch });
-        seq.held.swap_remove(i);
-    }
-    for &(id, pitch) in &seq.want {
-        if seq.held.contains(&(id, pitch)) {
-            continue;
-        }
-        voice_note(
-            graph,
-            holds,
-            id,
-            NoteEvent::NoteOn {
-                note: pitch,
-                velocity: 0.8,
-            },
-        );
-        seq.held.push((id, pitch));
-    }
 }
 
 fn seq_release(
     graph: &mut Graph,
     holds: &mut HashMap<NodeId, HashMap<u8, u32>>,
+    tap_holds: &mut HashMap<(usize, u8), u32>,
     seq: &mut SeqRun,
 ) {
-    let held = seq.held.clone();
+    let held: Vec<(NodeId, u8)> = seq.held.drain(..).collect();
     for (id, pitch) in held {
         voice_note(graph, holds, id, NoteEvent::NoteOff { note: pitch });
     }
-    seq.held.clear();
+    seq_release_taps(tap_holds, seq);
+    seq.counts.clear();
     seq.was_active = false;
+    seq.need_init = true;
 }
 
-fn collect_now(seq: &mut SeqRun, song: f64, loop_len: f64) {
-    seq.want.clear();
+fn seq_release_taps(tap_holds: &mut HashMap<(usize, u8), u32>, seq: &mut SeqRun) {
+    let tap_counts = std::mem::take(&mut seq.tap_counts);
+    for ((idx, pitch), n) in tap_counts {
+        let Some(tap) = seq.taps.get(idx as usize) else {
+            continue;
+        };
+        for _ in 0..n {
+            tap_note(&tap.slot, tap_holds, pitch, false);
+        }
+    }
+}
+
+fn seq_snapshot(
+    graph: &mut Graph,
+    holds: &mut HashMap<NodeId, HashMap<u8, u32>>,
+    tap_holds: &mut HashMap<(usize, u8), u32>,
+    seq: &mut SeqRun,
+    song: f64,
+    loop_len: f64,
+) {
+    let mut counts = HashMap::new();
+    voice_spans(&seq.notes, &seq.targets, loop_len, |voice, pitch, dur, on, off| {
+        if sounding_at(song, on, off, loop_len, dur) {
+            *counts.entry((voice, pitch)).or_insert(0) += 1;
+        }
+    });
+    let new_keys: HashSet<(NodeId, u8)> = counts
+        .iter()
+        .filter(|(_, n)| **n > 0)
+        .map(|(k, _)| *k)
+        .collect();
+    let mut i = 0;
+    while i < seq.held.len() {
+        let key = seq.held[i];
+        if new_keys.contains(&key) {
+            i += 1;
+            continue;
+        }
+        voice_note(graph, holds, key.0, NoteEvent::NoteOff { note: key.1 });
+        seq.held.swap_remove(i);
+    }
+    for &key in &new_keys {
+        if seq.held.contains(&key) {
+            continue;
+        }
+        voice_note(
+            graph,
+            holds,
+            key.0,
+            NoteEvent::NoteOn {
+                note: key.1,
+                velocity: 0.8,
+            },
+        );
+        seq.held.push(key);
+    }
+    seq.counts = counts;
+
+    seq_release_taps(tap_holds, seq);
+    let mut tap_counts = HashMap::new();
+    tap_spans(&seq.notes, &seq.taps, loop_len, |idx, pitch, dur, on, off| {
+        if sounding_at(song, on, off, loop_len, dur) {
+            *tap_counts.entry((idx, pitch)).or_insert(0) += 1;
+        }
+    });
+    for (&(idx, pitch), &n) in &tap_counts {
+        let Some(tap) = seq.taps.get(idx as usize) else {
+            continue;
+        };
+        for _ in 0..n {
+            tap_note(&tap.slot, tap_holds, pitch, true);
+        }
+    }
+    seq.tap_counts = tap_counts;
+
+    let now = song.rem_euclid(loop_len);
+    seq.next_ev = seq.events.partition_point(|e| e.t <= now);
+}
+
+fn seq_catch_up(
+    graph: &mut Graph,
+    holds: &mut HashMap<NodeId, HashMap<u8, u32>>,
+    tap_holds: &mut HashMap<(usize, u8), u32>,
+    seq: &mut SeqRun,
+    from_song: f64,
+    to_song: f64,
+    loop_len: f64,
+) {
+    if to_song <= from_song || loop_len <= 0.0 {
+        return;
+    }
+    let last_loop = from_song.rem_euclid(loop_len);
+    let now_loop = to_song.rem_euclid(loop_len);
+    let wraps = ((last_loop + (to_song - from_song)) / loop_len).floor() as u32;
+    if wraps == 0 {
+        seq_fire_until(graph, holds, tap_holds, seq, now_loop);
+        return;
+    }
+    seq_fire_rest(graph, holds, tap_holds, seq);
+    for _ in 1..wraps {
+        seq.next_ev = 0;
+        seq_fire_rest(graph, holds, tap_holds, seq);
+    }
+    seq.next_ev = 0;
+    seq_fire_until(graph, holds, tap_holds, seq, now_loop);
+}
+
+fn seq_fire_until(
+    graph: &mut Graph,
+    holds: &mut HashMap<NodeId, HashMap<u8, u32>>,
+    tap_holds: &mut HashMap<(usize, u8), u32>,
+    seq: &mut SeqRun,
+    until: f64,
+) {
+    while seq.next_ev < seq.events.len() && seq.events[seq.next_ev].t <= until {
+        let ev = seq.events[seq.next_ev];
+        seq.next_ev += 1;
+        apply_seq_ev(graph, holds, tap_holds, seq, ev);
+    }
+}
+
+fn seq_fire_rest(
+    graph: &mut Graph,
+    holds: &mut HashMap<NodeId, HashMap<u8, u32>>,
+    tap_holds: &mut HashMap<(usize, u8), u32>,
+    seq: &mut SeqRun,
+) {
+    while seq.next_ev < seq.events.len() {
+        let ev = seq.events[seq.next_ev];
+        seq.next_ev += 1;
+        apply_seq_ev(graph, holds, tap_holds, seq, ev);
+    }
+}
+
+fn apply_seq_ev(
+    graph: &mut Graph,
+    holds: &mut HashMap<NodeId, HashMap<u8, u32>>,
+    tap_holds: &mut HashMap<(usize, u8), u32>,
+    seq: &mut SeqRun,
+    ev: SeqEv,
+) {
+    if let Some(id) = ev.voice {
+        let key = (id, ev.pitch);
+        let count = seq.counts.entry(key).or_insert(0);
+        if ev.on {
+            *count += 1;
+            if *count == 1 {
+                voice_note(
+                    graph,
+                    holds,
+                    id,
+                    NoteEvent::NoteOn {
+                        note: ev.pitch,
+                        velocity: 0.8,
+                    },
+                );
+                if !seq.held.contains(&key) {
+                    seq.held.push(key);
+                }
+            }
+        } else if *count > 0 {
+            *count -= 1;
+            if *count == 0 {
+                seq.counts.remove(&key);
+                voice_note(graph, holds, id, NoteEvent::NoteOff { note: ev.pitch });
+                seq.held.retain(|k| *k != key);
+            }
+        }
+    }
+    if let Some(idx) = ev.tap {
+        let key = (idx, ev.pitch);
+        let slot = seq.taps.get(idx as usize).map(|t| t.slot.clone());
+        let Some(slot) = slot else {
+            return;
+        };
+        let count = seq.tap_counts.entry(key).or_insert(0);
+        if ev.on {
+            *count += 1;
+            tap_note(&slot, tap_holds, ev.pitch, true);
+        } else if *count > 0 {
+            *count -= 1;
+            tap_note(&slot, tap_holds, ev.pitch, false);
+            if *count == 0 {
+                seq.tap_counts.remove(&key);
+            }
+        }
+    }
+}
+
+fn tap_note(slot: &crate::monitor::PitchSet, holds: &mut HashMap<(usize, u8), u32>, pitch: u8, on: bool) {
+    let k = (slot as *const crate::monitor::PitchSet as usize, pitch);
+    let count = holds.entry(k).or_insert(0);
+    if on {
+        *count += 1;
+        if *count == 1 {
+            slot.insert(pitch);
+        }
+    } else {
+        if *count > 0 {
+            *count -= 1;
+        }
+        if *count == 0 {
+            holds.remove(&k);
+            slot.remove(pitch);
+        }
+    }
+}
+
+fn compile_seq_events(
+    notes: &[SeqNote],
+    targets: &[SeqTarget],
+    taps: &[TapRun],
+    loop_beats: f64,
+) -> Vec<SeqEv> {
+    let loop_len = loop_beats.max(BEATS_PER_BAR as f64);
+    let mut events = Vec::new();
+    voice_spans(notes, targets, loop_len, |voice, pitch, dur, on, off| {
+        if dur >= loop_len - 1e-9 {
+            return;
+        }
+        events.push(SeqEv {
+            t: on,
+            on: true,
+            voice: Some(voice),
+            tap: None,
+            pitch,
+        });
+        events.push(SeqEv {
+            t: off,
+            on: false,
+            voice: Some(voice),
+            tap: None,
+            pitch,
+        });
+    });
+    tap_spans(notes, taps, loop_len, |idx, pitch, dur, on, off| {
+        if dur >= loop_len - 1e-9 {
+            return;
+        }
+        events.push(SeqEv {
+            t: on,
+            on: true,
+            voice: None,
+            tap: Some(idx),
+            pitch,
+        });
+        events.push(SeqEv {
+            t: off,
+            on: false,
+            voice: None,
+            tap: Some(idx),
+            pitch,
+        });
+    });
+    events.sort_by(|a, b| a.t.total_cmp(&b.t).then_with(|| a.on.cmp(&b.on)));
+    events
+}
+
+fn voice_spans(
+    notes: &[SeqNote],
+    targets: &[SeqTarget],
+    loop_len: f64,
+    mut emit: impl FnMut(NodeId, u8, f64, f64, f64),
+) {
     let max_step = (loop_len / BEATS_PER_STEP as f64).round().max(1.0) as u32;
-    for note in &seq.notes {
-        if note.step as u32 >= max_step {
+    for note in notes {
+        if note.step >= max_step {
             continue;
         }
         let note_dur = note.len.max(1) as f64 * BEATS_PER_STEP as f64;
-        for t in &seq.targets {
+        for t in targets {
             let dur = if t.gate > 1e-9 { t.gate } else { note_dur };
             let on = (note.step as f64 * BEATS_PER_STEP as f64 + t.delay).rem_euclid(loop_len);
             let off = (on + dur).rem_euclid(loop_len);
-            if sounding_at(song, on, off, loop_len, dur) {
-                let key = (t.voice, midi_shift(note.pitch, t.pitch));
-                if !seq.want.contains(&key) {
-                    seq.want.push(key);
-                }
-            }
+            emit(t.voice, midi_shift(note.pitch, t.pitch), dur, on, off);
         }
-        for t in &seq.taps {
+    }
+}
+
+fn tap_spans(
+    notes: &[SeqNote],
+    taps: &[TapRun],
+    loop_len: f64,
+    mut emit: impl FnMut(u32, u8, f64, f64, f64),
+) {
+    let max_step = (loop_len / BEATS_PER_STEP as f64).round().max(1.0) as u32;
+    for note in notes {
+        if note.step >= max_step {
+            continue;
+        }
+        let note_dur = note.len.max(1) as f64 * BEATS_PER_STEP as f64;
+        for (idx, t) in taps.iter().enumerate() {
             let dur = if t.gate > 1e-9 { t.gate } else { note_dur };
             let on = (note.step as f64 * BEATS_PER_STEP as f64 + t.delay).rem_euclid(loop_len);
             let off = (on + dur).rem_euclid(loop_len);
-            if sounding_at(song, on, off, loop_len, dur) {
-                t.slot.insert(midi_shift(note.pitch, t.pitch));
-            }
+            emit(idx as u32, midi_shift(note.pitch, t.pitch), dur, on, off);
         }
     }
 }
@@ -1086,21 +1377,13 @@ fn seq_desired(
     song: f64,
     loop_len: f64,
 ) -> HashSet<(NodeId, u8)> {
-    let mut seq = SeqRun {
-        notes: notes.to_vec(),
-        clock_id: String::new(),
-        windows: Vec::new(),
-        loop_beats: loop_len,
-        pos: 0.0,
-        playhead_out: Arc::new(AtomicU32::new(0)),
-        targets: targets.to_vec(),
-        taps: Vec::new(),
-        held: Vec::new(),
-        want: Vec::new(),
-        was_active: false,
-    };
-    collect_now(&mut seq, song, loop_len);
-    seq.want.into_iter().collect()
+    let mut out = HashSet::new();
+    voice_spans(notes, targets, loop_len, |voice, pitch, dur, on, off| {
+        if sounding_at(song, on, off, loop_len, dur) {
+            out.insert((voice, pitch));
+        }
+    });
+    out
 }
 
 fn sounding_at(song: f64, on: f64, off: f64, period: f64, dur: f64) -> bool {
@@ -1753,6 +2036,68 @@ mod tests {
             "empty notes must not keep sounding"
         );
         let _ = notes;
+    }
+
+    #[test]
+    fn event_cursor_matches_scan() {
+        let mut g = Graph::new(48_000.0, 1);
+        let voice = g.add_node(Box::new(Oscillator::new(Waveform::Sine, 440.0)));
+        let mut notes: Vec<SeqNote> = (0..250)
+            .map(|i| SeqNote {
+                step: (i * 3) % 32,
+                pitch: 40 + (i % 20) as u8,
+                len: 1 + (i % 5) as u32,
+            })
+            .collect();
+        notes.push(SeqNote {
+            step: 30,
+            pitch: 72,
+            len: 8,
+        });
+        let targets = [SeqTarget {
+            voice,
+            pitch: 0,
+            delay: 0.0,
+            gate: 0.0,
+        }];
+        let loop_len = 8.0;
+        let mut seq = SeqRun {
+            notes: notes.clone(),
+            clock_id: "clk".into(),
+            windows: Vec::new(),
+            loop_beats: loop_len,
+            pos: 0.0,
+            playhead_out: Arc::new(AtomicU32::new(0)),
+            targets: targets.to_vec(),
+            taps: Vec::new(),
+            events: compile_seq_events(&notes, &targets, &[], loop_len),
+            next_ev: 0,
+            counts: HashMap::new(),
+            tap_counts: HashMap::new(),
+            held: Vec::new(),
+            was_active: false,
+            need_init: true,
+        };
+        let clocks = HashMap::from([(
+            "clk".into(),
+            ClockRun {
+                out: Arc::new(AtomicU32::new(0)),
+            },
+        )]);
+        let mut holds = HashMap::new();
+        let mut tap_holds = HashMap::new();
+        let mut song = 0.0;
+        let dt = 0.02;
+        for i in 0..900 {
+            song += dt;
+            tick_seq(&mut g, &clocks, &mut holds, &mut tap_holds, &mut seq, song);
+            if i % 15 != 0 {
+                continue;
+            }
+            let want = seq_desired(&notes, &targets, song, loop_len);
+            let got: HashSet<_> = seq.held.iter().copied().collect();
+            assert_eq!(got, want, "held diverged at song={song}");
+        }
     }
 
     fn patch_with(nodes: Vec<crate::graph::GraphNode>, links: Vec<(&str, &str, &str, &str)>) -> Patch {

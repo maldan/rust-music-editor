@@ -12,11 +12,11 @@ use mega_ui::{CursorIcon, Ui, UiInput};
 
 pub use mega_ui::wgpu::DrawStats;
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::dpi::{LogicalSize, PhysicalPosition};
+use winit::event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
-use winit::window::{Window as WinitWindow, WindowId};
+use winit::window::{CursorGrabMode, Window as WinitWindow, WindowId};
 
 /// "Сырые" физические клавиши за этот кадр — независимо от того, съел ли их
 /// UI (текстовые поля и т.п.). Нужны демкам вроде синтезатора, где клавиатура
@@ -53,6 +53,7 @@ pub struct FrameInput {
     mouse_middle_pressed: bool,
     mouse_middle_released: bool,
     scroll_delta: Vec2,
+    mouse_delta: Vec2,
     text: String,
     key_backspace: bool,
     key_delete: bool,
@@ -84,6 +85,7 @@ impl FrameInput {
         self.mouse_middle_pressed = false;
         self.mouse_middle_released = false;
         self.scroll_delta = Vec2::ZERO;
+        self.mouse_delta = Vec2::ZERO;
         self.text.clear();
         self.key_backspace = false;
         self.key_delete = false;
@@ -120,6 +122,7 @@ impl FrameInput {
             mouse_middle_released: self.mouse_middle_released,
             viewport,
             scroll_delta: self.scroll_delta,
+            mouse_delta: self.mouse_delta,
             dt,
             text: self.text.clone(),
             key_backspace: self.key_backspace,
@@ -173,6 +176,9 @@ pub struct Host<S: Scene> {
     input: FrameInput,
     last_frame: Instant,
     cursor: CursorIcon,
+    cursor_visible: bool,
+    cursor_grabbed: bool,
+    cursor_lock_pos: Option<Vec2>,
     draw_stats: DrawStats,
     clipboard: Option<arboard::Clipboard>,
     key_events: KeyEvents,
@@ -190,6 +196,9 @@ impl<S: Scene> Host<S> {
             input: FrameInput::default(),
             last_frame: Instant::now(),
             cursor: CursorIcon::Default,
+            cursor_visible: true,
+            cursor_grabbed: false,
+            cursor_lock_pos: None,
             draw_stats: DrawStats::default(),
             clipboard: arboard::Clipboard::new().ok(),
             key_events: KeyEvents::default(),
@@ -320,7 +329,7 @@ impl<S: Scene> Host<S> {
             }
         }
 
-        self.apply_cursor(&window, out.cursor);
+        self.apply_cursor(&window, out.cursor, !out.hide_cursor, out.cursor_anchor);
 
         let Some(gpu) = self.gpu.as_mut() else {
             return;
@@ -400,7 +409,44 @@ impl<S: Scene> Host<S> {
         }
     }
 
-    fn apply_cursor(&mut self, window: &WinitWindow, cursor: CursorIcon) {
+    fn apply_cursor(
+        &mut self,
+        window: &WinitWindow,
+        cursor: CursorIcon,
+        visible: bool,
+        anchor: Option<Vec2>,
+    ) {
+        if !visible {
+            if let Some(p) = anchor {
+                self.cursor_lock_pos = Some(p);
+            }
+            if !self.cursor_grabbed {
+                let locked = window
+                    .set_cursor_grab(CursorGrabMode::Locked)
+                    .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
+                self.cursor_grabbed = locked.is_ok();
+            }
+            if self.cursor_visible {
+                window.set_cursor_visible(false);
+                self.cursor_visible = false;
+            }
+            return;
+        }
+
+        if self.cursor_grabbed || !self.cursor_visible {
+            let _ = window.set_cursor_grab(CursorGrabMode::None);
+            self.cursor_grabbed = false;
+            if let Some(p) = self.cursor_lock_pos.take().or(anchor) {
+                let _ = window.set_cursor_position(PhysicalPosition::new(p.x as f64, p.y as f64));
+                self.input.mouse_pos = p;
+            }
+            window.set_cursor_visible(true);
+            self.cursor_visible = true;
+            self.cursor = cursor;
+            window.set_cursor(map_cursor(cursor));
+            return;
+        }
+
         if cursor == self.cursor {
             return;
         }
@@ -576,6 +622,23 @@ impl<S: Scene> ApplicationHandler for Host<S> {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: winit::event::DeviceId,
+        event: DeviceEvent,
+    ) {
+        if let DeviceEvent::MouseMotion { delta } = event {
+            self.input.mouse_delta.x += delta.0 as f32;
+            self.input.mouse_delta.y += delta.1 as f32;
+            if self.cursor_grabbed {
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
         }
     }
 }
