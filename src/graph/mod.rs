@@ -1,6 +1,7 @@
 mod doc;
 mod file;
 mod node;
+mod project;
 
 pub use doc::GraphDoc;
 pub use file::{with_graph_ext, FILE_EXT};
@@ -9,3 +10,4 @@ pub use node::{
     NodeKind, SeqNote, ARP_NAMES, BEATS_PER_BAR, BEATS_PER_STEP, CHORD_NAMES, EqPt, MIX_INS,
     MIX_PAN_INS, MIX_VOL_INS, NOTE_JOIN_INS, SEQ_MAX_BARS, SEQ_OCTAVE_MIN, SEQ_PITCHES, SEQ_STEPS,
 };
+pub use project::{EditorView, Instrument, Project, Sequence};

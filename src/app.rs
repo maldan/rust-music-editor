@@ -2,20 +2,22 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use mega_audio::events::{event_channel, EventSender};
+use mega_audio::note::NoteEvent;
 use mega_audio::{AudioEngine, GraphSetup};
 use mega_ui::DockState;
 
 use crate::compile::{Live, Patch};
-use crate::graph::{with_graph_ext, FILE_EXT, GraphDoc};
+use crate::graph::{with_graph_ext, FILE_EXT, Project};
 use crate::monitor::Monitor;
 use crate::ui::default_dock;
 
 pub struct App {
-    pub graph: GraphDoc,
+    pub project: Project,
     pub dock: DockState,
     pub playing: bool,
     pub monitor: Arc<Monitor>,
     pub status: String,
+    pub preview_tx: EventSender<NoteEvent>,
     current_path: Option<PathBuf>,
     last_fp: u64,
     last_playing: bool,
@@ -26,9 +28,10 @@ pub struct App {
 
 impl App {
     pub fn start() -> Result<Self, Box<dyn std::error::Error>> {
-        let graph = GraphDoc::new_default();
+        let project = Project::new_default();
         let (tx, mut rx) = event_channel::<Patch>(16);
-        let first = Patch::from_doc(&graph, false);
+        let (preview_tx, mut preview_rx) = event_channel::<NoteEvent>(64);
+        let first = Patch::from_project(&project, false);
         let monitor = Arc::new(Monitor::default());
         let mon_audio = monitor.clone();
 
@@ -42,19 +45,23 @@ impl App {
                 if let Some(p) = last {
                     live.apply(graph, p);
                 }
+                while let Some(ev) = preview_rx.try_recv() {
+                    live.preview_event(graph, ev);
+                }
                 live.tick(graph);
             })
         })?;
 
         Ok(Self {
-            last_fp: graph.fingerprint(),
+            last_fp: project.fingerprint(),
             last_playing: false,
-            last_seek_gen: graph.seek_gen,
-            graph,
+            last_seek_gen: project.main.seek_gen,
+            project,
             dock: default_dock(),
             playing: false,
             monitor,
             status: String::new(),
+            preview_tx,
             current_path: None,
             tx,
             _engine: engine,
@@ -62,17 +69,17 @@ impl App {
     }
 
     pub fn sync_audio(&mut self) {
-        let fp = self.graph.fingerprint();
+        let fp = self.project.fingerprint();
         if fp == self.last_fp
             && self.playing == self.last_playing
-            && self.graph.seek_gen == self.last_seek_gen
+            && self.project.main.seek_gen == self.last_seek_gen
         {
             return;
         }
         self.last_fp = fp;
         self.last_playing = self.playing;
-        self.last_seek_gen = self.graph.seek_gen;
-        let _ = self.tx.send(Patch::from_doc(&self.graph, self.playing));
+        self.last_seek_gen = self.project.main.seek_gen;
+        let _ = self.tx.send(Patch::from_project(&self.project, self.playing));
     }
 
     pub fn save(&mut self) {
@@ -102,7 +109,7 @@ impl App {
     }
 
     fn write_to(&mut self, path: PathBuf) {
-        match self.graph.save_to_path(&path) {
+        match self.project.save_to_path(&path) {
             Ok(()) => {
                 self.status = format!("Saved {}", path.display());
                 self.current_path = Some(path);
@@ -118,9 +125,9 @@ impl App {
         let Some(path) = path else {
             return;
         };
-        match GraphDoc::load_from_path(&path) {
-            Ok(graph) => {
-                self.graph = graph;
+        match Project::load_from_path(&path) {
+            Ok(project) => {
+                self.project = project;
                 self.playing = false;
                 self.current_path = Some(path.clone());
                 self.status = format!("Opened {}", path.display());

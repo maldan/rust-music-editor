@@ -1,18 +1,26 @@
+mod explorer;
 mod graph;
 mod inspector;
 mod piano;
 
 use glam::Vec2;
+use mega_audio::events::EventSender;
+use mega_audio::note::NoteEvent;
 use mega_ui::{DockNode, DockState, Ui};
 
 use crate::app::App;
 use crate::framework::{DrawStats, KeyEvents, Scene};
+use crate::graph::EditorView;
 
 pub fn default_dock() -> DockState {
     DockState::new(DockNode::split_h(
-        0.82,
-        DockNode::leaf(&["Graph"]),
-        DockNode::leaf(&["Inspector"]),
+        0.16,
+        DockNode::leaf(&["Project"]),
+        DockNode::split_h(
+            0.80,
+            DockNode::leaf(&["Graph"]),
+            DockNode::leaf(&["Inspector"]),
+        ),
     ))
 }
 
@@ -53,17 +61,31 @@ impl Scene for App {
                 }
                 ui.separator();
                 if ui.menu_item("Fit view").clicked() {
-                    state.graph.space.fit_view = true;
+                    state.project.main.space.fit_view = true;
                 }
             });
         });
 
+        let seqs: Vec<(String, String)> = state
+            .project
+            .sequences
+            .iter()
+            .map(|s| (s.id.clone(), s.name.clone()))
+            .collect();
+        let insts: Vec<(String, String)> = state
+            .project
+            .instruments
+            .iter()
+            .map(|i| (i.id.clone(), i.name.clone()))
+            .collect();
+
         let App {
             dock,
-            graph: doc,
+            project,
             playing,
             monitor,
             status,
+            preview_tx,
             ..
         } = state;
 
@@ -71,18 +93,46 @@ impl Scene for App {
         let dock_size = Vec2::new(dock_size.x.max(1.0), dock_size.y.max(120.0));
 
         ui.dock_space("main", dock_size, dock, |ui, tab| match tab {
-            "Graph" => {
-                graph::draw(ui, doc, monitor);
-            }
+            "Project" => explorer::draw(ui, project),
+            "Graph" => draw_editor(ui, project, monitor, preview_tx, &seqs, &insts),
             "Inspector" => {
-                inspector::draw(ui, doc, playing, monitor, status);
+                inspector::draw(ui, project, playing, monitor, status);
             }
             _ => {}
         });
 
-        doc.apply_deletes();
-        doc.apply_clones();
+        if let Some(doc) = project.active_graph() {
+            doc.apply_deletes();
+            doc.apply_clones();
+        }
         state.sync_audio();
         true
+    }
+}
+
+fn draw_editor(
+    ui: &mut Ui,
+    project: &mut crate::graph::Project,
+    monitor: &std::sync::Arc<crate::monitor::Monitor>,
+    preview_tx: &mut EventSender<NoteEvent>,
+    seqs: &[(String, String)],
+    insts: &[(String, String)],
+) {
+    match project.view.clone() {
+        EditorView::Graph => {
+            graph::draw(ui, &mut project.main, monitor, seqs, insts, false);
+        }
+        EditorView::Instrument(id) => {
+            if let Some(inst) = project.instruments.iter_mut().find(|i| i.id == id) {
+                graph::draw(ui, &mut inst.graph, monitor, seqs, insts, true);
+            }
+        }
+        EditorView::Sequence(id) => {
+            let song = monitor.song_beats();
+            if let Some(seq) = project.sequence_mut(&id) {
+                let bars = seq.loop_bars();
+                piano::draw_editor(ui, &id, &mut seq.notes, bars, song, preview_tx);
+            }
+        }
     }
 }

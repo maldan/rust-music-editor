@@ -15,12 +15,25 @@ use crate::monitor::Monitor;
 
 use super::piano;
 
-pub fn draw(ui: &mut Ui, doc: &mut GraphDoc, monitor: &Arc<Monitor>) -> bool {
+pub enum Spawn {
+    Kind(NodeKind),
+    Seq(String),
+    Inst(String),
+}
+
+pub fn draw(
+    ui: &mut Ui,
+    doc: &mut GraphDoc,
+    monitor: &Arc<Monitor>,
+    sequences: &[(String, String)],
+    instruments: &[(String, String)],
+    instrument_graph: bool,
+) -> bool {
     let mut keep = false;
     let size = ui.available_size();
     let size = Vec2::new(size.x, size.y.max(120.0));
 
-    let mut spawn_at: Option<(NodeKind, Vec2)> = None;
+    let mut spawn_at: Option<(Spawn, Vec2)> = None;
 
     let (bg, world, opened) = {
         let space = &mut doc.space;
@@ -39,10 +52,10 @@ pub fn draw(ui: &mut Ui, doc: &mut GraphDoc, monitor: &Arc<Monitor>) -> bool {
                 let Some(idx) = nodes.iter().position(|n| n.id == id) else {
                     continue;
                 };
-                let title = nodes[idx].kind.title().to_string();
+                let title = node_title(&nodes[idx], sequences, instruments);
                 let mut pos = nodes[idx].pos;
                 ui.node(&id, &title, &mut pos, |ui| {
-                    draw_body(ui, &mut nodes[idx], monitor);
+                    draw_body(ui, &mut nodes[idx], monitor, sequences, instruments);
                 });
                 nodes[idx].pos = pos;
             }
@@ -59,7 +72,7 @@ pub fn draw(ui: &mut Ui, doc: &mut GraphDoc, monitor: &Arc<Monitor>) -> bool {
     }
     let mut spawn_kind = None;
     ui.context_menu("music_spawn", bg, |ui| {
-        spawn_kind = spawn_menu(ui, &mut doc.spawn_menu_page);
+        spawn_kind = spawn_menu(ui, &mut doc.spawn_menu_page, sequences, instruments, instrument_graph);
     });
     if !ui.context_menu_open() {
         doc.spawn_menu_page = 0;
@@ -68,23 +81,68 @@ pub fn draw(ui: &mut Ui, doc: &mut GraphDoc, monitor: &Arc<Monitor>) -> bool {
         spawn_at = Some((kind, world));
     }
 
-    if let Some((kind, world)) = spawn_at {
-        doc.spawn_node(kind, world);
+    if let Some((spawn, world)) = spawn_at {
+        match spawn {
+            Spawn::Kind(kind) => {
+                doc.spawn_node(kind, world);
+            }
+            Spawn::Seq(seq_id) => {
+                let id = doc.spawn_node(NodeKind::Sequencer, world);
+                if let Some(n) = doc.nodes.iter_mut().find(|n| n.id == id) {
+                    n.seq_id = seq_id;
+                }
+            }
+            Spawn::Inst(inst_id) => {
+                let id = doc.spawn_node(NodeKind::Instrument, world);
+                if let Some(n) = doc.nodes.iter_mut().find(|n| n.id == id) {
+                    n.inst_id = inst_id;
+                }
+            }
+        }
         keep = true;
     }
 
     keep
 }
 
-fn spawn_menu(ui: &mut Ui, page: &mut u8) -> Option<NodeKind> {
+fn node_title(
+    node: &GraphNode,
+    sequences: &[(String, String)],
+    instruments: &[(String, String)],
+) -> String {
+    match node.kind {
+        NodeKind::Sequencer => sequences
+            .iter()
+            .find(|(id, _)| *id == node.seq_id)
+            .map(|(_, n)| n.clone())
+            .unwrap_or_else(|| node.kind.title().into()),
+        NodeKind::Instrument => instruments
+            .iter()
+            .find(|(id, _)| *id == node.inst_id)
+            .map(|(_, n)| n.clone())
+            .unwrap_or_else(|| node.kind.title().into()),
+        _ => node.kind.title().into(),
+    }
+}
+
+fn spawn_menu(
+    ui: &mut Ui,
+    page: &mut u8,
+    sequences: &[(String, String)],
+    instruments: &[(String, String)],
+    instrument_graph: bool,
+) -> Option<Spawn> {
     const ROOT: u8 = 0;
     const NOTES: u8 = 1;
-    const SOUND: u8 = 2;
-    const FX: u8 = 3;
-    const MATH: u8 = 4;
+    const SYNTH: u8 = 2;
+    const SOUND: u8 = 3;
+    const FX: u8 = 4;
+    const MATH: u8 = 5;
+    const SEQS: u8 = 6;
+    const INSTS: u8 = 7;
 
-    fn leaf(ui: &mut Ui, label: &str, kind: NodeKind) -> Option<NodeKind> {
-        ui.menu_item(label).clicked().then_some(kind)
+    fn leaf(ui: &mut Ui, label: &str, kind: NodeKind) -> Option<Spawn> {
+        ui.menu_item(label).clicked().then_some(Spawn::Kind(kind))
     }
     fn go(ui: &mut Ui, label: &str, page: &mut u8, to: u8) {
         if ui.menu_item_submenu(label).clicked() {
@@ -98,24 +156,50 @@ fn spawn_menu(ui: &mut Ui, page: &mut u8) -> Option<NodeKind> {
     }
 
     match *page {
+        SEQS => {
+            back(ui, page);
+            ui.separator();
+            let mut hit = None;
+            for (id, name) in sequences {
+                if ui.menu_item(name).clicked() {
+                    hit = Some(Spawn::Seq(id.clone()));
+                }
+            }
+            hit
+        }
+        INSTS => {
+            back(ui, page);
+            ui.separator();
+            let mut hit = None;
+            for (id, name) in instruments {
+                if ui.menu_item(name).clicked() {
+                    hit = Some(Spawn::Inst(id.clone()));
+                }
+            }
+            hit
+        }
         NOTES => {
             back(ui, page);
             ui.separator();
             leaf(ui, "Clock", NodeKind::Clock)
-                .or_else(|| leaf(ui, "Sequencer", NodeKind::Sequencer))
-                .or_else(|| leaf(ui, "Voice", NodeKind::Voice))
                 .or_else(|| leaf(ui, "Join Notes", NodeKind::NoteJoin))
                 .or_else(|| leaf(ui, "Transpose", NodeKind::Transpose))
                 .or_else(|| leaf(ui, "Chord", NodeKind::Chord))
                 .or_else(|| leaf(ui, "Arp", NodeKind::Arp))
                 .or_else(|| leaf(ui, "Notes", NodeKind::NoteScope))
         }
-        SOUND => {
+        SYNTH => {
             back(ui, page);
             ui.separator();
             leaf(ui, "Oscillator", NodeKind::Osc)
+                .or_else(|| leaf(ui, "Voice", NodeKind::Voice))
+                .or_else(|| leaf(ui, "Guitar", NodeKind::Guitar))
                 .or_else(|| leaf(ui, "LFO", NodeKind::Lfo))
-                .or_else(|| leaf(ui, "Filter", NodeKind::Filter))
+        }
+        SOUND => {
+            back(ui, page);
+            ui.separator();
+            leaf(ui, "Filter", NodeKind::Filter)
                 .or_else(|| leaf(ui, "Gain", NodeKind::Gain))
                 .or_else(|| leaf(ui, "Join Audio", NodeKind::Mix))
                 .or_else(|| leaf(ui, "Mixer", NodeKind::Mixer))
@@ -142,7 +226,12 @@ fn spawn_menu(ui: &mut Ui, page: &mut u8) -> Option<NodeKind> {
                 .or_else(|| leaf(ui, "Remap", NodeKind::Remap))
         }
         _ => {
+            if !instrument_graph {
+                go(ui, "Sequences", page, SEQS);
+                go(ui, "Instruments", page, INSTS);
+            }
             go(ui, "Notes", page, NOTES);
+            go(ui, "Synth", page, SYNTH);
             go(ui, "Sound", page, SOUND);
             go(ui, "Effects", page, FX);
             go(ui, "Math", page, MATH);
@@ -151,7 +240,13 @@ fn spawn_menu(ui: &mut Ui, page: &mut u8) -> Option<NodeKind> {
     }
 }
 
-fn draw_body(ui: &mut Ui, node: &mut GraphNode, monitor: &Monitor) {
+fn draw_body(
+    ui: &mut Ui,
+    node: &mut GraphNode,
+    monitor: &Monitor,
+    sequences: &[(String, String)],
+    instruments: &[(String, String)],
+) {
     let names: Vec<&str> = WAVEFORMS.iter().map(|(n, _)| *n).collect();
     match node.kind {
         NodeKind::Clock => {
@@ -160,12 +255,21 @@ fn draw_body(ui: &mut Ui, node: &mut GraphNode, monitor: &Monitor) {
         NodeKind::Sequencer => {
             ui.node_port(NodePortSide::Input, "clock", port::CLOCK);
             ui.node_port(NodePortSide::Output, "clock", port::CLOCK);
+            if let Some((_, name)) = sequences.iter().find(|(id, _)| *id == node.seq_id) {
+                ui.label(name);
+            }
             ui.label("When");
             ui.text_input("when", &mut node.seq_when);
-            roll_chrome(ui, node);
-            let id = node.id.clone();
-            let playhead = monitor.playhead(&id).filter(|p| p.is_finite());
-            piano::draw_in_node(ui, &id, node, playhead);
+            ui.node_port(NodePortSide::Output, "notes", port::NOTES);
+        }
+        NodeKind::Instrument => {
+            ui.node_port(NodePortSide::Input, "notes", port::NOTES);
+            if let Some((_, name)) = instruments.iter().find(|(id, _)| *id == node.inst_id) {
+                ui.label(name);
+            }
+            ui.node_port(NodePortSide::Output, "out", port::AUDIO);
+        }
+        NodeKind::Input => {
             ui.node_port(NodePortSide::Output, "notes", port::NOTES);
         }
         NodeKind::Voice => {
@@ -182,6 +286,10 @@ fn draw_body(ui: &mut Ui, node: &mut GraphNode, monitor: &Monitor) {
             labeled_slider(ui, "Decay, sec", &mut node.adsr_decay, 0.01..=2.0);
             labeled_slider(ui, "Sustain", &mut node.adsr_sustain, 0.0..=1.0);
             labeled_slider(ui, "Release, sec", &mut node.adsr_release, 0.01..=4.0);
+            ui.node_port(NodePortSide::Output, "out", port::AUDIO);
+        }
+        NodeKind::Guitar => {
+            ui.node_port(NodePortSide::Input, "notes", port::NOTES);
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
         NodeKind::Osc => {

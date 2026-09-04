@@ -4,13 +4,14 @@ use std::hash::{Hash, Hasher};
 use glam::Vec2;
 use mega_ui::{NodeLink, NodeSpace};
 
-use super::node::{output_port_type, port, tick_to_beats, GraphNode, NodeKind, SeqNote};
+use super::node::{output_port_type, port, tick_to_beats, GraphNode, NodeKind};
 
 pub struct GraphDoc {
     pub nodes: Vec<GraphNode>,
     pub space: NodeSpace,
     pub next_serial: u64,
     pub output_id: String,
+    pub input_id: String,
     pub bpm: f32,
     pub play_from: i32,
     pub seek_gen: u64,
@@ -31,6 +32,7 @@ impl GraphDoc {
             space,
             next_serial: 1,
             output_id: String::new(),
+            input_id: String::new(),
             bpm: 120.0,
             play_from: 1,
             seek_gen: 0,
@@ -45,28 +47,18 @@ impl GraphDoc {
         let clock = doc.spawn_node(NodeKind::Clock, Vec2::new(40.0, 40.0));
         let seq_a = doc.spawn_node(NodeKind::Sequencer, Vec2::new(40.0, 180.0));
         if let Some(n) = doc.nodes.iter_mut().find(|n| n.id == seq_a) {
-            n.notes = vec![
-                SeqNote { step: 0, pitch: 60, len: 1 },
-                SeqNote { step: 4, pitch: 64, len: 1 },
-                SeqNote { step: 8, pitch: 67, len: 1 },
-                SeqNote { step: 12, pitch: 64, len: 1 },
-            ];
+            n.seq_id = "s1".into();
         }
-        let seq_b = doc.spawn_node(NodeKind::Sequencer, Vec2::new(40.0, 520.0));
+        let seq_b = doc.spawn_node(NodeKind::Sequencer, Vec2::new(40.0, 320.0));
         if let Some(n) = doc.nodes.iter_mut().find(|n| n.id == seq_b) {
-            n.notes = vec![
-                SeqNote { step: 2, pitch: 62, len: 1 },
-                SeqNote { step: 6, pitch: 65, len: 1 },
-                SeqNote { step: 10, pitch: 69, len: 1 },
-                SeqNote { step: 14, pitch: 71, len: 1 },
-            ];
+            n.seq_id = "s2".into();
         }
-        let join = doc.spawn_node(NodeKind::NoteJoin, Vec2::new(320.0, 360.0));
-        let voice = doc.spawn_node(NodeKind::Voice, Vec2::new(500.0, 360.0));
-        let delay = doc.spawn_node(NodeKind::Delay, Vec2::new(700.0, 360.0));
-        let gain = doc.spawn_node(NodeKind::Gain, Vec2::new(900.0, 360.0));
-        let scope = doc.spawn_node(NodeKind::Scope, Vec2::new(1080.0, 360.0));
-        let out = doc.spawn_node(NodeKind::Output, Vec2::new(1280.0, 360.0));
+        let join = doc.spawn_node(NodeKind::NoteJoin, Vec2::new(280.0, 240.0));
+        let voice = doc.spawn_node(NodeKind::Voice, Vec2::new(500.0, 240.0));
+        let delay = doc.spawn_node(NodeKind::Delay, Vec2::new(700.0, 240.0));
+        let gain = doc.spawn_node(NodeKind::Gain, Vec2::new(900.0, 240.0));
+        let scope = doc.spawn_node(NodeKind::Scope, Vec2::new(1080.0, 240.0));
+        let out = doc.spawn_node(NodeKind::Output, Vec2::new(1280.0, 240.0));
         doc.output_id = out.clone();
 
         let _ = doc.connect(&clock, "clock", &seq_a, "clock");
@@ -81,13 +73,32 @@ impl GraphDoc {
         doc
     }
 
+    pub fn new_instrument() -> Self {
+        let mut doc = Self::blank();
+        let input = doc.spawn_node(NodeKind::Input, Vec2::new(40.0, 200.0));
+        let voice = doc.spawn_node(NodeKind::Voice, Vec2::new(280.0, 200.0));
+        let out = doc.spawn_node(NodeKind::Output, Vec2::new(560.0, 200.0));
+        let _ = doc.connect(&input, "notes", &voice, "notes");
+        let _ = doc.connect(&voice, "out", &out, "in");
+        doc
+    }
+
     pub fn spawn_node(&mut self, kind: NodeKind, pos: Vec2) -> String {
         if kind == NodeKind::Output && self.nodes.iter().any(|n| n.kind == NodeKind::Output) {
             return self.output_id.clone();
         }
+        if kind == NodeKind::Input && self.nodes.iter().any(|n| n.kind == NodeKind::Input) {
+            return self.input_id.clone();
+        }
         let id = format!("n{}", self.next_serial);
         self.next_serial += 1;
         self.nodes.push(GraphNode::new(id.clone(), kind, pos));
+        if kind == NodeKind::Output {
+            self.output_id = id.clone();
+        }
+        if kind == NodeKind::Input {
+            self.input_id = id.clone();
+        }
         id
     }
 
@@ -231,6 +242,8 @@ impl GraphDoc {
             }
             n.seq_when.hash(&mut h);
             n.seq_loop_bars.hash(&mut h);
+            n.seq_id.hash(&mut h);
+            n.inst_id.hash(&mut h);
             n.notes.len().hash(&mut h);
             for note in &n.notes {
                 note.step.hash(&mut h);

@@ -57,7 +57,10 @@ pub enum NodeKind {
     NoteScope,
     Clock,
     Sequencer,
+    Instrument,
     Voice,
+    Guitar,
+    Input,
     Output,
 }
 
@@ -90,18 +93,21 @@ impl NodeKind {
             Self::NoteScope => "Notes",
             Self::Clock => "Clock",
             Self::Sequencer => "Sequencer",
+            Self::Instrument => "Instrument",
             Self::Voice => "Voice",
+            Self::Guitar => "Guitar",
+            Self::Input => "In",
             Self::Output => "Output",
         }
     }
 
     pub fn can_delete(self) -> bool {
-        !matches!(self, Self::Output)
+        !matches!(self, Self::Output | Self::Input)
     }
 
     /// Inspector bypass: skip processing / pass signal through.
     pub fn can_bypass(self) -> bool {
-        !matches!(self, Self::Output | Self::NoteJoin)
+        !matches!(self, Self::Output | Self::Input | Self::NoteJoin)
     }
 }
 
@@ -109,6 +115,7 @@ pub fn output_port_type(kind: NodeKind, port: &str) -> u16 {
     match (kind, port) {
         (NodeKind::Clock, "clock") | (NodeKind::Sequencer, "clock") => port::CLOCK,
         (NodeKind::Sequencer, "notes")
+        | (NodeKind::Input, "notes")
         | (NodeKind::NoteJoin, "out")
         | (NodeKind::Transpose, "out")
         | (NodeKind::Chord, "out")
@@ -214,6 +221,12 @@ pub struct GraphNode {
     /// Visible piano-roll octave (C0..=C8).
     #[serde(default = "default_seq_octave")]
     pub seq_octave: i32,
+    /// Sequence entity id for [`NodeKind::Sequencer`].
+    #[serde(default)]
+    pub seq_id: String,
+    /// Instrument entity id for [`NodeKind::Instrument`].
+    #[serde(default)]
+    pub inst_id: String,
     #[serde(default)]
     pub notes: Vec<SeqNote>,
     #[serde(default)]
@@ -441,6 +454,8 @@ impl GraphNode {
                 NodeKind::NoteScope => 3,
                 _ => 4,
             },
+            seq_id: String::new(),
+            inst_id: String::new(),
             notes: Vec::new(),
             transpose_notes: 0,
             transpose_octaves: 0,
@@ -861,10 +876,13 @@ mod tests {
 
     #[test]
     fn bypass_kinds() {
-        assert!(NodeKind::Filter.can_bypass());
+        assert!(NodeKind::Instrument.can_bypass());
+        assert!(!NodeKind::Input.can_delete());
         assert!(NodeKind::Sequencer.can_bypass());
         assert!(NodeKind::Voice.can_bypass());
+        assert!(NodeKind::Guitar.can_bypass());
         assert!(!NodeKind::Output.can_bypass());
+        assert!(!NodeKind::Input.can_bypass());
         assert!(!NodeKind::NoteJoin.can_bypass());
         assert!(NodeKind::Chord.can_bypass());
         assert!(NodeKind::Eq.can_bypass());
