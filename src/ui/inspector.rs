@@ -1,6 +1,6 @@
 use mega_ui::Ui;
 
-use crate::graph::{beats_to_tick, EditorView, Project, SEQ_MAX_BARS};
+use crate::graph::{beats_to_tick, EditorView, Project};
 use crate::monitor::Monitor;
 
 pub fn draw(
@@ -48,10 +48,10 @@ pub fn draw(
                     ui.label("Bars");
                     let mut bars = seq.seq_loop_bars as i32;
                     ui.drag_int("seq_bars", &mut bars, 1);
-                    seq.seq_loop_bars = bars.clamp(1, SEQ_MAX_BARS as i32) as u32;
+                    seq.seq_loop_bars = bars.max(1) as u32;
                 });
                 ui.label("Play with");
-                let mut labels: Vec<&str> = vec!["Sine"];
+                let mut labels: Vec<&str> = vec!["Default"];
                 for n in &inst_names {
                     labels.push(n.as_str());
                 }
@@ -66,6 +66,9 @@ pub fn draw(
                 } else {
                     inst_ids[sel - 1].clone()
                 };
+                if ui.button("Delete sequence").clicked {
+                    project.pending_delete_seq = Some(id.clone());
+                }
             }
         }
         EditorView::Graph | EditorView::Instrument(_) => {

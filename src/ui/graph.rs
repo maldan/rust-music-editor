@@ -9,7 +9,7 @@ use crate::compile::WAVEFORMS;
 use crate::fft::{freq_ticks, SPEC_BINS, SPEC_COLS};
 use crate::graph::{
     port, ARP_NAMES, CHORD_NAMES, EqPt, GraphDoc, GraphNode, NodeKind, MIX_INS, MIX_PAN_INS,
-    MIX_VOL_INS, NOTE_JOIN_INS, SEQ_MAX_BARS, SEQ_OCTAVE_MIN,
+    MIX_VOL_INS, NOTE_JOIN_INS, SEQ_OCTAVE_MIN,
 };
 use crate::monitor::Monitor;
 
@@ -290,6 +290,10 @@ fn draw_body(
         }
         NodeKind::Guitar => {
             ui.node_port(NodePortSide::Input, "notes", port::NOTES);
+            labeled_slider(ui, "Attack, sec", &mut node.adsr_attack, 0.001..=2.0);
+            labeled_slider(ui, "Decay, sec", &mut node.adsr_decay, 0.01..=2.0);
+            labeled_slider(ui, "Sustain", &mut node.adsr_sustain, 0.0..=1.0);
+            labeled_slider(ui, "Release, sec", &mut node.adsr_release, 0.01..=4.0);
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
         NodeKind::Osc => {
@@ -519,7 +523,7 @@ fn roll_chrome(ui: &mut Ui, node: &mut GraphNode) {
         ui.label("Bars");
         let mut bars = node.seq_loop_bars as i32;
         ui.drag_int("bars", &mut bars, 1);
-        node.seq_loop_bars = bars.clamp(1, SEQ_MAX_BARS as i32) as u32;
+        node.seq_loop_bars = bars.max(1) as u32;
     });
     ui.label("Octave");
     let mut oct = node.seq_octave as f32;

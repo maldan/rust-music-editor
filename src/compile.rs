@@ -85,6 +85,13 @@ impl Patch {
                 return sequence_patch(project, seq, playing);
             }
         }
+        let mut patch = Self::from_main(project, playing);
+        patch.seek_beats = project.main.seek_beats.max(0.0);
+        patch
+    }
+
+    /// Main arrangement, ignoring sequence-edit preview.
+    pub fn from_main(project: &Project, playing: bool) -> Self {
         let mut nodes = project.main.nodes.clone();
         let mut links: Vec<(String, String, String, String)> = project
             .main
@@ -106,7 +113,7 @@ impl Patch {
             playing,
             bpm: project.main.bpm.max(1.0),
             seek_gen: project.main.seek_gen,
-            seek_beats: project.main.seek_beats.max(0.0),
+            seek_beats: 0.0,
             output_id: project.main.output_id.clone(),
             nodes,
             links,
@@ -281,7 +288,12 @@ pub struct Build {
 }
 
 pub fn build_graph(patch: &Patch, sample_rate: f32, monitor: &Monitor) -> Build {
-    let mut graph = Graph::new(sample_rate, 1);
+    build_graph_at(patch, sample_rate, monitor, 1)
+}
+
+fn build_graph_at(patch: &Patch, sample_rate: f32, monitor: &Monitor, block_size: usize) -> Build {
+    let block_size = block_size.max(1);
+    let mut graph = Graph::new(sample_rate, block_size);
     let mut out_port: HashMap<(String, String), Wire> = HashMap::new();
     let mut in_port: HashMap<(String, String), Wire> = HashMap::new();
     let mut voices = HashMap::new();
@@ -305,7 +317,7 @@ pub fn build_graph(patch: &Patch, sample_rate: f32, monitor: &Monitor) -> Build 
                 let id = graph.add_node(Box::new(PolyphonicInstrument::new(
                     8,
                     sample_rate,
-                    1,
+                    block_size,
                     wf,
                     voice_adsr(n),
                     n.pulse_width,
@@ -318,7 +330,9 @@ pub fn build_graph(patch: &Patch, sample_rate: f32, monitor: &Monitor) -> Build 
                 out_port.insert((n.id.clone(), "out".into()), Wire::stereo(id, 0, 1));
             }
             NodeKind::Guitar => {
-                let id = graph.add_node(Box::new(KarplusStrong::new(sample_rate)));
+                let mut gtr = KarplusStrong::new(sample_rate);
+                gtr.set_adsr(voice_adsr(n));
+                let id = graph.add_node(Box::new(gtr));
                 voices.insert(n.id.clone(), id);
                 dsp.insert(n.id.clone(), id);
                 out_port.insert((n.id.clone(), "out".into()), Wire::stereo(id, 0, 1));
@@ -581,13 +595,24 @@ pub struct Live {
     song_beats: f64,
     bpm: f32,
     seek_gen: u64,
+    block_size: usize,
 }
 
 impl Live {
     pub fn new(patch: &Patch, sample_rate: f32, monitor: Arc<Monitor>) -> (Self, Graph) {
-        let build = build_graph(patch, sample_rate, &monitor);
+        Self::new_at(patch, sample_rate, monitor, 1)
+    }
+
+    pub fn new_at(
+        patch: &Patch,
+        sample_rate: f32,
+        monitor: Arc<Monitor>,
+        block_size: usize,
+    ) -> (Self, Graph) {
+        let block_size = block_size.max(1);
+        let build = build_graph_at(patch, sample_rate, &monitor, block_size);
         let mut graph = build.graph;
-        let preview = attach_preview(&mut graph, build.master, sample_rate);
+        let preview = attach_preview(&mut graph, build.master, sample_rate, block_size);
         let mut live = Self {
             sample_rate,
             playing: patch.playing,
@@ -605,6 +630,7 @@ impl Live {
             song_beats: patch.seek_beats.max(0.0),
             bpm: patch.bpm.max(1.0),
             seek_gen: patch.seek_gen,
+            block_size,
         };
         live.rebuild_clocks(patch);
         live.rebuild_taps(patch);
@@ -725,6 +751,11 @@ impl Live {
                     if let Some(inst) = graph.node_mut::<PolyphonicInstrument>(id) {
                         inst.set_adsr(voice_adsr(n));
                         inst.set_pulse_width(n.pulse_width);
+                    }
+                }
+                NodeKind::Guitar => {
+                    if let Some(gtr) = graph.node_mut::<KarplusStrong>(id) {
+                        gtr.set_adsr(voice_adsr(n));
                     }
                 }
                 NodeKind::Osc => {
@@ -856,13 +887,13 @@ impl Live {
         let topo = patch.topo_hash();
         let keep_held = topo == self.topo;
         if !keep_held {
-            let build = build_graph(&patch, self.sample_rate, &self.monitor);
+            let build = build_graph_at(&patch, self.sample_rate, &self.monitor, self.block_size);
             *graph = build.graph;
             self.voices = build.voices;
             self.dsp = build.dsp;
             self.lfo_mix = build.lfo_mix;
             self.master = build.master;
-            self.preview = attach_preview(graph, self.master, self.sample_rate);
+            self.preview = attach_preview(graph, self.master, self.sample_rate, self.block_size);
             self.topo = topo;
             self.voice_holds.clear();
         }
@@ -919,10 +950,14 @@ impl Live {
     }
 
     pub fn tick(&mut self, graph: &mut Graph) {
+        self.tick_block(graph, 1);
+    }
+
+    pub fn tick_block(&mut self, graph: &mut Graph, samples: usize) {
         self.clear_taps();
         if self.playing {
             let step = self.bpm as f64 / (self.sample_rate as f64 * 60.0);
-            self.song_beats += step;
+            self.song_beats += step * samples.max(1) as f64;
             let song = self.song_beats;
             for seq in self.seqs.values_mut() {
                 tick_seq(graph, &self.clocks, &mut self.voice_holds, seq, song);
@@ -1452,11 +1487,11 @@ fn expand_instruments(
     }
 }
 
-fn attach_preview(graph: &mut Graph, master: NodeId, sample_rate: f32) -> NodeId {
+fn attach_preview(graph: &mut Graph, master: NodeId, sample_rate: f32, block_size: usize) -> NodeId {
     let voice = graph.add_node(Box::new(PolyphonicInstrument::new(
         8,
         sample_rate,
-        1,
+        block_size.max(1),
         Waveform::Sine,
         AdsrParams {
             attack: 0.005,

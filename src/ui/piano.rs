@@ -34,7 +34,7 @@ thread_local! {
 #[derive(Clone, Copy)]
 struct Roll {
     drag: Option<Drag>,
-    last_len: u8,
+    last_len: u32,
     preview: Option<u8>,
     key: Option<u8>,
     scrolled: bool,
@@ -97,9 +97,9 @@ fn row_of_pitch(base: u8, pitch: u8, rows: u32) -> Option<u32> {
 }
 
 fn clamp_note(n: &mut SeqNote, steps: u32) {
-    let max_step = steps.saturating_sub(1).min(u8::MAX as u32) as u8;
+    let max_step = steps.saturating_sub(1);
     n.step = n.step.min(max_step);
-    let room = (steps - n.step as u32).max(1).min(u8::MAX as u32) as u8;
+    let room = (steps - n.step).max(1);
     n.len = n.len.max(1).min(room);
     n.pitch = n.pitch.min(127);
 }
@@ -117,16 +117,16 @@ fn set_preview(tx: &mut EventSender<NoteEvent>, held: &mut Option<u8>, pitch: Op
     *held = pitch;
 }
 
-fn cell_at(grid: Rect, stride: Vec2, pos: Vec2, steps: u32, rows: u32, base: u8) -> Option<(u8, u8)> {
+fn cell_at(grid: Rect, stride: Vec2, pos: Vec2, steps: u32, rows: u32, base: u8) -> Option<(u32, u8)> {
     if pos.x < grid.min.x || pos.y < grid.min.y || pos.x >= grid.max.x || pos.y >= grid.max.y {
         return None;
     }
     let col = ((pos.x - grid.min.x) / stride.x).floor() as i32;
     let row = ((pos.y - grid.min.y) / stride.y).floor() as i32;
-    if col < 0 || row < 0 || col >= steps as i32 || row >= rows as i32 {
+    if col < 0 || row < 0 || col as u32 >= steps || row as u32 >= rows {
         return None;
     }
-    Some((col as u8, pitch_of_row(base, row as u32, rows)))
+    Some((col as u32, pitch_of_row(base, row as u32, rows)))
 }
 
 fn note_rect(grid: Rect, stride: Vec2, note: SeqNote, base: u8, rows: u32) -> Option<Rect> {
@@ -187,11 +187,11 @@ fn draw_note_handles(ui: &mut Ui, r: Rect) {
     );
 }
 
-fn resize_note(n: &mut SeqNote, step: u8, left: bool, steps: u32) {
+fn resize_note(n: &mut SeqNote, step: u32, left: bool, steps: u32) {
     if left {
-        let end = n.step as u32 + n.len.max(1) as u32;
-        n.step = step.min(end.saturating_sub(1) as u8);
-        n.len = (end - n.step as u32).max(1) as u8;
+        let end = n.step + n.len.max(1);
+        n.step = step.min(end.saturating_sub(1));
+        n.len = (end - n.step).max(1);
     } else {
         n.len = step.saturating_sub(n.step).saturating_add(1);
     }
@@ -457,7 +457,7 @@ pub fn draw_in_node(ui: &mut Ui, node_id: &str, node: &mut GraphNode, playhead: 
             }
             None => {
                 if let Some((step, pitch)) = cell_at(grid, g.stride, ptr.pos, steps, g.rows, base) {
-                    let len = roll.last_len.max(1).min((steps - step as u32) as u8);
+                    let len = roll.last_len.max(1).min(steps - step);
                     node.notes.push(SeqNote { step, pitch, len });
                     roll.drag = Some(Drag::Move {
                         idx: node.notes.len() - 1,
@@ -477,7 +477,8 @@ pub fn draw_in_node(ui: &mut Ui, node_id: &str, node: &mut GraphNode, playhead: 
             }) => {
                 if let Some((step, pitch)) = cell_at(grid, g.stride, ptr.pos, steps, g.rows, base) {
                     if let Some(n) = node.notes.get_mut(idx) {
-                        n.step = (step as i32 - grab_step).clamp(0, steps as i32 - 1) as u8;
+                        n.step = (step as i64 - grab_step as i64)
+                            .clamp(0, steps.saturating_sub(1) as i64) as u32;
                         n.pitch = (pitch as i32 - grab_pitch).clamp(0, 127) as u8;
                         clamp_note(n, steps);
                     }
@@ -550,7 +551,7 @@ pub fn draw_editor(
     song_beats: f64,
     preview: &mut EventSender<NoteEvent>,
 ) {
-    let steps = SEQ_STEPS * loop_bars.clamp(1, 8);
+    let steps = SEQ_STEPS * loop_bars.max(1);
     let base = EDITOR_BASE;
     let g = geom_editor(ui.scale().max(1.0), steps, EDITOR_ROWS);
     let loop_beats = steps as f32 * BEATS_PER_STEP;
@@ -637,7 +638,7 @@ pub fn draw_editor(
                             if let Some((step, pitch)) =
                                 cell_at(grid, g.stride, ptr.pos, steps, g.rows, base)
                             {
-                                let len = roll.last_len.max(1).min((steps - step as u32) as u8);
+                                let len = roll.last_len.max(1).min(steps - step);
                                 notes.push(SeqNote { step, pitch, len });
                                 roll.drag = Some(Drag::Move {
                                     idx: notes.len() - 1,
@@ -660,7 +661,9 @@ pub fn draw_editor(
                                 cell_at(grid, g.stride, ptr.pos, steps, g.rows, base)
                             {
                                 if let Some(n) = notes.get_mut(idx) {
-                                    n.step = (step as i32 - grab_step).clamp(0, steps as i32 - 1) as u8;
+                                    n.step = (step as i64 - grab_step as i64)
+                                        .clamp(0, steps.saturating_sub(1) as i64)
+                                        as u32;
                                     n.pitch = (pitch as i32 - grab_pitch).clamp(0, 127) as u8;
                                     clamp_note(n, steps);
                                     set_preview(preview, &mut roll.preview, Some(n.pitch));

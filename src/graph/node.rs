@@ -9,7 +9,6 @@ pub mod port {
 pub const SEQ_STEPS: u32 = 16;
 pub const SEQ_PITCHES: u32 = 12;
 pub const SEQ_BASE_PITCH: u8 = 60;
-pub const SEQ_MAX_BARS: u32 = 8;
 pub const SEQ_OCTAVE_MIN: i32 = 0;
 pub const SEQ_OCTAVE_MAX: i32 = 8;
 /// One sequencer cell = one 16th note (0.25 beat at 4/4).
@@ -23,9 +22,9 @@ pub const MIX_PAN_INS: [&str; 8] = ["p1", "p2", "p3", "p4", "p5", "p6", "p7", "p
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct SeqNote {
-    pub step: u8,
+    pub step: u32,
     pub pitch: u8,
-    pub len: u8,
+    pub len: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -569,7 +568,7 @@ impl GraphNode {
     }
 
     pub fn loop_bars(&self) -> u32 {
-        self.seq_loop_bars.clamp(1, SEQ_MAX_BARS)
+        self.seq_loop_bars.max(1)
     }
 
     pub fn loop_steps(&self) -> u32 {
@@ -620,7 +619,7 @@ impl GraphNode {
         };
     }
 
-    pub fn toggle_note(&mut self, step: u8, pitch: u8) {
+    pub fn toggle_note(&mut self, step: u32, pitch: u8) {
         if let Some(i) = self
             .notes
             .iter()
@@ -839,7 +838,7 @@ mod tests {
         assert_eq!(n.view_base_pitch(), 72);
         n.seq_loop_bars = 99;
         n.seq_octave = -3;
-        assert_eq!(n.loop_bars(), SEQ_MAX_BARS);
+        assert_eq!(n.loop_bars(), 99);
         assert_eq!(n.view_octave(), SEQ_OCTAVE_MIN);
         let p = GraphNode::new("p".into(), NodeKind::NoteScope, Vec2::ZERO);
         assert_eq!(p.view_octaves(), 3);

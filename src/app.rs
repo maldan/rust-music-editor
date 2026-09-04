@@ -1,5 +1,6 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
+use std::sync::{Arc, Mutex};
 
 use mega_audio::events::{event_channel, EventSender};
 use mega_audio::note::NoteEvent;
@@ -11,6 +12,12 @@ use crate::graph::{with_graph_ext, FILE_EXT, Project};
 use crate::monitor::Monitor;
 use crate::ui::default_dock;
 
+pub struct ExportJob {
+    pub path: PathBuf,
+    pub progress: Arc<AtomicU32>,
+    pub done: Arc<Mutex<Option<Result<(), String>>>>,
+}
+
 pub struct App {
     pub project: Project,
     pub dock: DockState,
@@ -18,6 +25,10 @@ pub struct App {
     pub monitor: Arc<Monitor>,
     pub status: String,
     pub preview_tx: EventSender<NoteEvent>,
+    pub export_open: bool,
+    pub export_path: String,
+    pub export_bars: i32,
+    pub export_job: Option<ExportJob>,
     current_path: Option<PathBuf>,
     last_fp: u64,
     last_playing: bool,
@@ -62,6 +73,10 @@ impl App {
             monitor,
             status: String::new(),
             preview_tx,
+            export_open: false,
+            export_path: String::new(),
+            export_bars: 8,
+            export_job: None,
             current_path: None,
             tx,
             _engine: engine,
@@ -133,6 +148,28 @@ impl App {
                 self.status = format!("Opened {}", path.display());
             }
             Err(e) => self.status = format!("Open failed: {e}"),
+        }
+    }
+
+    pub fn import_midi_dialog(&mut self) {
+        let path = rfd::FileDialog::new()
+            .add_filter("MIDI", &["mid", "midi"])
+            .pick_file();
+        let Some(path) = path else {
+            return;
+        };
+        match std::fs::read(&path) {
+            Ok(bytes) => match self.project.import_midi(&bytes) {
+                Ok(n) => {
+                    self.status = format!(
+                        "Imported {n} sequence{} from {}",
+                        if n == 1 { "" } else { "s" },
+                        path.display()
+                    );
+                }
+                Err(e) => self.status = format!("MIDI import failed: {e}"),
+            },
+            Err(e) => self.status = format!("MIDI import failed: {e}"),
         }
     }
 }

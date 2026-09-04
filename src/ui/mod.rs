@@ -1,4 +1,5 @@
 mod explorer;
+mod export;
 mod graph;
 mod inspector;
 mod piano;
@@ -59,6 +60,12 @@ impl Scene for App {
                 if ui.menu_item("Save As...").clicked() {
                     state.save_dialog();
                 }
+                if ui.menu_item("Import MIDI...").clicked() {
+                    state.import_midi_dialog();
+                }
+                if ui.menu_item("Export MP3...").clicked() {
+                    state.export_open = true;
+                }
                 ui.separator();
                 if ui.menu_item("Fit view").clicked() {
                     state.project.main.space.fit_view = true;
@@ -79,6 +86,7 @@ impl Scene for App {
             .map(|i| (i.id.clone(), i.name.clone()))
             .collect();
 
+        let mut import_midi = false;
         let App {
             dock,
             project,
@@ -93,7 +101,7 @@ impl Scene for App {
         let dock_size = Vec2::new(dock_size.x.max(1.0), dock_size.y.max(120.0));
 
         ui.dock_space("main", dock_size, dock, |ui, tab| match tab {
-            "Project" => explorer::draw(ui, project),
+            "Project" => explorer::draw(ui, project, &mut import_midi),
             "Graph" => draw_editor(ui, project, monitor, preview_tx, &seqs, &insts),
             "Inspector" => {
                 inspector::draw(ui, project, playing, monitor, status);
@@ -105,6 +113,11 @@ impl Scene for App {
             doc.apply_deletes();
             doc.apply_clones();
         }
+        explorer::confirm_delete(ui, project);
+        if import_midi {
+            state.import_midi_dialog();
+        }
+        export::draw(ui, state);
         state.sync_audio();
         true
     }

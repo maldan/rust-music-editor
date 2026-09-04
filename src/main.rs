@@ -2,6 +2,7 @@
 
 mod app;
 mod compile;
+mod export;
 mod fft;
 mod framework;
 mod graph;

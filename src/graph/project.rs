@@ -2,7 +2,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use super::doc::GraphDoc;
-use super::node::{GraphNode, NodeKind, SeqNote, SEQ_MAX_BARS};
+use super::node::{GraphNode, NodeKind, SeqNote};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EditorView {
@@ -35,7 +35,7 @@ fn default_seq_octave() -> i32 {
 
 impl Sequence {
     pub fn loop_bars(&self) -> u32 {
-        self.seq_loop_bars.clamp(1, SEQ_MAX_BARS)
+        self.seq_loop_bars.max(1)
     }
 }
 
@@ -53,6 +53,7 @@ pub struct Project {
     pub tree_sel: Option<String>,
     pub next_seq: u64,
     pub next_inst: u64,
+    pub pending_delete_seq: Option<String>,
 }
 
 impl Project {
@@ -96,6 +97,7 @@ impl Project {
             tree_sel: Some("graph".into()),
             next_seq: 3,
             next_inst: 2,
+            pending_delete_seq: None,
         };
         p.sync_serials();
         p
@@ -115,6 +117,39 @@ impl Project {
         });
         self.select_sequence(&id);
         id
+    }
+
+    pub fn import_midi(&mut self, bytes: &[u8]) -> Result<usize, String> {
+        let tracks = super::midi::parse_midi(bytes)?;
+        let n = tracks.len();
+        for t in tracks {
+            let id = format!("s{}", self.next_seq);
+            self.next_seq += 1;
+            self.sequences.push(Sequence {
+                id,
+                name: t.name,
+                seq_loop_bars: t.bars,
+                seq_octave: t.octave,
+                notes: t.notes,
+                play_inst: String::new(),
+            });
+        }
+        Ok(n)
+    }
+
+    pub fn remove_sequence(&mut self, id: &str) {
+        self.sequences.retain(|s| s.id != id);
+        for n in &mut self.main.nodes {
+            if n.kind == NodeKind::Sequencer && n.seq_id == id {
+                n.seq_id.clear();
+                n.notes.clear();
+            }
+        }
+        if matches!(&self.view, EditorView::Sequence(cur) if cur == id) {
+            self.view = EditorView::Graph;
+            self.tree_sel = Some("graph".into());
+        }
+        self.pending_delete_seq = None;
     }
 
     pub fn add_instrument(&mut self) -> String {
@@ -237,5 +272,25 @@ impl Project {
             .max()
             .unwrap_or(0);
         self.next_inst = self.next_inst.max(max_i + 1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remove_sequence_clears_graph_refs() {
+        let mut p = Project::new_default();
+        p.remove_sequence("s1");
+        assert!(p.sequences.iter().all(|s| s.id != "s1"));
+        assert!(
+            p.main
+                .nodes
+                .iter()
+                .filter(|n| n.kind == NodeKind::Sequencer)
+                .all(|n| n.seq_id != "s1")
+        );
+        assert_eq!(p.view, EditorView::Graph);
     }
 }
