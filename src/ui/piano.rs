@@ -21,23 +21,34 @@ const HEAD_H: f32 = 4.0;
 const ED_LABEL_W: f32 = 52.0;
 const ED_CELL_W: f32 = 20.0;
 const ED_CELL_H: f32 = 18.0;
-const ED_HEAD_H: f32 = 10.0;
+const ED_HEAD_H: f32 = 22.0;
 const GAP: f32 = 1.0;
 const HANDLE: f32 = 8.0;
 const FADE_SEC: f32 = 0.45;
+const ZOOM_MIN: f32 = 0.12;
+const ZOOM_MAX: f32 = 4.0;
+const NOTE_FILL: [f32; 4] = [0.32, 0.72, 0.40, 1.0];
+const NOTE_PLAY: [f32; 4] = [0.48, 0.88, 0.52, 1.0];
+const NOTE_SEL: [f32; 4] = [0.82, 0.28, 0.32, 1.0];
+const NOTE_SEL_PLAY: [f32; 4] = [0.95, 0.42, 0.44, 1.0];
 
 thread_local! {
     static ROLLS: RefCell<HashMap<String, Roll>> = RefCell::new(HashMap::new());
     static PREVIEWS: RefCell<HashMap<String, Preview>> = RefCell::new(HashMap::new());
+    static CLIP: RefCell<Vec<SeqNote>> = const { RefCell::new(Vec::new()) };
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Roll {
     drag: Option<Drag>,
     last_len: u32,
     preview: Option<u8>,
     key: Option<u8>,
     scrolled: bool,
+    zoom: f32,
+    sel: Vec<usize>,
+    header: Rect,
+    view: Rect,
 }
 
 impl Default for Roll {
@@ -48,15 +59,30 @@ impl Default for Roll {
             preview: None,
             key: None,
             scrolled: false,
+            zoom: 1.0,
+            sel: Vec::new(),
+            header: Rect {
+                min: Vec2::ZERO,
+                max: Vec2::ZERO,
+            },
+            view: Rect {
+                min: Vec2::ZERO,
+                max: Vec2::ZERO,
+            },
         }
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Drag {
-    Move { idx: usize, grab_step: i32, grab_pitch: i32 },
+    Move {
+        press_step: u32,
+        press_pitch: u8,
+        orig: Vec<(usize, u32, u8)>,
+    },
     Resize { idx: usize, left: bool },
     Erase,
+    Box { a: Vec2, b: Vec2 },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -104,7 +130,129 @@ fn clamp_note(n: &mut SeqNote, steps: u32) {
     n.pitch = n.pitch.min(127);
 }
 
-fn set_preview(tx: &mut EventSender<NoteEvent>, held: &mut Option<u8>, pitch: Option<u8>) {
+fn clamp_zoom(z: f32) -> f32 {
+    z.clamp(ZOOM_MIN, ZOOM_MAX)
+}
+
+fn zoom_anchor_x(old_stride: f32, new_stride: f32, offset: f32, local: f32) -> f32 {
+    let content = (offset + local).max(0.0);
+    let ratio = new_stride / old_stride.max(1e-6);
+    (content * ratio - local).max(0.0)
+}
+
+fn header_step(rect: Rect, stride_x: f32, off_x: f32, pos: Vec2, steps: u32) -> u32 {
+    let x = (pos.x - rect.min.x + off_x).max(0.0);
+    let step = (x / stride_x.max(1e-6)).floor() as i32;
+    step.clamp(0, steps.saturating_sub(1) as i32) as u32
+}
+
+fn sel_has(sel: &[usize], i: usize) -> bool {
+    sel.contains(&i)
+}
+
+fn toggle_sel(sel: &mut Vec<usize>, i: usize) {
+    if let Some(p) = sel.iter().position(|&x| x == i) {
+        sel.remove(p);
+    } else {
+        sel.push(i);
+    }
+}
+
+fn shift_sel(notes: &mut [SeqNote], orig: &[(usize, u32, u8)], d_step: i32, d_pitch: i32, steps: u32) {
+    if orig.is_empty() {
+        return;
+    }
+    let max_s = steps.saturating_sub(1) as i32;
+    let min_step = orig.iter().map(|o| o.1 as i32).min().unwrap_or(0);
+    let max_step = orig.iter().map(|o| o.1 as i32).max().unwrap_or(0);
+    let min_pitch = orig.iter().map(|o| o.2 as i32).min().unwrap_or(0);
+    let max_pitch = orig.iter().map(|o| o.2 as i32).max().unwrap_or(0);
+    let ds = d_step.clamp(-min_step, max_s - max_step);
+    let dp = d_pitch.clamp(-min_pitch, 127 - max_pitch);
+    for &(i, step, pitch) in orig {
+        if let Some(n) = notes.get_mut(i) {
+            n.step = (step as i32 + ds) as u32;
+            n.pitch = (pitch as i32 + dp) as u8;
+            clamp_note(n, steps);
+        }
+    }
+}
+
+fn remove_sel(notes: &mut Vec<SeqNote>, sel: &mut Vec<usize>) {
+    sel.sort_unstable();
+    sel.dedup();
+    for i in sel.iter().rev().copied() {
+        if i < notes.len() {
+            notes.remove(i);
+        }
+    }
+    sel.clear();
+}
+
+fn clone_sel(notes: &mut Vec<SeqNote>, sel: &[usize], steps: u32) -> Vec<usize> {
+    let mut add = Vec::new();
+    for &i in sel {
+        let Some(src) = notes.get(i).copied() else {
+            continue;
+        };
+        let mut n = src;
+        n.step = n.step.saturating_add(1);
+        clamp_note(&mut n, steps);
+        add.push(n);
+    }
+    let start = notes.len();
+    notes.extend(add);
+    (start..notes.len()).collect()
+}
+
+fn clip_from_sel(notes: &[SeqNote], sel: &[usize]) -> Vec<SeqNote> {
+    sel.iter().filter_map(|&i| notes.get(i).copied()).collect()
+}
+
+fn paste_at(notes: &mut Vec<SeqNote>, clip: &[SeqNote], step: u32, pitch: u8, steps: u32) -> Vec<usize> {
+    if clip.is_empty() {
+        return Vec::new();
+    }
+    let min_step = clip.iter().map(|n| n.step).min().unwrap_or(0);
+    let min_pitch = clip.iter().map(|n| n.pitch).min().unwrap_or(0);
+    let mut add = Vec::new();
+    for n in clip {
+        let mut c = *n;
+        c.step = (step as i32 + (n.step as i32 - min_step as i32)).max(0) as u32;
+        c.pitch = (pitch as i32 + (n.pitch as i32 - min_pitch as i32)).clamp(0, 127) as u8;
+        clamp_note(&mut c, steps);
+        add.push(c);
+    }
+    let start = notes.len();
+    notes.extend(add);
+    (start..notes.len()).collect()
+}
+
+fn notes_in_box(
+    notes: &[SeqNote],
+    grid: Rect,
+    stride: Vec2,
+    a: Vec2,
+    b: Vec2,
+    base: u8,
+    rows: u32,
+) -> Vec<usize> {
+    let min = Vec2::new(a.x.min(b.x), a.y.min(b.y));
+    let max = Vec2::new(a.x.max(b.x), a.y.max(b.y));
+    let boxr = Rect { min, max };
+    let mut out = Vec::new();
+    for (i, n) in notes.iter().copied().enumerate() {
+        let Some(r) = note_rect(grid, stride, n, base, rows) else {
+            continue;
+        };
+        if r.intersect(boxr).is_some() {
+            out.push(i);
+        }
+    }
+    out
+}
+
+pub(crate) fn set_preview(tx: &mut EventSender<NoteEvent>, held: &mut Option<u8>, pitch: Option<u8>) {
     if *held == pitch {
         return;
     }
@@ -214,6 +362,7 @@ fn erase_at(
     }
 }
 
+#[derive(Clone, Copy)]
 struct RollGeom {
     s: f32,
     gap: f32,
@@ -230,8 +379,17 @@ fn geom(s: f32, steps: u32, rows: u32) -> RollGeom {
     geom_ex(s, steps, rows, LABEL_W, CELL_W, CELL_H, HEAD_H, false)
 }
 
-fn geom_editor(s: f32, steps: u32, rows: u32) -> RollGeom {
-    geom_ex(s, steps, rows, ED_LABEL_W, ED_CELL_W, ED_CELL_H, ED_HEAD_H, true)
+fn geom_editor(s: f32, steps: u32, rows: u32, zoom: f32) -> RollGeom {
+    geom_ex(
+        s,
+        steps,
+        rows,
+        ED_LABEL_W,
+        ED_CELL_W * clamp_zoom(zoom),
+        ED_CELL_H,
+        ED_HEAD_H,
+        true,
+    )
 }
 
 fn geom_ex(
@@ -263,30 +421,19 @@ fn geom_ex(
     }
 }
 
-fn draw_grid(ui: &mut Ui, rect: Rect, g: &RollGeom, base: u8, with_keys: bool) -> Rect {
+fn draw_grid(ui: &mut Ui, rect: Rect, g: &RollGeom, base: u8, with_keys: bool, head: bool) -> Rect {
     let label_w = if with_keys { g.label_w } else { 0.0 };
+    let head_h = if head { g.head_h } else { 0.0 };
     let grid = Rect {
-        min: Vec2::new(rect.min.x + label_w, rect.min.y + g.head_h),
+        min: Vec2::new(rect.min.x + label_w, rect.min.y + head_h),
         max: Vec2::new(rect.max.x, rect.max.y),
     };
     ui.fill_rect(rect, [0.07, 0.07, 0.08, 1.0]);
-    for step in 0..g.steps {
-        let x = grid.min.x + step as f32 * g.stride.x;
-        let bar = step % SEQ_STEPS == 0;
-        let color = if bar {
-            [0.28, 0.28, 0.34, 1.0]
-        } else if step % 4 == 0 {
-            [0.22, 0.22, 0.26, 1.0]
-        } else {
-            [0.14, 0.14, 0.16, 1.0]
-        };
-        ui.fill_rect(
-            Rect::from_min_size(
-                Vec2::new(x, rect.min.y),
-                Vec2::new((g.stride.x - g.gap).max(1.0), g.head_h - 1.0),
-            ),
-            color,
-        );
+    if head {
+        draw_bar_header(ui, Rect {
+            min: Vec2::new(grid.min.x, rect.min.y),
+            max: Vec2::new(grid.max.x, grid.min.y),
+        }, g, 0.0);
     }
     for row in 0..g.rows {
         let pitch = pitch_of_row(base, row, g.rows);
@@ -323,6 +470,42 @@ fn draw_grid(ui: &mut Ui, rect: Rect, g: &RollGeom, base: u8, with_keys: bool) -
     }
     draw_time_lines(ui, grid, g);
     grid
+}
+
+fn draw_bar_header(ui: &mut Ui, rect: Rect, g: &RollGeom, off_x: f32) {
+    ui.fill_rect(rect, [0.08, 0.08, 0.10, 1.0]);
+    let bars = (g.steps / SEQ_STEPS).max(1);
+    let bar_w = SEQ_STEPS as f32 * g.stride.x;
+    let px = (12.0 * g.s).min(rect.height() * 0.8);
+    for bar in 0..bars {
+        let x = rect.min.x + bar as f32 * bar_w - off_x;
+        let cell = Rect::from_min_size(Vec2::new(x, rect.min.y), Vec2::new(bar_w.max(1.0), rect.height()));
+        let Some(vis) = cell.intersect(rect) else {
+            continue;
+        };
+        let color = if bar % 2 == 0 {
+            [0.16, 0.16, 0.19, 1.0]
+        } else {
+            [0.13, 0.13, 0.16, 1.0]
+        };
+        ui.fill_rect(vis, color);
+        let tx = x + 6.0 * g.s.min(1.5);
+        if tx >= rect.min.x + 2.0 && tx < rect.max.x - 8.0 {
+            ui.text_at_size(
+                Vec2::new(tx, rect.min.y + (rect.height() - px) * 0.5),
+                &format!("{}", bar + 1),
+                px,
+            );
+        }
+        if x >= rect.min.x && x <= rect.max.x {
+            ui.line(
+                Vec2::new(x, rect.min.y),
+                Vec2::new(x, rect.max.y),
+                1.2,
+                [0.02, 0.02, 0.03, 1.0],
+            );
+        }
+    }
 }
 
 fn draw_time_lines(ui: &mut Ui, grid: Rect, g: &RollGeom) {
@@ -373,9 +556,9 @@ fn draw_key(ui: &mut Ui, x: f32, y: f32, g: &RollGeom, pitch: u8, row_h: f32, li
     );
 }
 
-fn draw_keys(ui: &mut Ui, rect: Rect, g: &RollGeom, base: u8, offset_y: f32, lit: Option<u8>) {
+fn draw_keys(ui: &mut Ui, rect: Rect, g: &RollGeom, base: u8, offset_y: f32, lit: Option<u8>, head_h: f32) {
     ui.fill_rect(rect, [0.07, 0.07, 0.08, 1.0]);
-    let y0 = rect.min.y + g.head_h - offset_y;
+    let y0 = rect.min.y + head_h - offset_y;
     let row_h = (g.stride.y - g.gap).max(1.0);
     for row in 0..g.rows {
         let y = y0 + row as f32 * g.stride.y;
@@ -415,7 +598,7 @@ pub fn draw_in_node(ui: &mut Ui, node_id: &str, node: &mut GraphNode, playhead: 
         max: Vec2::new(rect.max.x, rect.max.y),
     };
 
-    let mut roll = ROLLS.with(|m| m.borrow().get(node_id).copied().unwrap_or_default());
+    let mut roll = ROLLS.with(|m| m.borrow().get(node_id).cloned().unwrap_or_default());
 
     if area.hovered || area.active {
         match hit_note(&node.notes, grid, g.stride, ptr.pos, base, g.rows) {
@@ -449,9 +632,9 @@ pub fn draw_in_node(ui: &mut Ui, node_id: &str, node: &mut GraphNode, playhead: 
                 roll.last_len = n.len.max(1);
                 if let Some((step, pitch)) = cell_at(grid, g.stride, ptr.pos, steps, g.rows, base) {
                     roll.drag = Some(Drag::Move {
-                        idx,
-                        grab_step: step as i32 - n.step as i32,
-                        grab_pitch: pitch as i32 - n.pitch as i32,
+                        press_step: step,
+                        press_pitch: pitch,
+                        orig: vec![(idx, n.step, n.pitch)],
                     });
                 }
             }
@@ -460,28 +643,29 @@ pub fn draw_in_node(ui: &mut Ui, node_id: &str, node: &mut GraphNode, playhead: 
                     let len = roll.last_len.max(1).min(steps - step);
                     node.notes.push(SeqNote { step, pitch, len });
                     roll.drag = Some(Drag::Move {
-                        idx: node.notes.len() - 1,
-                        grab_step: 0,
-                        grab_pitch: 0,
+                        press_step: step,
+                        press_pitch: pitch,
+                        orig: vec![(node.notes.len() - 1, step, pitch)],
                     });
                 }
             }
         }
         ui.request_repaint();
     } else if area.active && ptr.down {
-        match roll.drag {
+        match roll.drag.clone() {
             Some(Drag::Move {
-                idx,
-                grab_step,
-                grab_pitch,
+                press_step,
+                press_pitch,
+                orig,
             }) => {
                 if let Some((step, pitch)) = cell_at(grid, g.stride, ptr.pos, steps, g.rows, base) {
-                    if let Some(n) = node.notes.get_mut(idx) {
-                        n.step = (step as i64 - grab_step as i64)
-                            .clamp(0, steps.saturating_sub(1) as i64) as u32;
-                        n.pitch = (pitch as i32 - grab_pitch).clamp(0, 127) as u8;
-                        clamp_note(n, steps);
-                    }
+                    shift_sel(
+                        &mut node.notes,
+                        &orig,
+                        step as i32 - press_step as i32,
+                        pitch as i32 - press_pitch as i32,
+                        steps,
+                    );
                 }
                 ui.request_repaint();
             }
@@ -494,7 +678,7 @@ pub fn draw_in_node(ui: &mut Ui, node_id: &str, node: &mut GraphNode, playhead: 
                 }
                 ui.request_repaint();
             }
-            Some(Drag::Erase) | None => {}
+            Some(Drag::Erase | Drag::Box { .. }) | None => {}
         }
     }
 
@@ -502,15 +686,17 @@ pub fn draw_in_node(ui: &mut Ui, node_id: &str, node: &mut GraphNode, playhead: 
         roll.drag = None;
     }
 
+    let drag = roll.drag.clone();
     ROLLS.with(|m| {
         m.borrow_mut().insert(node_id.to_string(), roll);
     });
 
-    let grid = draw_grid(ui, rect, &g, base, true);
+    let grid = draw_grid(ui, rect, &g, base, true, true);
 
-    let active_idx = match roll.drag {
-        Some(Drag::Move { idx, .. } | Drag::Resize { idx, .. }) => Some(idx),
-        _ => None,
+    let active = match &drag {
+        Some(Drag::Move { orig, .. }) => orig.iter().map(|o| o.0).collect::<Vec<_>>(),
+        Some(Drag::Resize { idx, .. }) => vec![*idx],
+        _ => Vec::new(),
     };
     for (i, note) in node.notes.iter().copied().enumerate() {
         let Some(r) = note_rect(grid, g.stride, note, base, g.rows) else {
@@ -522,7 +708,7 @@ pub fn draw_in_node(ui: &mut Ui, node_id: &str, node: &mut GraphNode, playhead: 
         {
             color = [1.0, 0.82, 0.35, 1.0];
         }
-        if Some(i) == active_idx {
+        if active.iter().any(|&j| j == i) {
             color = [1.0, 0.88, 0.45, 1.0];
         }
         ui.fill_round(r, 2.0 * g.s.min(1.5), color);
@@ -550,241 +736,430 @@ pub fn draw_editor(
     loop_bars: u32,
     song_beats: f64,
     preview: &mut EventSender<NoteEvent>,
-) {
+) -> Option<f64> {
     let steps = SEQ_STEPS * loop_bars.max(1);
     let base = EDITOR_BASE;
-    let g = geom_editor(ui.scale().max(1.0), steps, EDITOR_ROWS);
+    let mut roll = ROLLS.with(|m| m.borrow().get(id).cloned().unwrap_or_default());
     let loop_beats = steps as f32 * BEATS_PER_STEP;
     let play_step = {
-        let t = (song_beats.rem_euclid(loop_beats as f64) / loop_beats.max(0.001) as f64).clamp(0.0, 0.999);
+        let t = (song_beats.rem_euclid(loop_beats as f64) / loop_beats.max(0.001) as f64)
+            .clamp(0.0, 0.999);
         Some((t * steps as f64) as u32)
     };
-    let view = ui.available_size();
-    let view = Vec2::new(view.x.max(80.0), view.y.max(80.0));
-    let grid_size = Vec2::new((g.size.x - g.label_w).max(1.0), g.size.y);
     let mut jump_c4 = false;
+    if !roll.scrolled {
+        jump_c4 = true;
+        roll.scrolled = true;
+    }
+    let mut seek_to = None;
+    let scale = ui.scale().max(1.0);
+    let mut g = geom_editor(scale, steps, EDITOR_ROWS, roll.zoom);
+    apply_zoom_at_cursor(ui, &mut roll, &mut g, scale, steps);
+    let grid_h = (g.size.y - g.head_h).max(1.0);
+    let grid_size = Vec2::new((g.size.x - g.label_w).max(1.0), grid_h);
+    let mut header_rect = roll.header;
 
-    // Zero gap: default row spacing sits on the right of the scroll_area and clips the v-bar.
-    ui.row_with(LayoutOpts { spacing: Some(0.0), ..Default::default() }, |ui| {
-        let keys = ui.area("keys", Vec2::new(g.label_w, view.y));
-        ui.flex(1.0, |ui| {
-            let size = ui.available_size();
-            let size = Vec2::new(size.x.max(80.0), size.y.max(80.0));
-            ui.scroll_area(
-            "seq_roll",
-            size,
-            ScrollAxes::Both,
-            |ui| {
-                let area = ui.area("roll", grid_size);
-                let rect = area.rect;
+    ui.column_with(LayoutOpts { spacing: Some(0.0), ..Default::default() }, |ui| {
+        ui.row_with(LayoutOpts { spacing: Some(0.0), ..Default::default() }, |ui| {
+            let corner = ui.area("corner", Vec2::new(g.label_w, g.head_h));
+            ui.fill_rect(corner.rect, [0.08, 0.08, 0.10, 1.0]);
+            ui.flex(1.0, |ui| {
+                let w = ui.available_size().x.max(1.0);
+                let header = ui.area("bars", Vec2::new(w, g.head_h));
+                header_rect = header.rect;
+                let off_x = ui.scroll_offset("seq_roll").x;
+                draw_bar_header(ui, header.rect, &g, off_x);
                 let ptr = ui.pointer();
-                let grid = Rect {
-                    min: Vec2::new(rect.min.x, rect.min.y + g.head_h),
-                    max: Vec2::new(rect.max.x, rect.max.y),
-                };
-
-                let mut roll = ROLLS.with(|m| m.borrow().get(id).copied().unwrap_or_default());
-                if !roll.scrolled {
-                    jump_c4 = true;
-                    roll.scrolled = true;
-                }
-
-                if area.hovered || area.active {
-                    match hit_note(notes, grid, g.stride, ptr.pos, base, g.rows) {
-                        Some((_, Edge::Left | Edge::Right))
-                            if !matches!(roll.drag, Some(Drag::Move { .. })) =>
-                        {
-                            ui.set_mouse_cursor(CursorIcon::ResizeEw);
-                        }
-                        Some(_) => ui.set_mouse_cursor(CursorIcon::Move),
-                        None if area.hovered => ui.set_mouse_cursor(CursorIcon::Pointer),
-                        None => {}
-                    }
-                }
-
-                if ptr.right_pressed && (area.hovered || area.active) {
-                    erase_at(notes, grid, g.stride, ptr.pos, base, g.rows);
-                    roll.drag = Some(Drag::Erase);
-                    set_preview(preview, &mut roll.preview, None);
-                    ui.request_repaint();
-                } else if matches!(roll.drag, Some(Drag::Erase)) && ptr.right_down && area.active {
-                    erase_at(notes, grid, g.stride, ptr.pos, base, g.rows);
-                    ui.request_repaint();
-                } else if ptr.pressed && area.hovered {
-                    match hit_note(notes, grid, g.stride, ptr.pos, base, g.rows) {
-                        Some((idx, edge)) if edge != Edge::Body => {
-                            roll.last_len = notes[idx].len.max(1);
-                            roll.drag = Some(Drag::Resize {
-                                idx,
-                                left: edge == Edge::Left,
-                            });
-                            set_preview(preview, &mut roll.preview, Some(notes[idx].pitch));
-                        }
-                        Some((idx, _)) => {
-                            let n = notes[idx];
-                            roll.last_len = n.len.max(1);
-                            if let Some((step, pitch)) =
-                                cell_at(grid, g.stride, ptr.pos, steps, g.rows, base)
-                            {
-                                roll.drag = Some(Drag::Move {
-                                    idx,
-                                    grab_step: step as i32 - n.step as i32,
-                                    grab_pitch: pitch as i32 - n.pitch as i32,
-                                });
-                            }
-                            set_preview(preview, &mut roll.preview, Some(n.pitch));
-                        }
-                        None => {
-                            if let Some((step, pitch)) =
-                                cell_at(grid, g.stride, ptr.pos, steps, g.rows, base)
-                            {
-                                let len = roll.last_len.max(1).min(steps - step);
-                                notes.push(SeqNote { step, pitch, len });
-                                roll.drag = Some(Drag::Move {
-                                    idx: notes.len() - 1,
-                                    grab_step: 0,
-                                    grab_pitch: 0,
-                                });
-                                set_preview(preview, &mut roll.preview, Some(pitch));
-                            }
-                        }
-                    }
-                    ui.request_repaint();
-                } else if area.active && ptr.down {
-                    match roll.drag {
-                        Some(Drag::Move {
-                            idx,
-                            grab_step,
-                            grab_pitch,
-                        }) => {
-                            if let Some((step, pitch)) =
-                                cell_at(grid, g.stride, ptr.pos, steps, g.rows, base)
-                            {
-                                if let Some(n) = notes.get_mut(idx) {
-                                    n.step = (step as i64 - grab_step as i64)
-                                        .clamp(0, steps.saturating_sub(1) as i64)
-                                        as u32;
-                                    n.pitch = (pitch as i32 - grab_pitch).clamp(0, 127) as u8;
-                                    clamp_note(n, steps);
-                                    set_preview(preview, &mut roll.preview, Some(n.pitch));
-                                }
-                            }
+                if header.hovered {
+                    ui.set_mouse_cursor(CursorIcon::Pointer);
+                    if !ptr.ctrl {
+                        let wheel = ui.take_scroll();
+                        if wheel.y.abs() > 0.0 || wheel.x.abs() > 0.0 {
+                            let mut off = ui.scroll_offset("seq_roll");
+                            off.x = (off.x - wheel.y - wheel.x).max(0.0);
+                            ui.set_scroll_target("seq_roll", off);
                             ui.request_repaint();
                         }
-                        Some(Drag::Resize { idx, left }) => {
-                            if let Some(n) = notes.get_mut(idx) {
-                                if let Some((step, _)) =
-                                    cell_at(grid, g.stride, ptr.pos, steps, g.rows, base)
+                    }
+                }
+                if (header.hovered && ptr.pressed) || (header.active && ptr.down) {
+                    let step = header_step(header.rect, g.stride.x, off_x, ptr.pos, steps);
+                    seek_to = Some(step as f64 * BEATS_PER_STEP as f64);
+                    ui.request_repaint();
+                }
+            });
+        });
+        ui.flex(1.0, |ui| {
+            ui.row_with(LayoutOpts { spacing: Some(0.0), ..Default::default() }, |ui| {
+                let keys_h = ui.available_size().y.max(80.0);
+                let keys = ui.area("keys", Vec2::new(g.label_w, keys_h));
+                ui.flex(1.0, |ui| {
+                    let size = ui.available_size();
+                    let size = Vec2::new(size.x.max(80.0), size.y.max(80.0));
+                    ui.scroll_area("seq_roll", size, ScrollAxes::Both, |ui| {
+                        let area = ui.area("roll", grid_size);
+                        let rect = area.rect;
+                        let ptr = ui.pointer();
+                        let grid = Rect {
+                            min: rect.min,
+                            max: rect.max,
+                        };
+
+                        if area.hovered || area.active {
+                            match hit_note(notes, grid, g.stride, ptr.pos, base, g.rows) {
+                                Some((_, Edge::Left | Edge::Right))
+                                    if !matches!(roll.drag, Some(Drag::Move { .. })) =>
                                 {
-                                    resize_note(n, step, left, steps);
-                                    roll.last_len = n.len.max(1);
+                                    ui.set_mouse_cursor(CursorIcon::ResizeEw);
                                 }
+                                Some(_) => ui.set_mouse_cursor(CursorIcon::Move),
+                                None if area.hovered => ui.set_mouse_cursor(CursorIcon::Pointer),
+                                None => {}
                             }
+                        }
+
+                        editor_interact(
+                            ui,
+                            notes,
+                            &mut roll,
+                            preview,
+                            area,
+                            grid,
+                            g.stride,
+                            ptr,
+                            steps,
+                            base,
+                            g.rows,
+                        );
+
+                        let grid = draw_grid(ui, rect, &g, base, false, false);
+                        for (i, note) in notes.iter().copied().enumerate() {
+                            let Some(r) = note_rect(grid, g.stride, note, base, g.rows) else {
+                                continue;
+                            };
+                            let playing = play_step.map(|s| {
+                                s >= note.step && s < note.step + note.len.max(1)
+                            }) == Some(true);
+                            let selected = sel_has(&roll.sel, i);
+                            let color = match (selected, playing) {
+                                (true, true) => NOTE_SEL_PLAY,
+                                (true, false) => NOTE_SEL,
+                                (false, true) => NOTE_PLAY,
+                                (false, false) => NOTE_FILL,
+                            };
+                            ui.fill_round(r, 2.0 * g.s.min(1.5), color);
+                            draw_note_handles(ui, r);
+                        }
+                        if let Some(Drag::Box { a, b }) = &roll.drag {
+                            let min = Vec2::new(a.x.min(b.x), a.y.min(b.y));
+                            let max = Vec2::new(a.x.max(b.x), a.y.max(b.y));
+                            ui.fill_rect(
+                                Rect { min, max },
+                                [0.82, 0.28, 0.32, 0.18],
+                            );
+                        }
+                        if let Some(step) = play_step {
+                            let x = grid.min.x + step as f32 * g.stride.x;
+                            ui.line(
+                                Vec2::new(x, grid.min.y),
+                                Vec2::new(x, grid.max.y),
+                                1.5,
+                                [1.0, 0.42, 0.18, 0.9],
+                            );
+                        }
+                        if roll.drag.is_some() {
                             ui.request_repaint();
                         }
-                        Some(Drag::Erase) | None => {}
-                    }
-                }
-
-                if ptr.released {
-                    roll.drag = None;
-                    set_preview(preview, &mut roll.preview, None);
-                }
-
-                ROLLS.with(|m| {
-                    m.borrow_mut().insert(id.to_string(), roll);
+                    });
                 });
 
-                let grid = draw_grid(ui, rect, &g, base, false);
-                let active_idx = match roll.drag {
-                    Some(Drag::Move { idx, .. } | Drag::Resize { idx, .. }) => Some(idx),
-                    _ => None,
-                };
-                for (i, note) in notes.iter().copied().enumerate() {
-                    let Some(r) = note_rect(grid, g.stride, note, base, g.rows) else {
-                        continue;
-                    };
-                    let mut color = [0.95, 0.72, 0.22, 1.0];
-                    if play_step.map(|s| {
-                        s >= note.step as u32 && s < note.step as u32 + note.len.max(1) as u32
-                    }) == Some(true)
-                    {
-                        color = [1.0, 0.82, 0.35, 1.0];
+                if jump_c4 {
+                    if let Some(row) = row_of_pitch(base, 60, EDITOR_ROWS) {
+                        let y = (row as f32 * g.stride.y - keys_h * 0.4).max(0.0);
+                        ui.set_scroll_target("seq_roll", Vec2::new(0.0, y));
                     }
-                    if Some(i) == active_idx {
-                        color = [1.0, 0.88, 0.45, 1.0];
-                    }
-                    ui.fill_round(r, 2.0 * g.s.min(1.5), color);
-                    draw_note_handles(ui, r);
-                }
-                if let Some(step) = play_step {
-                    let x = grid.min.x + step as f32 * g.stride.x;
-                    ui.line(
-                        Vec2::new(x, grid.min.y),
-                        Vec2::new(x, grid.max.y),
-                        1.5,
-                        [1.0, 0.42, 0.18, 0.9],
-                    );
-                }
-                if roll.drag.is_some() {
                     ui.request_repaint();
                 }
-            },
-        );
+
+                let mut off = ui.scroll_offset("seq_roll");
+                let ptr = ui.pointer();
+                if keys.hovered {
+                    ui.set_mouse_cursor(CursorIcon::Pointer);
+                    if ptr.select_all {
+                        roll.sel = (0..notes.len()).collect();
+                        ui.request_repaint();
+                    }
+                    let wheel = ui.take_scroll();
+                    if wheel.y.abs() > 0.0 {
+                        off.y = (off.y - wheel.y).max(0.0);
+                        ui.set_scroll_target("seq_roll", off);
+                        ui.request_repaint();
+                    }
+                }
+                if ptr.pressed && keys.hovered {
+                    if let Some(pitch) = key_at(&g, keys.rect, ptr.pos, base, off.y, 0.0) {
+                        set_preview(preview, &mut roll.key, Some(pitch));
+                    }
+                    ui.request_repaint();
+                } else if roll.key.is_some() && ptr.down {
+                    if let Some(pitch) = key_at(&g, keys.rect, ptr.pos, base, off.y, 0.0) {
+                        set_preview(preview, &mut roll.key, Some(pitch));
+                    }
+                    ui.request_repaint();
+                }
+                if ptr.released {
+                    set_preview(preview, &mut roll.key, None);
+                }
+                draw_keys(ui, keys.rect, &g, base, off.y, roll.key, 0.0);
+                if roll.key.is_some() {
+                    ui.request_repaint();
+                }
+                roll.header = header_rect;
+                roll.view = Rect {
+                    min: Vec2::new(header_rect.min.x, keys.rect.min.y),
+                    max: Vec2::new(header_rect.max.x, keys.rect.max.y),
+                };
+            });
         });
+    });
 
-        if jump_c4 {
-            if let Some(row) = row_of_pitch(base, 60, EDITOR_ROWS) {
-                let y = (g.head_h + row as f32 * g.stride.y - view.y * 0.4).max(0.0);
-                ui.set_scroll_target("seq_roll", Vec2::new(0.0, y));
-            }
-            ui.request_repaint();
-        }
+    ROLLS.with(|m| {
+        m.borrow_mut().insert(id.to_string(), roll);
+    });
+    seek_to
+}
 
-        let mut off = ui.scroll_offset("seq_roll");
-        if keys.hovered {
-            let wheel = ui.take_scroll();
-            if wheel.y.abs() > 0.0 {
-                off.y = (off.y - wheel.y).max(0.0);
-                ui.set_scroll_target("seq_roll", off);
+fn apply_zoom_at_cursor(
+    ui: &mut Ui,
+    roll: &mut Roll,
+    g: &mut RollGeom,
+    scale: f32,
+    steps: u32,
+) {
+    let ptr = ui.pointer();
+    if !ptr.ctrl {
+        return;
+    }
+    let over_header = roll.header.contains(ptr.pos);
+    let over_view = roll.view.contains(ptr.pos);
+    if !over_header && !over_view {
+        return;
+    }
+    let wheel = ui.take_scroll();
+    if wheel.y.abs() <= 0.0 {
+        return;
+    }
+    let next = clamp_zoom(roll.zoom * if wheel.y > 0.0 { 1.1 } else { 0.9 });
+    if (next - roll.zoom).abs() <= 1e-6 {
+        return;
+    }
+    let min_x = if over_header {
+        roll.header.min.x
+    } else {
+        roll.view.min.x
+    };
+    let local_x = ptr.pos.x - min_x;
+    let old = *g;
+    roll.zoom = next;
+    *g = geom_editor(scale, steps, EDITOR_ROWS, roll.zoom);
+    apply_h_zoom(ui, &old, scale, steps, roll.zoom, local_x);
+    ui.request_repaint();
+}
+
+fn apply_h_zoom(ui: &mut Ui, old: &RollGeom, scale: f32, steps: u32, zoom: f32, local_x: f32) {
+    let next = geom_editor(scale, steps, EDITOR_ROWS, zoom);
+    let mut off = ui.scroll_offset("seq_roll");
+    off.x = zoom_anchor_x(old.stride.x, next.stride.x, off.x, local_x);
+    ui.set_scroll_target("seq_roll", off);
+}
+
+fn editor_interact(
+    ui: &mut Ui,
+    notes: &mut Vec<SeqNote>,
+    roll: &mut Roll,
+    preview: &mut EventSender<NoteEvent>,
+    area: mega_ui::Area,
+    grid: Rect,
+    stride: Vec2,
+    ptr: mega_ui::Pointer,
+    steps: u32,
+    base: u8,
+    rows: u32,
+) {
+    let hot = area.hovered || area.active;
+    if ptr.select_all && hot {
+        roll.sel = (0..notes.len()).collect();
+        ui.request_repaint();
+    }
+    if ptr.delete && hot && !roll.sel.is_empty() {
+        remove_sel(notes, &mut roll.sel);
+        set_preview(preview, &mut roll.preview, None);
+        ui.request_repaint();
+    }
+    if ptr.copy && hot && !roll.sel.is_empty() {
+        let clip = clip_from_sel(notes, &roll.sel);
+        CLIP.with(|c| *c.borrow_mut() = clip);
+    }
+    if ptr.cut && hot && !roll.sel.is_empty() {
+        let clip = clip_from_sel(notes, &roll.sel);
+        CLIP.with(|c| *c.borrow_mut() = clip);
+        remove_sel(notes, &mut roll.sel);
+        set_preview(preview, &mut roll.preview, None);
+        ui.request_repaint();
+    }
+    if ptr.paste && hot {
+        let clip = CLIP.with(|c| c.borrow().clone());
+        if !clip.is_empty() {
+            if let Some((step, pitch)) = cell_at(grid, stride, ptr.pos, steps, rows, base) {
+                roll.sel = paste_at(notes, &clip, step, pitch, steps);
                 ui.request_repaint();
             }
         }
+    }
+    if ptr.duplicate && hot && !roll.sel.is_empty() {
+        let next = clone_sel(notes, &roll.sel, steps);
+        roll.sel = next;
+        ui.request_repaint();
+    }
 
-        let ptr = ui.pointer();
-        let mut roll = ROLLS.with(|m| m.borrow().get(id).copied().unwrap_or_default());
-        if keys.hovered {
-            ui.set_mouse_cursor(CursorIcon::Pointer);
-        }
-        if ptr.pressed && keys.hovered {
-            if let Some(pitch) = key_at(&g, keys.rect, ptr.pos, base, off.y) {
-                set_preview(preview, &mut roll.key, Some(pitch));
+    if ptr.right_pressed && hot {
+        if let Some((idx, _)) = hit_note(notes, grid, stride, ptr.pos, base, rows) {
+            if sel_has(&roll.sel, idx) {
+                remove_sel(notes, &mut roll.sel);
+            } else {
+                notes.remove(idx);
+                roll.sel.clear();
             }
-            ui.request_repaint();
-        } else if roll.key.is_some() && ptr.down {
-            if let Some(pitch) = key_at(&g, keys.rect, ptr.pos, base, off.y) {
-                set_preview(preview, &mut roll.key, Some(pitch));
+        }
+        roll.drag = Some(Drag::Erase);
+        set_preview(preview, &mut roll.preview, None);
+        ui.request_repaint();
+    } else if matches!(roll.drag, Some(Drag::Erase)) && ptr.right_down && area.active {
+        erase_at(notes, grid, stride, ptr.pos, base, rows);
+        ui.request_repaint();
+    } else if ptr.pressed && area.hovered {
+        match hit_note(notes, grid, stride, ptr.pos, base, rows) {
+            Some((idx, edge)) if edge != Edge::Body && !ptr.ctrl => {
+                roll.last_len = notes[idx].len.max(1);
+                roll.sel = vec![idx];
+                roll.drag = Some(Drag::Resize {
+                    idx,
+                    left: edge == Edge::Left,
+                });
+                set_preview(preview, &mut roll.preview, Some(notes[idx].pitch));
             }
-            ui.request_repaint();
+            Some((idx, _)) if ptr.ctrl => {
+                toggle_sel(&mut roll.sel, idx);
+                set_preview(preview, &mut roll.preview, Some(notes[idx].pitch));
+            }
+            Some((idx, _)) => {
+                let n = notes[idx];
+                roll.last_len = n.len.max(1);
+                if !sel_has(&roll.sel, idx) {
+                    roll.sel = vec![idx];
+                }
+                if let Some((step, pitch)) = cell_at(grid, stride, ptr.pos, steps, rows, base) {
+                    let orig = roll
+                        .sel
+                        .iter()
+                        .filter_map(|&i| notes.get(i).map(|n| (i, n.step, n.pitch)))
+                        .collect();
+                    roll.drag = Some(Drag::Move {
+                        press_step: step,
+                        press_pitch: pitch,
+                        orig,
+                    });
+                }
+                set_preview(preview, &mut roll.preview, Some(n.pitch));
+            }
+            None if ptr.ctrl => {
+                roll.drag = Some(Drag::Box {
+                    a: ptr.pos,
+                    b: ptr.pos,
+                });
+            }
+            None => {
+                roll.sel.clear();
+                if let Some((step, pitch)) = cell_at(grid, stride, ptr.pos, steps, rows, base)
+                {
+                    let len = roll.last_len.max(1).min(steps - step);
+                    notes.push(SeqNote { step, pitch, len });
+                    let idx = notes.len() - 1;
+                    roll.sel = vec![idx];
+                    roll.drag = Some(Drag::Move {
+                        press_step: step,
+                        press_pitch: pitch,
+                        orig: vec![(idx, step, pitch)],
+                    });
+                    set_preview(preview, &mut roll.preview, Some(pitch));
+                }
+            }
         }
-        if ptr.released {
-            set_preview(preview, &mut roll.key, None);
+        ui.request_repaint();
+    } else if area.active && ptr.down {
+        match roll.drag.clone() {
+            Some(Drag::Move {
+                press_step,
+                press_pitch,
+                orig,
+            }) => {
+                if let Some((step, pitch)) = cell_at(grid, stride, ptr.pos, steps, rows, base)
+                {
+                    shift_sel(
+                        notes,
+                        &orig,
+                        step as i32 - press_step as i32,
+                        pitch as i32 - press_pitch as i32,
+                        steps,
+                    );
+                    if let Some((_, p)) = orig.first().and_then(|o| notes.get(o.0)).map(|n| (n.step, n.pitch))
+                    {
+                        set_preview(preview, &mut roll.preview, Some(p));
+                    }
+                }
+                ui.request_repaint();
+            }
+            Some(Drag::Resize { idx, left }) => {
+                if let Some(n) = notes.get_mut(idx) {
+                    if let Some((step, _)) = cell_at(grid, stride, ptr.pos, steps, rows, base) {
+                        resize_note(n, step, left, steps);
+                        roll.last_len = n.len.max(1);
+                    }
+                }
+                ui.request_repaint();
+            }
+            Some(Drag::Box { a, .. }) => {
+                roll.drag = Some(Drag::Box { a, b: ptr.pos });
+                ui.request_repaint();
+            }
+            Some(Drag::Erase) | None => {}
         }
-        ROLLS.with(|m| {
-            m.borrow_mut().insert(id.to_string(), roll);
-        });
-        draw_keys(ui, keys.rect, &g, base, off.y, roll.key);
-        if roll.key.is_some() {
-            ui.request_repaint();
+    }
+
+    if ptr.released {
+        if let Some(Drag::Box { a, b }) = roll.drag.take() {
+            let hit = notes_in_box(notes, grid, stride, a, b, base, rows);
+            if ptr.ctrl {
+                for i in hit {
+                    if !sel_has(&roll.sel, i) {
+                        roll.sel.push(i);
+                    }
+                }
+            } else {
+                roll.sel = hit;
+            }
+        } else {
+            roll.drag = None;
         }
-    });
+        set_preview(preview, &mut roll.preview, None);
+    }
 }
 
-fn key_at(g: &RollGeom, keys: Rect, pos: Vec2, base: u8, offset_y: f32) -> Option<u8> {
+fn key_at(g: &RollGeom, keys: Rect, pos: Vec2, base: u8, offset_y: f32, head_h: f32) -> Option<u8> {
     if pos.x < keys.min.x || pos.x >= keys.max.x {
         return None;
     }
-    let y = pos.y - keys.min.y + offset_y - g.head_h;
+    let y = pos.y - keys.min.y + offset_y - head_h;
     let row = (y / g.stride.y).floor() as i32;
     if row < 0 || row >= g.rows as i32 {
         return None;
@@ -804,7 +1179,7 @@ pub fn draw_preview(ui: &mut Ui, node: &GraphNode, monitor: &Monitor) {
     };
 
     let area = ui.area("preview", g.size);
-    let grid = draw_grid(ui, area.rect, &g, base, true);
+    let grid = draw_grid(ui, area.rect, &g, base, true, true);
 
     let sounding = monitor.sounding_notes(&node.id);
     let mut fading = false;
@@ -971,12 +1346,72 @@ mod tests {
 
     #[test]
     fn key_hit_tracks_vertical_scroll() {
-        let g = geom_editor(1.0, 16, EDITOR_ROWS);
+        let g = geom_editor(1.0, 16, EDITOR_ROWS, 1.0);
         let keys = Rect::from_min_size(Vec2::ZERO, Vec2::new(g.label_w, 200.0));
         let row = row_of_pitch(EDITOR_BASE, 60, EDITOR_ROWS).unwrap();
-        let pos = Vec2::new(g.label_w * 0.5, g.head_h + 4.0);
-        let pitch = key_at(&g, keys, pos, EDITOR_BASE, row as f32 * g.stride.y).unwrap();
+        let pos = Vec2::new(g.label_w * 0.5, 4.0);
+        let pitch = key_at(&g, keys, pos, EDITOR_BASE, row as f32 * g.stride.y, 0.0).unwrap();
         assert_eq!(pitch, 60);
+    }
+
+    #[test]
+    fn group_shift_stays_in_grid() {
+        let mut notes = vec![
+            SeqNote { step: 0, pitch: 60, len: 2 },
+            SeqNote { step: 2, pitch: 64, len: 2 },
+        ];
+        let orig = vec![(0, 0, 60), (1, 2, 64)];
+        shift_sel(&mut notes, &orig, -4, -2, 16);
+        assert_eq!(notes[0].step, 0);
+        assert_eq!(notes[0].pitch, 58);
+        assert_eq!(notes[1].step, 2);
+        assert_eq!(notes[1].pitch, 62);
+        let orig = vec![
+            (0, notes[0].step, notes[0].pitch),
+            (1, notes[1].step, notes[1].pitch),
+        ];
+        shift_sel(&mut notes, &orig, 20, 0, 16);
+        assert_eq!(notes[1].step, 15);
+        assert_eq!(notes[0].step, 13);
+    }
+
+    #[test]
+    fn paste_at_cursor_keeps_shape() {
+        let clip = vec![
+            SeqNote { step: 4, pitch: 60, len: 2 },
+            SeqNote { step: 6, pitch: 64, len: 1 },
+        ];
+        let mut notes = Vec::new();
+        let sel = paste_at(&mut notes, &clip, 8, 72, 32);
+        assert_eq!(sel, vec![0, 1]);
+        assert_eq!(notes[0], SeqNote { step: 8, pitch: 72, len: 2 });
+        assert_eq!(notes[1], SeqNote { step: 10, pitch: 76, len: 1 });
+    }
+
+    #[test]
+    fn zoom_clamps() {
+        assert_eq!(clamp_zoom(0.01), ZOOM_MIN);
+        assert_eq!(clamp_zoom(9.0), ZOOM_MAX);
+        assert!((clamp_zoom(1.0) - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn zoom_keeps_cursor_content() {
+        let off = zoom_anchor_x(10.0, 20.0, 40.0, 80.0);
+        assert!((off - 160.0).abs() < 0.01);
+        let off = zoom_anchor_x(20.0, 10.0, 160.0, 80.0);
+        assert!((off - 40.0).abs() < 0.01);
+        let off = zoom_anchor_x(16.0, 17.6, 0.0, 120.0);
+        let content = 120.0 * (17.6 / 16.0);
+        assert!((off - (content - 120.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn header_click_maps_to_step() {
+        let rect = Rect::from_min_size(Vec2::new(100.0, 0.0), Vec2::new(200.0, 20.0));
+        assert_eq!(header_step(rect, 10.0, 0.0, Vec2::new(100.0, 5.0), 32), 0);
+        assert_eq!(header_step(rect, 10.0, 0.0, Vec2::new(125.0, 5.0), 32), 2);
+        assert_eq!(header_step(rect, 10.0, 40.0, Vec2::new(100.0, 5.0), 32), 4);
     }
 
     #[test]

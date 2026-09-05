@@ -5,6 +5,8 @@ mod graph;
 mod inspector;
 mod piano;
 
+pub use graph::DeviceLists;
+
 use glam::Vec2;
 use mega_audio::events::EventSender;
 use mega_audio::note::NoteEvent;
@@ -95,6 +97,7 @@ impl Scene for App {
             monitor,
             status,
             preview_tx,
+            devices,
             ..
         } = state;
 
@@ -103,9 +106,9 @@ impl Scene for App {
 
         ui.dock_space("main", dock_size, dock, |ui, tab| match tab {
             "Project" => explorer::draw(ui, project, &mut import_midi),
-            "Graph" => draw_editor(ui, project, monitor, preview_tx, &seqs, &insts),
+            "Graph" => draw_editor(ui, project, monitor, preview_tx, &seqs, &insts, devices),
             "Inspector" => {
-                inspector::draw(ui, project, playing, monitor, status);
+                inspector::draw(ui, project, playing, monitor, status, preview_tx);
             }
             _ => {}
         });
@@ -131,22 +134,30 @@ fn draw_editor(
     preview_tx: &mut EventSender<NoteEvent>,
     seqs: &[(String, String)],
     insts: &[(String, String)],
+    devices: &mut DeviceLists,
 ) {
-    match project.view.clone() {
+    let seek = match project.view.clone() {
         EditorView::Graph => {
-            graph::draw(ui, &mut project.main, monitor, seqs, insts, false);
+            graph::draw(ui, &mut project.main, monitor, seqs, insts, devices, false);
+            None
         }
         EditorView::Instrument(id) => {
             if let Some(inst) = project.instruments.iter_mut().find(|i| i.id == id) {
-                graph::draw(ui, &mut inst.graph, monitor, seqs, insts, true);
+                graph::draw(ui, &mut inst.graph, monitor, seqs, insts, devices, true);
             }
+            None
         }
         EditorView::Sequence(id) => {
             let song = monitor.song_beats();
             if let Some(seq) = project.sequence_mut(&id) {
                 let bars = seq.loop_bars();
-                piano::draw_editor(ui, &id, &mut seq.notes, bars, song, preview_tx);
+                piano::draw_editor(ui, &id, &mut seq.notes, bars, song, preview_tx)
+            } else {
+                None
             }
         }
+    };
+    if let Some(beats) = seek {
+        project.main.seek_to(beats);
     }
 }

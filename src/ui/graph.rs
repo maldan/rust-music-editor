@@ -8,12 +8,30 @@ use mega_ui::{
 use crate::compile::WAVEFORMS;
 use crate::fft::{freq_ticks, SPEC_BINS, SPEC_COLS};
 use crate::graph::{
-    port, ARP_NAMES, CHORD_NAMES, EqPt, GraphDoc, GraphNode, NodeKind, MIX_INS, MIX_PAN_INS,
+    port, ARP_NAMES, CHORD_NAMES, FILTER_NAMES, EqPt, GraphDoc, GraphNode, NodeKind, MIX_INS, MIX_PAN_INS,
     MIX_VOL_INS, NOTE_JOIN_INS, SEQ_OCTAVE_MIN,
 };
 use crate::monitor::Monitor;
 
 use super::piano;
+
+pub struct DeviceLists {
+    pub outputs: Vec<String>,
+    pub inputs: Vec<String>,
+}
+
+impl DeviceLists {
+    pub fn fetch() -> Self {
+        Self {
+            outputs: mega_audio::output_device_names(),
+            inputs: mega_audio::input_device_names(),
+        }
+    }
+
+    pub fn refresh(&mut self) {
+        *self = Self::fetch();
+    }
+}
 
 pub enum Spawn {
     Kind(NodeKind),
@@ -27,6 +45,7 @@ pub fn draw(
     monitor: &Arc<Monitor>,
     sequences: &[(String, String)],
     instruments: &[(String, String)],
+    devices: &mut DeviceLists,
     instrument_graph: bool,
 ) -> bool {
     let mut keep = false;
@@ -46,6 +65,19 @@ pub fn draw(
             }
         }
 
+        let cutoff_cv: Vec<String> = space
+            .links
+            .iter()
+            .filter(|l| l.to_port == "cutoff")
+            .map(|l| l.to_node.clone())
+            .collect();
+        let pan_cv: Vec<String> = space
+            .links
+            .iter()
+            .filter(|l| l.to_port == "pan")
+            .map(|l| l.to_node.clone())
+            .collect();
+
         ui.node_space("music_graph", size, space, |ui| {
             let ids: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
             for id in ids {
@@ -54,8 +86,20 @@ pub fn draw(
                 };
                 let title = node_title(&nodes[idx], sequences, instruments);
                 let mut pos = nodes[idx].pos;
+                let cutoff_from_cv = cutoff_cv.iter().any(|n| n == &id);
+                let pan_from_cv = pan_cv.iter().any(|n| n == &id);
                 ui.node(&id, &title, &mut pos, |ui| {
-                    draw_body(ui, &mut nodes[idx], monitor, sequences, instruments);
+                    draw_body(
+                        ui,
+                        &mut nodes[idx],
+                        monitor,
+                        sequences,
+                        instruments,
+                        devices,
+                        cutoff_from_cv,
+                        pan_from_cv,
+                        instrument_graph,
+                    );
                 });
                 nodes[idx].pos = pos;
             }
@@ -201,8 +245,10 @@ fn spawn_menu(
             ui.separator();
             leaf(ui, "Filter", NodeKind::Filter)
                 .or_else(|| leaf(ui, "Gain", NodeKind::Gain))
+                .or_else(|| leaf(ui, "Pan", NodeKind::Pan))
                 .or_else(|| leaf(ui, "Join Audio", NodeKind::Mix))
                 .or_else(|| leaf(ui, "Mixer", NodeKind::Mixer))
+                .or_else(|| leaf(ui, "Audio In", NodeKind::AudioIn))
                 .or_else(|| leaf(ui, "Waveform", NodeKind::Scope))
                 .or_else(|| leaf(ui, "Spectrum", NodeKind::Spectrum))
                 .or_else(|| leaf(ui, "Spectrogram", NodeKind::Spectrogram))
@@ -246,6 +292,10 @@ fn draw_body(
     monitor: &Monitor,
     sequences: &[(String, String)],
     instruments: &[(String, String)],
+    devices: &mut DeviceLists,
+    cutoff_from_cv: bool,
+    pan_from_cv: bool,
+    instrument_graph: bool,
 ) {
     let names: Vec<&str> = WAVEFORMS.iter().map(|(n, _)| *n).collect();
     match node.kind {
@@ -272,6 +322,10 @@ fn draw_body(
         NodeKind::Input => {
             ui.node_port(NodePortSide::Output, "notes", port::NOTES);
         }
+        NodeKind::AudioIn => {
+            device_picker(ui, node, &devices.inputs.clone(), devices);
+            ui.node_port(NodePortSide::Output, "out", port::AUDIO);
+        }
         NodeKind::Voice => {
             ui.node_port(NodePortSide::Input, "notes", port::NOTES);
             ui.node_port(NodePortSide::Input, "pitch", port::AUDIO);
@@ -282,6 +336,7 @@ fn draw_body(
             ui.label("Pulse width");
             ui.drag_float("pw", &mut node.pulse_width, 0.01);
             node.pulse_width = node.pulse_width.clamp(0.02, 0.98);
+            labeled_slider(ui, "Detune, cents", &mut node.detune, 0.0..=50.0);
             super::adsr::draw(ui, node);
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
@@ -315,7 +370,10 @@ fn draw_body(
         NodeKind::Filter => {
             ui.node_port(NodePortSide::Input, "in", port::AUDIO);
             ui.node_port(NodePortSide::Input, "cutoff", port::AUDIO);
-            labeled_slider(ui, "Cutoff, Hz", &mut node.cutoff, 80.0..=8000.0);
+            ui.select("filter_kind", &mut node.filter_kind, &FILTER_NAMES);
+            if !cutoff_from_cv {
+                labeled_slider(ui, "Cutoff, Hz", &mut node.cutoff, 20.0..=16_000.0);
+            }
             labeled_slider(ui, "Resonance", &mut node.q, 0.3..=8.0);
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
@@ -333,6 +391,14 @@ fn draw_body(
         NodeKind::Gain => {
             ui.node_port(NodePortSide::Input, "in", port::AUDIO);
             labeled_slider(ui, "Volume", &mut node.gain, 0.0..=1.5);
+            ui.node_port(NodePortSide::Output, "out", port::AUDIO);
+        }
+        NodeKind::Pan => {
+            ui.node_port(NodePortSide::Input, "in", port::AUDIO);
+            ui.node_port(NodePortSide::Input, "pan", port::AUDIO);
+            if !pan_from_cv {
+                labeled_slider(ui, "Pan", &mut node.pan, -1.0..=1.0);
+            }
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
         NodeKind::NoteJoin => {
@@ -399,7 +465,7 @@ fn draw_body(
             ui.node_port(NodePortSide::Input, "in", port::AUDIO);
             let bins = monitor.spectrum(&node.id);
             let ticks = freq_ticks(48_000.0);
-            ui.plot_bars("fft", Vec2::new(320.0, 96.0), &bins, &ticks);
+            ui.plot_line("fft", Vec2::new(480.0, 110.0), &bins, &ticks);
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
         NodeKind::Spectrogram => {
@@ -408,7 +474,7 @@ fn draw_body(
             let ticks = freq_ticks(48_000.0);
             ui.plot_heatmap(
                 "gram",
-                Vec2::new(400.0, 140.0),
+                Vec2::new(420.0, 384.0),
                 SPEC_COLS,
                 SPEC_BINS,
                 &cells,
@@ -496,18 +562,23 @@ fn draw_body(
         }
         NodeKind::Remap => {
             ui.node_port(NodePortSide::Input, "in", port::AUDIO);
-            ui.label("In min");
-            ui.drag_float("imin", &mut node.map_in_min, 0.1);
-            ui.label("In max");
-            ui.drag_float("imax", &mut node.map_in_max, 0.1);
-            ui.label("Out min");
-            ui.drag_float("omin", &mut node.map_out_min, 0.1);
-            ui.label("Out max");
-            ui.drag_float("omax", &mut node.map_out_max, 0.1);
+            ui.label("In min / max");
+            let mut inn = Vec2::new(node.map_in_min, node.map_in_max);
+            ui.vec2("map_in", &mut inn, 0.1, Vec2::new(-1.0, 1.0));
+            node.map_in_min = inn.x;
+            node.map_in_max = inn.y;
+            ui.label("Out min / max");
+            let mut out = Vec2::new(node.map_out_min, node.map_out_max);
+            ui.vec2("map_out", &mut out, 0.1, Vec2::new(-1.0, 1.0));
+            node.map_out_min = out.x;
+            node.map_out_max = out.y;
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
         NodeKind::Output => {
             ui.node_port(NodePortSide::Input, "in", port::AUDIO);
+            if !instrument_graph {
+                device_picker(ui, node, &devices.outputs.clone(), devices);
+            }
         }
     }
 }
@@ -529,6 +600,38 @@ fn roll_chrome(ui: &mut Ui, node: &mut GraphNode) {
 fn labeled_slider(ui: &mut Ui, name: &str, value: &mut f32, range: std::ops::RangeInclusive<f32>) {
     ui.label(name);
     ui.slider(name, value, range);
+}
+
+fn device_picker(ui: &mut Ui, node: &mut GraphNode, names: &[String], lists: &mut DeviceLists) {
+    ui.label("Device");
+    let mut labels = vec!["Default".to_string()];
+    labels.extend(names.iter().cloned());
+    if !node.audio_device.is_empty() && !names.iter().any(|n| *n == node.audio_device) {
+        labels.push(node.audio_device.clone());
+    }
+    let refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+    let mut sel = if node.audio_device.is_empty() {
+        0
+    } else {
+        labels
+            .iter()
+            .position(|l| l == &node.audio_device)
+            .unwrap_or(0)
+    };
+    ui.select(&format!("{}_dev", node.id), &mut sel, &refs);
+    node.audio_device = if sel == 0 {
+        String::new()
+    } else {
+        labels.get(sel).cloned().unwrap_or_default()
+    };
+    if ui
+        .button_with(&format!("{}_ref", node.id), |ui| {
+            ui.label("Refresh");
+        })
+        .clicked
+    {
+        lists.refresh();
+    }
 }
 
 fn eq_to_curve(pts: &[EqPt]) -> AnimationCurve {

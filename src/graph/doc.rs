@@ -177,6 +177,11 @@ impl GraphDoc {
         self.space.selected_link = None;
     }
 
+    pub fn seek_to(&mut self, beats: f64) {
+        self.seek_beats = beats.max(0.0);
+        self.seek_gen = self.seek_gen.wrapping_add(1);
+    }
+
     pub fn cue_play(&mut self) {
         self.seek_beats = tick_to_beats(self.play_from);
         self.seek_gen = self.seek_gen.wrapping_add(1);
@@ -206,9 +211,12 @@ impl GraphDoc {
             n.lfo_depth.to_bits().hash(&mut h);
             n.cutoff.to_bits().hash(&mut h);
             n.q.to_bits().hash(&mut h);
+            n.filter_kind.hash(&mut h);
             n.gain.to_bits().hash(&mut h);
+            n.pan.to_bits().hash(&mut h);
             n.drive.to_bits().hash(&mut h);
             n.pulse_width.to_bits().hash(&mut h);
+            n.detune.to_bits().hash(&mut h);
             n.clamp_min.to_bits().hash(&mut h);
             n.clamp_max.to_bits().hash(&mut h);
             n.map_in_min.to_bits().hash(&mut h);
@@ -265,6 +273,7 @@ impl GraphDoc {
                 p.t.to_bits().hash(&mut h);
                 p.v.to_bits().hash(&mut h);
             }
+            n.audio_device.hash(&mut h);
         }
         self.bpm.to_bits().hash(&mut h);
         h.finish()

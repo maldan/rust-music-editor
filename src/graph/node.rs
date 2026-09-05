@@ -34,6 +34,7 @@ pub enum NodeKind {
     Lfo,
     Filter,
     Gain,
+    Pan,
     Mix,
     Mixer,
     NoteJoin,
@@ -60,6 +61,7 @@ pub enum NodeKind {
     Voice,
     Guitar,
     Input,
+    AudioIn,
     Output,
 }
 
@@ -70,6 +72,7 @@ impl NodeKind {
             Self::Lfo => "LFO",
             Self::Filter => "Filter",
             Self::Gain => "Gain",
+            Self::Pan => "Pan",
             Self::Mix => "Join Audio",
             Self::Mixer => "Mixer",
             Self::NoteJoin => "Join Notes",
@@ -96,6 +99,7 @@ impl NodeKind {
             Self::Voice => "Voice",
             Self::Guitar => "Guitar",
             Self::Input => "In",
+            Self::AudioIn => "Audio In",
             Self::Output => "Output",
         }
     }
@@ -143,12 +147,21 @@ pub struct GraphNode {
     pub cutoff: f32,
     #[serde(default = "default_q")]
     pub q: f32,
+    /// Index into [`FILTER_NAMES`] (low / high / band / notch).
+    #[serde(default)]
+    pub filter_kind: usize,
     #[serde(default = "default_gain")]
     pub gain: f32,
+    /// Pan: `-1` left, `0` center, `+1` right.
+    #[serde(default)]
+    pub pan: f32,
     #[serde(default = "default_drive")]
     pub drive: f32,
     #[serde(default = "default_pulse_width")]
     pub pulse_width: f32,
+    /// Voice dual-osc spread, cents (0 = unison).
+    #[serde(default)]
+    pub detune: f32,
     #[serde(default = "default_clamp_min")]
     pub clamp_min: f32,
     #[serde(default = "default_clamp_max")]
@@ -252,6 +265,9 @@ pub struct GraphNode {
     pub adsr_release: f32,
     #[serde(default = "default_eq_pts")]
     pub eq_pts: Vec<EqPt>,
+    /// Output / Audio In device name. Empty = system default.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub audio_device: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -411,9 +427,12 @@ impl GraphNode {
             lfo_depth: 12.0,
             cutoff: 1200.0,
             q: 0.8,
+            filter_kind: 0,
             gain: 0.7,
+            pan: 0.0,
             drive: 4.0,
             pulse_width: 0.5,
+            detune: 0.0,
             clamp_min: -1.0,
             clamp_max: 1.0,
             map_in_min: -1.0,
@@ -467,6 +486,7 @@ impl GraphNode {
             adsr_sustain: 0.7,
             adsr_release: 0.2,
             eq_pts: default_eq_pts(),
+            audio_device: String::new(),
         }
     }
 
@@ -645,6 +665,8 @@ pub const CHORD_NAMES: [&str; 9] = [
 ];
 
 pub const ARP_NAMES: [&str; 3] = ["Up", "Down", "UpDown"];
+
+pub const FILTER_NAMES: [&str; 4] = ["Low pass", "High pass", "Band pass", "Notch"];
 
 pub fn chord_intervals(kind: usize) -> &'static [i32] {
     match kind {
@@ -863,6 +885,8 @@ mod tests {
     fn pulse_width_default() {
         let n = GraphNode::new("o".into(), NodeKind::Osc, Vec2::ZERO);
         assert!((n.pulse_width - 0.5).abs() < 1e-6);
+        let v = GraphNode::new("v".into(), NodeKind::Voice, Vec2::ZERO);
+        assert_eq!(v.detune, 0.0);
     }
 
     #[test]
@@ -882,9 +906,12 @@ mod tests {
         assert!(NodeKind::Guitar.can_bypass());
         assert!(!NodeKind::Output.can_bypass());
         assert!(!NodeKind::Input.can_bypass());
+        assert!(NodeKind::AudioIn.can_bypass());
+        assert!(NodeKind::AudioIn.can_delete());
         assert!(!NodeKind::NoteJoin.can_bypass());
         assert!(NodeKind::Chord.can_bypass());
         assert!(NodeKind::Eq.can_bypass());
+        assert!(NodeKind::Pan.can_bypass());
         assert!(NodeKind::Reverb.can_bypass());
         assert!(NodeKind::Compressor.can_bypass());
     }
@@ -896,6 +923,13 @@ mod tests {
         assert_eq!(pts.len(), 2);
         assert!((pts[0].1 - 1.0).abs() < 1e-6);
         assert!((pts[1].1 - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn filter_defaults_lowpass() {
+        let n = GraphNode::new("f".into(), NodeKind::Filter, Vec2::ZERO);
+        assert_eq!(n.filter_kind, 0);
+        assert_eq!(FILTER_NAMES[1], "High pass");
     }
 
     #[test]

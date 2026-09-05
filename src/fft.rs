@@ -1,8 +1,9 @@
 //! Real radix-2 FFT + log-frequency fold for Spectrum / Spectrogram taps.
 
 pub const FFT_N: usize = 1024;
-pub const FFT_HOP: usize = 256;
-pub const SPEC_BINS: usize = 40;
+pub const TAP_FFT_N: usize = 2048;
+pub const TAP_HOP: usize = 512;
+pub const SPEC_BINS: usize = 256;
 pub const SPEC_COLS: usize = 72;
 pub const FMIN: f32 = 20.0;
 const DB_FLOOR: f32 = -72.0;
@@ -175,13 +176,13 @@ pub fn fold_log_bins(re: &[f32], im: &[f32], sample_rate: f32, out: &mut [f32]) 
 }
 
 pub fn analyze_window(samples: &[f32], sample_rate: f32, out: &mut [f32]) {
-    debug_assert_eq!(samples.len(), FFT_N);
+    debug_assert_eq!(samples.len(), TAP_FFT_N);
     let mut re: Vec<f32> = samples
         .iter()
         .enumerate()
-        .map(|(i, s)| s * hann(i, FFT_N))
+        .map(|(i, s)| s * hann(i, TAP_FFT_N))
         .collect();
-    let mut im = vec![0.0f32; FFT_N];
+    let mut im = vec![0.0f32; TAP_FFT_N];
     fft_radix2(&mut re, &mut im);
     fold_log_bins(&re, &im, sample_rate, out);
 }
@@ -250,7 +251,7 @@ mod tests {
     #[test]
     fn a440_is_below_nyquist_mid() {
         let sr = 48_000.0;
-        let mut samples = vec![0.0f32; FFT_N];
+        let mut samples = vec![0.0f32; TAP_FFT_N];
         for (i, s) in samples.iter_mut().enumerate() {
             *s = (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sr).sin();
         }

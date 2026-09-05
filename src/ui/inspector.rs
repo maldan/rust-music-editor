@@ -1,7 +1,27 @@
+use std::cell::RefCell;
+
+use mega_audio::events::EventSender;
+use mega_audio::note::NoteEvent;
 use mega_ui::Ui;
 
 use crate::graph::{beats_to_tick, EditorView, Project};
 use crate::monitor::Monitor;
+use crate::ui::piano::set_preview;
+
+thread_local! {
+    static TEST_HELD: RefCell<Option<u8>> = const { RefCell::new(None) };
+}
+
+const TEST_KEYS: [(&str, u8); 8] = [
+    ("C4", 60),
+    ("D4", 62),
+    ("E4", 64),
+    ("F4", 65),
+    ("G4", 67),
+    ("A4", 69),
+    ("B4", 71),
+    ("C5", 72),
+];
 
 pub fn draw(
     ui: &mut Ui,
@@ -9,6 +29,7 @@ pub fn draw(
     playing: &mut bool,
     monitor: &Monitor,
     status: &str,
+    preview_tx: &mut EventSender<NoteEvent>,
 ) -> bool {
     ui.horizontal(|ui| {
         ui.label(&format!("Tick {}", beats_to_tick(monitor.song_beats())));
@@ -118,10 +139,38 @@ pub fn draw(
         }
     }
 
+    if matches!(project.view, EditorView::Instrument(_)) {
+        draw_test_keys(ui, preview_tx);
+    } else {
+        TEST_HELD.with(|h| set_preview(preview_tx, &mut h.borrow_mut(), None));
+    }
+
     if !status.is_empty() {
         ui.separator();
         ui.label(status);
     }
 
     false
+}
+
+fn draw_test_keys(ui: &mut Ui, tx: &mut EventSender<NoteEvent>) {
+    ui.separator();
+    ui.label("Test notes");
+    let down = ui.pointer().down;
+    let mut want = None;
+    ui.horizontal(|ui| {
+        for (label, pitch) in &TEST_KEYS[..4] {
+            if ui.button(label).hovered && down {
+                want = Some(*pitch);
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        for (label, pitch) in &TEST_KEYS[4..] {
+            if ui.button(label).hovered && down {
+                want = Some(*pitch);
+            }
+        }
+    });
+    TEST_HELD.with(|h| set_preview(tx, &mut h.borrow_mut(), want));
 }

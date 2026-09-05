@@ -19,7 +19,7 @@ pub fn draw(ui: &mut Ui, project: &mut Project, import_midi: &mut bool) {
         ui.tree_leaf_icon("graph", "file", "Graph");
         ui.tree_node_icon_open("seqs", "folder", "Sequences", true, |ui| {
             for (id, name) in &seqs {
-                ui.tree_leaf_icon(&format!("seq:{id}"), "file", name);
+                ui.tree_leaf_icon(&format!("seq:{id}"), "music/piano", name);
             }
         });
         ui.tree_node_icon_open("insts", "folder", "Instruments", true, |ui| {
