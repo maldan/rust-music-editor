@@ -127,7 +127,9 @@ impl GraphDoc {
             .unwrap_or(120.0);
         doc.play_from = file.play_from.max(1);
         for l in &file.links {
-            let to_port = remap_mix_port(&doc.nodes, &l.to_node, &l.to_port);
+            let Some(to_port) = remap_mix_port(&doc.nodes, &l.to_node, &l.to_port) else {
+                continue;
+            };
             let _ = doc.connect(&l.from_node, &l.from_port, &l.to_node, &to_port);
         }
         if !doc
@@ -232,9 +234,9 @@ impl Project {
             next_inst: 1,
             next_sample: 1,
             pending_delete_seq: None,
+            pending_delete_inst: None,
             pending_delete_sample: None,
             sample_seek: 0.0,
-            preview_clock: false,
         };
         for inst in file.instruments {
             p.instruments.push(Instrument {
@@ -277,9 +279,9 @@ fn migrate_v1(mut graph: GraphDoc) -> Project {
         next_inst: 1,
         next_sample: 1,
         pending_delete_seq: None,
+        pending_delete_inst: None,
         pending_delete_sample: None,
         sample_seek: 0.0,
-        preview_clock: false,
     };
         p.sync_serials();
         p
@@ -312,17 +314,19 @@ pub fn with_graph_ext(mut path: std::path::PathBuf) -> std::path::PathBuf {
     path
 }
 
-fn remap_mix_port(nodes: &[GraphNode], to_node: &str, to_port: &str) -> String {
+fn remap_mix_port(nodes: &[GraphNode], to_node: &str, to_port: &str) -> Option<String> {
     let mix = nodes
         .iter()
         .any(|n| n.id == to_node && n.kind == NodeKind::Mixer);
     if !mix {
-        return to_port.to_string();
+        return Some(to_port.to_string());
     }
     match to_port {
-        "a" => "1".into(),
-        "b" => "2".into(),
-        other => other.to_string(),
+        "a" => Some("1".into()),
+        "b" => Some("2".into()),
+        "v1" | "v2" | "v3" | "v4" | "v5" | "v6" | "v7" | "v8" | "p1" | "p2" | "p3" | "p4"
+        | "p5" | "p6" | "p7" | "p8" => None,
+        other => Some(other.to_string()),
     }
 }
 
@@ -401,6 +405,29 @@ mod tests {
                 .iter()
                 .any(|l| l.to_node == mix && l.to_port == "1"),
             "legacy mix port a should become 1"
+        );
+    }
+
+    #[test]
+    fn mixer_cv_ports_dropped() {
+        let mut doc = GraphDoc::blank();
+        let osc = doc.spawn_node(NodeKind::Osc, Vec2::ZERO);
+        let mix = doc.spawn_node(NodeKind::Mixer, Vec2::ZERO);
+        let out = doc.spawn_node(NodeKind::Output, Vec2::ZERO);
+        doc.output_id = out;
+        doc.connect(&osc, "out", &mix, "1").unwrap();
+        let json = doc
+            .to_json()
+            .unwrap()
+            .replace("\"to_port\": \"1\"", "\"to_port\": \"v1\"");
+        let loaded = GraphDoc::from_json(&json).unwrap();
+        assert!(
+            loaded
+                .space
+                .links
+                .iter()
+                .all(|l| !(l.to_node == mix && l.to_port == "v1")),
+            "mixer vol/pan CV ports should be dropped"
         );
     }
 }

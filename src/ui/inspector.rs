@@ -4,7 +4,7 @@ use mega_audio::events::EventSender;
 use mega_audio::note::NoteEvent;
 use mega_ui::Ui;
 
-use crate::graph::{beats_to_tick, EditorView, Project};
+use crate::graph::{beats_to_tick, EditorView, GraphDoc, Project};
 use crate::monitor::Monitor;
 use crate::ui::piano::{self, set_preview};
 
@@ -90,6 +90,21 @@ pub fn draw(
                 }
             }
         }
+        EditorView::Instrument(id) => {
+            ui.label("Instrument");
+            if let Some(inst) = project.instrument_mut(&id) {
+                ui.label("Name");
+                ui.text_input("inst_name", &mut inst.name);
+                if ui.button("Delete instrument").clicked {
+                    project.pending_delete_inst = Some(id.clone());
+                }
+            }
+            ui.separator();
+            let Some(doc) = project.active_graph() else {
+                return false;
+            };
+            draw_graph_sel(ui, doc);
+        }
         EditorView::Sample(id) => {
             ui.label("Sample");
             if let Some(smp) = project.sample_mut(&id) {
@@ -104,72 +119,17 @@ pub fn draw(
                 }
             }
         }
-        EditorView::Graph | EditorView::Instrument(_) => {
+        EditorView::Graph => {
             let Some(doc) = project.active_graph() else {
                 return false;
             };
-            ui.label("Selection");
-            let selected = doc.space.selected_nodes.clone();
-            let actionable: Vec<String> = selected
-                .iter()
-                .filter(|id| {
-                    doc.nodes
-                        .iter()
-                        .find(|n| n.id == **id)
-                        .is_some_and(|n| n.kind.can_delete())
-                })
-                .cloned()
-                .collect();
-            let can_act = !actionable.is_empty();
-
-            if selected.is_empty() {
-                ui.label("No selection");
-            } else if selected.len() == 1 {
-                let id = selected[0].clone();
-                if let Some(n) = doc.nodes.iter_mut().find(|n| n.id == id) {
-                    ui.label(n.kind.title());
-                    if n.kind.can_bypass() {
-                        ui.checkbox("Bypass", &mut n.bypass);
-                    }
-                }
-            } else {
-                ui.label(&format!("{} nodes", selected.len()));
-            }
-
-            ui.add_enabled(can_act, |ui| {
-                if ui.button("Clone").clicked {
-                    doc.space.request_clone_nodes = actionable.clone();
-                }
-                if ui.button("Delete").clicked {
-                    doc.space.request_delete_nodes = actionable.clone();
-                }
-            });
-
-            if !can_act && selected.iter().any(|id| id == &doc.output_id || id == &doc.input_id) {
-                ui.label("In/Out cannot be deleted.");
-            }
+            draw_graph_sel(ui, doc);
         }
     }
 
     if matches!(project.view, EditorView::Instrument(_)) {
         ui.separator();
-        ui.horizontal(|ui| {
-            let clock = if project.preview_clock {
-                "Clock off"
-            } else {
-                "Clock"
-            };
-            if ui.button(clock).clicked {
-                project.preview_clock = !project.preview_clock;
-                if project.preview_clock {
-                    project.main.reset_tick();
-                }
-            }
-        });
         TEST_HELD.with(|h| piano::draw_test_keyboard(ui, preview_tx, &mut h.borrow_mut()));
-        if project.preview_clock {
-            ui.request_repaint();
-        }
     } else {
         TEST_HELD.with(|h| set_preview(preview_tx, &mut h.borrow_mut(), None));
     }
@@ -180,4 +140,47 @@ pub fn draw(
     }
 
     false
+}
+
+fn draw_graph_sel(ui: &mut Ui, doc: &mut GraphDoc) {
+    ui.label("Selection");
+    let selected = doc.space.selected_nodes.clone();
+    let actionable: Vec<String> = selected
+        .iter()
+        .filter(|id| {
+            doc.nodes
+                .iter()
+                .find(|n| n.id == **id)
+                .is_some_and(|n| n.kind.can_delete())
+        })
+        .cloned()
+        .collect();
+    let can_act = !actionable.is_empty();
+
+    if selected.is_empty() {
+        ui.label("No selection");
+    } else if selected.len() == 1 {
+        let id = selected[0].clone();
+        if let Some(n) = doc.nodes.iter_mut().find(|n| n.id == id) {
+            ui.label(n.kind.title());
+            if n.kind.can_bypass() {
+                ui.checkbox("Bypass", &mut n.bypass);
+            }
+        }
+    } else {
+        ui.label(&format!("{} nodes", selected.len()));
+    }
+
+    ui.add_enabled(can_act, |ui| {
+        if ui.button("Clone").clicked {
+            doc.space.request_clone_nodes = actionable.clone();
+        }
+        if ui.button("Delete").clicked {
+            doc.space.request_delete_nodes = actionable.clone();
+        }
+    });
+
+    if !can_act && selected.iter().any(|id| id == &doc.output_id || id == &doc.input_id) {
+        ui.label("In/Out cannot be deleted.");
+    }
 }

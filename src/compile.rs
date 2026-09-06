@@ -12,7 +12,7 @@ use mega_audio::dsp::{
     TranceGate, Waveform, Const,
 };
 use mega_audio::graph::{Bypass, Graph, Node, NodeId, ProcessContext};
-use mega_audio::instrument::{KarplusStrong, PolyphonicInstrument};
+use mega_audio::instrument::{AdditivePiano, AnalogDrums, KarplusStrong, PolyphonicInstrument};
 use mega_audio::note::NoteEvent;
 use mega_audio::sample::{AudioClip, SamplePlayer};
 use mega_audio::{CaptureSource, CaptureTap};
@@ -23,7 +23,7 @@ use crate::fft::{
 };
 use crate::graph::{
     midi_shift, output_port_type, parse_seq_when, port, seq_window, EditorView, GraphDoc, Instrument,
-    NodeKind, Project, SeqNote, BEATS_PER_BAR, BEATS_PER_STEP, MIX_INS, MIX_PAN_INS, MIX_VOL_INS,
+    NodeKind, Project, SeqNote, BEATS_PER_BAR, BEATS_PER_STEP, MIX_INS,
     NOTE_JOIN_INS,
 };
 use crate::monitor::{FftBuf, Monitor, ScopeBuf};
@@ -221,6 +221,7 @@ fn sequence_patch(project: &Project, seq: &crate::graph::Sequence, playing: bool
     let mut nodes = vec![clock, seq_n, play, out];
     let mut links = vec![
         ("clk".into(), "clock".into(), "seq".into(), "clock".into()),
+        ("clk".into(), "clock".into(), "play".into(), "clock".into()),
         ("seq".into(), "notes".into(), "play".into(), "notes".into()),
         ("play".into(), "out".into(), "out".into(), "in".into()),
     ];
@@ -254,45 +255,18 @@ fn instrument_patch(project: &Project, inst: &Instrument, playing: bool) -> Patc
             SeqNote { step: 8, pitch: 72, len: 4 },
         ];
     }
+    let clock = crate::graph::GraphNode::new("clk".into(), NodeKind::Clock, glam::Vec2::ZERO);
     let mut play = crate::graph::GraphNode::new("play".into(), NodeKind::Instrument, glam::Vec2::ZERO);
     play.inst_id = inst.id.clone();
     let out = crate::graph::GraphNode::new("out".into(), NodeKind::Output, glam::Vec2::ZERO);
-    let mut nodes = vec![keys, play, out];
+    let mut nodes = vec![clock, keys, play, out];
     let mut links = vec![
+        ("clk".into(), "clock".into(), "keys".into(), "clock".into()),
+        ("clk".into(), "clock".into(), "play".into(), "clock".into()),
         ("keys".into(), "notes".into(), "play".into(), "notes".into()),
         ("play".into(), "out".into(), "out".into(), "in".into()),
     ];
     expand_instruments(&mut nodes, &mut links, &project.instruments, true);
-    if project.preview_clock || playing {
-        let clock_id = if let Some(n) = nodes.iter().find(|n| n.kind == NodeKind::Clock) {
-            n.id.clone()
-        } else {
-            nodes.insert(
-                0,
-                crate::graph::GraphNode::new("clk".into(), NodeKind::Clock, glam::Vec2::ZERO),
-            );
-            "clk".into()
-        };
-        if playing && !links.iter().any(|l| l.2 == "keys" && l.3 == "clock") {
-            links.insert(
-                0,
-                (clock_id.clone(), "clock".into(), "keys".into(), "clock".into()),
-            );
-        }
-        if project.preview_clock {
-            let gates: Vec<String> = nodes
-                .iter()
-                .filter(|n| n.kind == NodeKind::TranceGate)
-                .map(|n| n.id.clone())
-                .collect();
-            for gid in gates {
-                if links.iter().any(|l| l.2 == gid && l.3 == "clock") {
-                    continue;
-                }
-                links.push((clock_id.clone(), "clock".into(), gid, "clock".into()));
-            }
-        }
-    }
     let mut patch = Patch {
         // Stay audible for inspector key tests even when the demo loop is stopped.
         playing: true,
@@ -346,7 +320,7 @@ fn fill_clips(patch: &mut Patch, samples: &[crate::graph::Sample]) {
 
 fn dsp_bypass(kind: NodeKind) -> Bypass {
     match kind {
-        NodeKind::Osc | NodeKind::Voice | NodeKind::Guitar | NodeKind::Lfo | NodeKind::AudioIn | NodeKind::Value | NodeKind::Sample => {
+        NodeKind::Osc | NodeKind::Voice | NodeKind::Guitar | NodeKind::Piano | NodeKind::Drums | NodeKind::Lfo | NodeKind::AudioIn | NodeKind::Value | NodeKind::Sample => {
             Bypass::Mute
         }
         NodeKind::Filter
@@ -399,6 +373,8 @@ fn dsp_kind(kind: NodeKind) -> bool {
             | NodeKind::Spectrogram
             | NodeKind::Voice
             | NodeKind::Guitar
+            | NodeKind::Piano
+            | NodeKind::Drums
             | NodeKind::AudioIn
             | NodeKind::Sample
     )
@@ -408,14 +384,14 @@ fn port_wired(patch: &Patch, node: &str, port: &str) -> bool {
     patch.links.iter().any(|l| l.2 == node && l.3 == port)
 }
 
-fn apply_mixer_strips(mix: &mut StereoMixer, n: &crate::graph::GraphNode, patch: &Patch) {
+fn apply_mixer_strips(mix: &mut StereoMixer, n: &crate::graph::GraphNode) {
     let strips = mix.gains.len().min(MIX_INS.len());
     for i in 0..strips {
         let s = n.mix_strip(i);
-        mix.gains[i] = s.vol.clamp(0.0, 1.5);
+        mix.gains[i] = if s.mute { 0.0 } else { s.vol.clamp(0.0, 1.5) };
         mix.pans[i] = s.pan.clamp(-1.0, 1.0);
-        mix.vol_from_cv[i] = port_wired(patch, &n.id, MIX_VOL_INS[i]);
-        mix.pan_from_cv[i] = port_wired(patch, &n.id, MIX_PAN_INS[i]);
+        mix.vol_from_cv[i] = false;
+        mix.pan_from_cv[i] = false;
     }
 }
 
@@ -506,6 +482,20 @@ fn build_graph_at(patch: &Patch, sample_rate: f32, monitor: &Monitor, block_size
                 let mut gtr = KarplusStrong::new(sample_rate);
                 gtr.set_adsr(voice_adsr(n));
                 let id = graph.add_node(Box::new(gtr));
+                voices.insert(n.id.clone(), id);
+                dsp.insert(n.id.clone(), id);
+                out_port.insert((n.id.clone(), "out".into()), Wire::stereo(id, 0, 1));
+            }
+            NodeKind::Piano => {
+                let mut pno = AdditivePiano::new(sample_rate);
+                pno.set_adsr(voice_adsr(n));
+                let id = graph.add_node(Box::new(pno));
+                voices.insert(n.id.clone(), id);
+                dsp.insert(n.id.clone(), id);
+                out_port.insert((n.id.clone(), "out".into()), Wire::stereo(id, 0, 1));
+            }
+            NodeKind::Drums => {
+                let id = graph.add_node(Box::new(AnalogDrums::new(sample_rate)));
                 voices.insert(n.id.clone(), id);
                 dsp.insert(n.id.clone(), id);
                 out_port.insert((n.id.clone(), "out".into()), Wire::stereo(id, 0, 1));
@@ -618,21 +608,13 @@ fn build_graph_at(patch: &Patch, sample_rate: f32, monitor: &Monitor, block_size
             NodeKind::Mixer => {
                 let n_strips = MIX_INS.len();
                 let mut mix = StereoMixer::new(n_strips);
-                apply_mixer_strips(&mut mix, n, patch);
+                apply_mixer_strips(&mut mix, n);
                 let id = graph.add_node(Box::new(mix));
                 dsp.insert(n.id.clone(), id);
                 for (i, p) in MIX_INS.iter().enumerate() {
                     in_port.insert(
                         (n.id.clone(), (*p).into()),
                         Wire::stereo(id, i, n_strips + i),
-                    );
-                    in_port.insert(
-                        (n.id.clone(), MIX_VOL_INS[i].into()),
-                        Wire::mono(id, n_strips * 2 + i),
-                    );
-                    in_port.insert(
-                        (n.id.clone(), MIX_PAN_INS[i].into()),
-                        Wire::mono(id, n_strips * 3 + i),
                     );
                 }
                 in_port.insert((n.id.clone(), "a".into()), Wire::stereo(id, 0, n_strips));
@@ -1016,6 +998,11 @@ impl Live {
                         gtr.set_adsr(voice_adsr(n));
                     }
                 }
+                NodeKind::Piano => {
+                    if let Some(pno) = graph.node_mut::<AdditivePiano>(id) {
+                        pno.set_adsr(voice_adsr(n));
+                    }
+                }
                 NodeKind::Osc => {
                     if let Some(osc) = graph.node_mut::<Oscillator>(id) {
                         osc.frequency = n.freq.max(1.0);
@@ -1136,7 +1123,7 @@ impl Live {
                 }
                 NodeKind::Mixer => {
                     if let Some(mix) = graph.node_mut::<StereoMixer>(id) {
-                        apply_mixer_strips(mix, n, patch);
+                        apply_mixer_strips(mix, n);
                     }
                 }
                 _ => {}
@@ -1731,6 +1718,18 @@ fn sounding_at(song: f64, on: f64, off: f64, period: f64, dur: f64) -> bool {
     }
 }
 
+fn emit_voice(graph: &mut Graph, id: NodeId, event: NoteEvent) {
+    if let Some(inst) = graph.node_mut::<PolyphonicInstrument>(id) {
+        inst.handle_event(event);
+    } else if let Some(gtr) = graph.node_mut::<KarplusStrong>(id) {
+        gtr.handle_event(event);
+    } else if let Some(pno) = graph.node_mut::<AdditivePiano>(id) {
+        pno.handle_event(event);
+    } else if let Some(drm) = graph.node_mut::<AnalogDrums>(id) {
+        drm.handle_event(event);
+    }
+}
+
 fn voice_note(
     graph: &mut Graph,
     holds: &mut HashMap<NodeId, HashMap<u8, u32>>,
@@ -1742,12 +1741,9 @@ fn voice_note(
         NoteEvent::NoteOn { note, velocity } => {
             let count = slot.entry(note).or_insert(0);
             *count += 1;
-            if *count == 1 {
-                if let Some(inst) = graph.node_mut::<PolyphonicInstrument>(id) {
-                    inst.handle_event(NoteEvent::NoteOn { note, velocity });
-                } else if let Some(gtr) = graph.node_mut::<KarplusStrong>(id) {
-                    gtr.handle_event(NoteEvent::NoteOn { note, velocity });
-                }
+            let retrig = *count > 1 && graph.node_mut::<AnalogDrums>(id).is_some();
+            if *count == 1 || retrig {
+                emit_voice(graph, id, NoteEvent::NoteOn { note, velocity });
             }
         }
         NoteEvent::NoteOff { note } => {
@@ -1757,11 +1753,7 @@ fn voice_note(
             }
             if *count == 0 {
                 slot.remove(&note);
-                if let Some(inst) = graph.node_mut::<PolyphonicInstrument>(id) {
-                    inst.handle_event(NoteEvent::NoteOff { note });
-                } else if let Some(gtr) = graph.node_mut::<KarplusStrong>(id) {
-                    gtr.handle_event(NoteEvent::NoteOff { note });
-                }
+                emit_voice(graph, id, NoteEvent::NoteOff { note });
             }
         }
     }
@@ -2034,7 +2026,7 @@ fn expand_instruments(
         nodes.retain(|n| n.id != host.id);
         let incoming: Vec<_> = links
             .iter()
-            .filter(|l| l.2 == host.id && l.3 == "notes")
+            .filter(|l| l.2 == host.id)
             .cloned()
             .collect();
         let outgoing: Vec<_> = links
@@ -2067,11 +2059,14 @@ fn expand_instruments(
             nodes.push(c);
         }
 
-        let mut note_dsts = Vec::new();
+        let mut in_dsts: HashMap<String, Vec<(String, String)>> = HashMap::new();
         let mut audio_srcs = Vec::new();
         for l in &inst.graph.space.links {
-            if l.from_node == input_id && l.from_port == "notes" {
-                note_dsts.push((l.to_node.clone(), l.to_port.clone()));
+            if l.from_node == input_id {
+                in_dsts
+                    .entry(l.from_port.clone())
+                    .or_default()
+                    .push((l.to_node.clone(), l.to_port.clone()));
                 continue;
             }
             if l.to_node == output_id && l.to_port == "in" {
@@ -2093,8 +2088,16 @@ fn expand_instruments(
             ));
         }
         for inc in &incoming {
-            for (to, port) in &note_dsts {
-                links.push((inc.0.clone(), inc.1.clone(), format!("{prefix}{to}"), port.clone()));
+            let Some(dsts) = in_dsts.get(&inc.3) else {
+                continue;
+            };
+            for (to, port) in dsts {
+                links.push((
+                    inc.0.clone(),
+                    inc.1.clone(),
+                    format!("{prefix}{to}"),
+                    port.clone(),
+                ));
             }
         }
         for out in &outgoing {
@@ -2201,7 +2204,7 @@ fn seq_routes(
                 continue;
             }
             match (kind_of(to), to_p.as_str()) {
-                (Some(NodeKind::Voice | NodeKind::Guitar), "notes") => {
+                (Some(NodeKind::Voice | NodeKind::Guitar | NodeKind::Piano | NodeKind::Drums), "notes") => {
                     if let Some(&id) = voices.get(to) {
                         out.push(SeqTarget {
                             voice: id,
@@ -2486,6 +2489,19 @@ mod tests {
     }
 
     #[test]
+    fn piano_is_seq_target() {
+        let seq = crate::graph::GraphNode::new("seq".into(), NodeKind::Sequencer, glam::Vec2::ZERO);
+        let pno = crate::graph::GraphNode::new("pno".into(), NodeKind::Piano, glam::Vec2::ZERO);
+        let patch = patch_with(vec![seq, pno], vec![("seq", "notes", "pno", "notes")]);
+        let mon = Monitor::default();
+        let mut build = build_graph(&patch, 48_000.0, &mon);
+        let id = *build.dsp.get("pno").expect("piano dsp");
+        assert!(build.graph.node_mut::<AdditivePiano>(id).is_some());
+        let (targets, _) = seq_routes(&patch, "seq", &build.voices);
+        assert_eq!(targets.len(), 1);
+    }
+
+    #[test]
     fn guitar_is_seq_target() {
         let seq = crate::graph::GraphNode::new("seq".into(), NodeKind::Sequencer, glam::Vec2::ZERO);
         let gtr = crate::graph::GraphNode::new("gtr".into(), NodeKind::Guitar, glam::Vec2::ZERO);
@@ -2493,6 +2509,18 @@ mod tests {
         let mon = Monitor::default();
         let build = build_graph(&patch, 48_000.0, &mon);
         assert!(build.dsp.contains_key("gtr"));
+        let (targets, _) = seq_routes(&patch, "seq", &build.voices);
+        assert_eq!(targets.len(), 1);
+    }
+
+    #[test]
+    fn drums_is_seq_target() {
+        let seq = crate::graph::GraphNode::new("seq".into(), NodeKind::Sequencer, glam::Vec2::ZERO);
+        let drm = crate::graph::GraphNode::new("drm".into(), NodeKind::Drums, glam::Vec2::ZERO);
+        let patch = patch_with(vec![seq, drm], vec![("seq", "notes", "drm", "notes")]);
+        let mon = Monitor::default();
+        let build = build_graph(&patch, 48_000.0, &mon);
+        assert!(build.dsp.contains_key("drm"));
         let (targets, _) = seq_routes(&patch, "seq", &build.voices);
         assert_eq!(targets.len(), 1);
     }
@@ -2771,6 +2799,32 @@ mod tests {
     }
 
     #[test]
+    fn mixer_mute_silences_strip() {
+        let osc = crate::graph::GraphNode::new("osc".into(), NodeKind::Osc, glam::Vec2::ZERO);
+        let mut mix = crate::graph::GraphNode::new("mix".into(), NodeKind::Mixer, glam::Vec2::ZERO);
+        let out = crate::graph::GraphNode::new("out".into(), NodeKind::Output, glam::Vec2::ZERO);
+        mix.ensure_mix_strips();
+        mix.mix_strips[0].mute = true;
+        let mut patch = patch_with(
+            vec![osc, mix, out],
+            vec![
+                ("osc", "out", "mix", "1"),
+                ("mix", "out", "out", "in"),
+            ],
+        );
+        patch.playing = true;
+        let mon = Monitor::default();
+        let mut build = build_graph(&patch, 48_000.0, &mon);
+        let mut peak = 0.0f32;
+        for _ in 0..512 {
+            let _ = build.graph.process();
+            let (l, r) = build.graph.master_lr();
+            peak = peak.max(l.abs()).max(r.abs());
+        }
+        assert!(peak < 1e-4, "muted strip leaked {peak}");
+    }
+
+    #[test]
     fn stereo_pan_survives_delay() {
         let osc = crate::graph::GraphNode::new("osc".into(), NodeKind::Osc, glam::Vec2::ZERO);
         let mut mix = crate::graph::GraphNode::new("mix".into(), NodeKind::Mixer, glam::Vec2::ZERO);
@@ -2806,7 +2860,7 @@ mod tests {
     }
 
     #[test]
-    fn mixer_wired_vol_cv_ignores_slider_flag() {
+    fn mixer_legacy_vol_port_does_not_take_cv() {
         let osc = crate::graph::GraphNode::new("osc".into(), NodeKind::Osc, glam::Vec2::ZERO);
         let mix = crate::graph::GraphNode::new("mix".into(), NodeKind::Mixer, glam::Vec2::ZERO);
         let out = crate::graph::GraphNode::new("out".into(), NodeKind::Output, glam::Vec2::ZERO);
@@ -2822,7 +2876,7 @@ mod tests {
         let mut build = build_graph(&patch, 48_000.0, &mon);
         let id = *build.dsp.get("mix").unwrap();
         let mix = build.graph.node_mut::<StereoMixer>(id).unwrap();
-        assert!(mix.vol_from_cv[0]);
+        assert!(!mix.vol_from_cv[0]);
         assert!(!mix.pan_from_cv[0]);
     }
 
@@ -2943,7 +2997,7 @@ mod tests {
         let mon = Monitor::default();
         let (live, _) = Live::new(&patch, 48_000.0, std::sync::Arc::new(mon));
         assert!(!live.preview_targets.is_empty());
-        assert!(!patch.nodes.iter().any(|n| n.kind == NodeKind::Clock));
+        assert!(patch.nodes.iter().any(|n| n.kind == NodeKind::Clock));
 
         let heard = Patch::from_project(&p, true);
         let keys = heard
@@ -2990,10 +3044,14 @@ mod tests {
     fn instrument_clock_feeds_trance_gate() {
         let mut p = crate::graph::Project::new_default();
         let inst_id = p.instruments[0].id.clone();
-        let g = &mut p.instruments[0].graph;
-        let gate = g.spawn_node(NodeKind::TranceGate, glam::Vec2::ZERO);
+        let input = p.instruments[0].graph.input_id.clone();
+        let gate = p.instruments[0]
+            .graph
+            .spawn_node(NodeKind::TranceGate, glam::Vec2::ZERO);
+        let _ = p.instruments[0]
+            .graph
+            .connect(&input, "clock", &gate, "clock");
         p.view = crate::graph::EditorView::Instrument(inst_id);
-        p.preview_clock = true;
         let patch = Patch::from_project(&p, false);
         assert!(patch.nodes.iter().any(|n| n.kind == NodeKind::Clock));
         assert!(
@@ -3001,13 +3059,42 @@ mod tests {
                 .links
                 .iter()
                 .any(|l| l.2 == gate && l.3 == "clock"),
-            "preview clock must reach Trance Gate"
+            "In clock must reach Trance Gate"
         );
-        let silent = {
-            p.preview_clock = false;
-            Patch::from_project(&p, false)
-        };
-        assert!(!silent.nodes.iter().any(|n| n.kind == NodeKind::Clock));
+    }
+
+    #[test]
+    fn host_clock_rewires_into_instrument() {
+        let mut p = crate::graph::Project::new_default();
+        let inst_id = p.instruments[0].id.clone();
+        let input = p.instruments[0].graph.input_id.clone();
+        let gate = p.instruments[0]
+            .graph
+            .spawn_node(NodeKind::TranceGate, glam::Vec2::ZERO);
+        let _ = p.instruments[0]
+            .graph
+            .connect(&input, "clock", &gate, "clock");
+        let host = p.main.spawn_node(NodeKind::Instrument, glam::Vec2::ZERO);
+        if let Some(n) = p.main.nodes.iter_mut().find(|n| n.id == host) {
+            n.inst_id = inst_id;
+        }
+        let clock = p
+            .main
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Clock)
+            .unwrap()
+            .id
+            .clone();
+        let _ = p.main.connect(&clock, "clock", &host, "clock");
+        let patch = Patch::from_main(&p, true);
+        let inner_gate = format!("{host}__{gate}");
+        assert!(
+            patch
+                .links
+                .iter()
+                .any(|l| l.0 == clock && l.2 == inner_gate && l.3 == "clock")
+        );
     }
 
     #[test]

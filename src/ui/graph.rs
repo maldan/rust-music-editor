@@ -10,8 +10,8 @@ use crate::fft::{
     freq_ticks, spec_window, t_to_freq, view_freq_ticks, view_note_ticks, SPEC_BINS, SPEC_COLS,
 };
 use crate::graph::{
-    port, ARP_NAMES, CHORD_NAMES, FILTER_NAMES, GATE_DIV_NAMES, EqPt, GraphDoc, GraphNode, NodeKind, MIX_INS, MIX_PAN_INS,
-    MIX_VOL_INS, NOTE_JOIN_INS, SEQ_OCTAVE_MIN,
+    port, ARP_NAMES, CHORD_NAMES, FILTER_NAMES, GATE_DIV_NAMES, EqPt, GraphDoc, GraphNode, NodeKind, MIX_INS,
+    NOTE_JOIN_INS, SEQ_OCTAVE_MIN,
 };
 use crate::monitor::Monitor;
 
@@ -270,6 +270,8 @@ fn spawn_menu(
             leaf(ui, "Oscillator", NodeKind::Osc)
                 .or_else(|| leaf(ui, "Basic Synth", NodeKind::Voice))
                 .or_else(|| leaf(ui, "Guitar", NodeKind::Guitar))
+                .or_else(|| leaf(ui, "Piano", NodeKind::Piano))
+                .or_else(|| leaf(ui, "Drum Kit", NodeKind::Drums))
                 .or_else(|| leaf(ui, "LFO", NodeKind::Lfo))
         }
         SOUND => {
@@ -343,14 +345,28 @@ fn draw_body(
         NodeKind::Sequencer => {
             ui.node_port(NodePortSide::Input, "clock", port::CLOCK);
             ui.node_port(NodePortSide::Output, "clock", port::CLOCK);
-            if let Some((_, name)) = sequences.iter().find(|(id, _)| *id == node.seq_id) {
-                ui.label(name);
+            ui.label("Sequence");
+            let mut labels: Vec<&str> = vec!["None"];
+            for (_, name) in sequences {
+                labels.push(name.as_str());
             }
+            let mut sel = sequences
+                .iter()
+                .position(|(id, _)| *id == node.seq_id)
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            ui.select(&format!("{}_seq", node.id), &mut sel, &labels);
+            node.seq_id = if sel == 0 {
+                String::new()
+            } else {
+                sequences[sel - 1].0.clone()
+            };
             ui.label("When");
             ui.text_input("when", &mut node.seq_when);
             ui.node_port(NodePortSide::Output, "notes", port::NOTES);
         }
         NodeKind::Instrument => {
+            ui.node_port(NodePortSide::Input, "clock", port::CLOCK);
             ui.node_port(NodePortSide::Input, "notes", port::NOTES);
             if let Some((_, name)) = instruments.iter().find(|(id, _)| *id == node.inst_id) {
                 ui.label(name);
@@ -358,6 +374,7 @@ fn draw_body(
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
         NodeKind::Input => {
+            ui.node_port(NodePortSide::Output, "clock", port::CLOCK);
             ui.node_port(NodePortSide::Output, "notes", port::NOTES);
         }
         NodeKind::AudioIn => {
@@ -403,6 +420,16 @@ fn draw_body(
         NodeKind::Guitar => {
             ui.node_port(NodePortSide::Input, "notes", port::NOTES);
             super::adsr::draw(ui, node);
+            ui.node_port(NodePortSide::Output, "out", port::AUDIO);
+        }
+        NodeKind::Piano => {
+            ui.node_port(NodePortSide::Input, "notes", port::NOTES);
+            super::adsr::draw(ui, node);
+            ui.node_port(NodePortSide::Output, "out", port::AUDIO);
+        }
+        NodeKind::Drums => {
+            ui.node_port(NodePortSide::Input, "notes", port::NOTES);
+            ui.label("C2 kick  D2 snare  F#2 hat");
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
         NodeKind::Osc => {
@@ -540,14 +567,22 @@ fn draw_body(
         }
         NodeKind::Mixer => {
             node.ensure_mix_strips();
-            for (i, name) in MIX_INS.iter().enumerate() {
+            for name in MIX_INS {
                 ui.node_port(NodePortSide::Input, name, port::AUDIO);
-                ui.row(|ui| {
-                    ui.slider(&format!("mv{i}"), &mut node.mix_strips[i].vol, 0.0..=1.5);
-                    ui.slider(&format!("mp{i}"), &mut node.mix_strips[i].pan, -1.0..=1.0);
+            }
+            for row in 0..2 {
+                ui.horizontal(|ui| {
+                    for col in 0..4 {
+                        let i = row * 4 + col;
+                        ui.group(MIX_INS[i], |ui| {
+                            ui.checkbox("Mute", &mut node.mix_strips[i].mute);
+                            ui.horizontal(|ui| {
+                                ui.knob("Vol", &mut node.mix_strips[i].vol, 0.0..=1.5);
+                                ui.knob("Pan", &mut node.mix_strips[i].pan, -1.0..=1.0);
+                            });
+                        });
+                    }
                 });
-                ui.node_port(NodePortSide::Input, MIX_VOL_INS[i], port::AUDIO);
-                ui.node_port(NodePortSide::Input, MIX_PAN_INS[i], port::AUDIO);
             }
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }

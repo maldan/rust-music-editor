@@ -17,8 +17,6 @@ pub const BEATS_PER_STEP: f32 = 0.25;
 pub const BEATS_PER_BAR: f32 = SEQ_STEPS as f32 * BEATS_PER_STEP;
 pub const NOTE_JOIN_INS: [&str; 8] = ["1", "2", "3", "4", "5", "6", "7", "8"];
 pub const MIX_INS: [&str; 8] = NOTE_JOIN_INS;
-pub const MIX_VOL_INS: [&str; 8] = ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8"];
-pub const MIX_PAN_INS: [&str; 8] = ["p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct SeqNote {
@@ -63,6 +61,8 @@ pub enum NodeKind {
     Sample,
     Voice,
     Guitar,
+    Piano,
+    Drums,
     Input,
     AudioIn,
     Output,
@@ -104,6 +104,8 @@ impl NodeKind {
             Self::Sample => "Sample",
             Self::Voice => "Basic Synth",
             Self::Guitar => "Guitar",
+            Self::Piano => "Piano",
+            Self::Drums => "Drum Kit",
             Self::Input => "In",
             Self::AudioIn => "Audio In",
             Self::Output => "Output",
@@ -122,7 +124,9 @@ impl NodeKind {
 
 pub fn output_port_type(kind: NodeKind, port: &str) -> u16 {
     match (kind, port) {
-        (NodeKind::Clock, "clock") | (NodeKind::Sequencer, "clock") => port::CLOCK,
+        (NodeKind::Clock, "clock") | (NodeKind::Sequencer, "clock") | (NodeKind::Input, "clock") => {
+            port::CLOCK
+        }
         (NodeKind::Sequencer, "notes")
         | (NodeKind::Input, "notes")
         | (NodeKind::NoteJoin, "out")
@@ -318,6 +322,8 @@ pub struct MixStrip {
     pub vol: f32,
     #[serde(default)]
     pub pan: f32,
+    #[serde(default)]
+    pub mute: bool,
 }
 
 fn default_freq() -> f32 {
@@ -521,7 +527,11 @@ impl GraphNode {
             mix_a: 1.0,
             mix_b: 1.0,
             mix_strips: match kind {
-                NodeKind::Mixer => vec![MixStrip { vol: 1.0, pan: 0.0 }; MIX_INS.len()],
+                NodeKind::Mixer => vec![MixStrip {
+                    vol: 1.0,
+                    pan: 0.0,
+                    mute: false,
+                }; MIX_INS.len()],
                 _ => Vec::new(),
             },
             bpm: 120.0,
@@ -543,10 +553,22 @@ impl GraphNode {
             chord_kind: 0,
             arp_mode: 0,
             arp_rate: 1.0,
-            adsr_attack: 0.01,
-            adsr_decay: 0.1,
-            adsr_sustain: 0.7,
-            adsr_release: 0.2,
+            adsr_attack: match kind {
+                NodeKind::Piano => 0.003,
+                _ => 0.01,
+            },
+            adsr_decay: match kind {
+                NodeKind::Piano => 0.08,
+                _ => 0.1,
+            },
+            adsr_sustain: match kind {
+                NodeKind::Piano => 1.0,
+                _ => 0.7,
+            },
+            adsr_release: match kind {
+                NodeKind::Piano => 0.28,
+                _ => 0.2,
+            },
             eq_pts: default_eq_pts(),
             audio_device: String::new(),
             spec_pos: 0.0,
@@ -631,6 +653,7 @@ impl GraphNode {
                 _ => 1.0,
             },
             pan: 0.0,
+            mute: false,
         }
     }
 
@@ -638,7 +661,14 @@ impl GraphNode {
         if self.mix_strips.len() == MIX_INS.len() {
             return;
         }
-        let mut strips = vec![MixStrip { vol: 1.0, pan: 0.0 }; MIX_INS.len()];
+        let mut strips = vec![
+            MixStrip {
+                vol: 1.0,
+                pan: 0.0,
+                mute: false,
+            };
+            MIX_INS.len()
+        ];
         if self.mix_strips.is_empty() {
             strips[0].vol = self.mix_a;
             strips[1].vol = self.mix_b;
@@ -948,6 +978,8 @@ mod tests {
     fn voice_adsr_defaults_and_clamp() {
         let mut n = GraphNode::new("v".into(), NodeKind::Voice, Vec2::ZERO);
         assert_eq!(n.adsr_params(), (0.01, 0.1, 0.7, 0.2));
+        let p = GraphNode::new("p".into(), NodeKind::Piano, Vec2::ZERO);
+        assert_eq!(p.adsr_params(), (0.003, 0.08, 1.0, 0.28));
         n.adsr_attack = 0.0;
         n.adsr_sustain = 2.0;
         n.adsr_release = 99.0;
@@ -989,6 +1021,8 @@ mod tests {
         assert!(NodeKind::Sequencer.can_bypass());
         assert!(NodeKind::Voice.can_bypass());
         assert!(NodeKind::Guitar.can_bypass());
+        assert!(NodeKind::Piano.can_bypass());
+        assert!(NodeKind::Drums.can_bypass());
         assert!(!NodeKind::Output.can_bypass());
         assert!(!NodeKind::Input.can_bypass());
         assert!(NodeKind::AudioIn.can_bypass());
@@ -1059,7 +1093,14 @@ mod tests {
         assert!(n.mix_strips.is_empty());
         n.migrate_mixer_kind();
         assert_eq!(n.kind, NodeKind::Mix);
-        n.mix_strips = vec![MixStrip { vol: 1.0, pan: -0.5 }; 8];
+        n.mix_strips = vec![
+            MixStrip {
+                vol: 1.0,
+                pan: -0.5,
+                mute: false,
+            };
+            8
+        ];
         n.migrate_mixer_kind();
         assert_eq!(n.kind, NodeKind::Mixer);
     }

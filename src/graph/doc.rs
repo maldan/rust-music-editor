@@ -254,6 +254,7 @@ impl GraphDoc {
             for s in &n.mix_strips {
                 s.vol.to_bits().hash(&mut h);
                 s.pan.to_bits().hash(&mut h);
+                s.mute.hash(&mut h);
             }
             n.seq_when.hash(&mut h);
             n.seq_loop_bars.hash(&mut h);

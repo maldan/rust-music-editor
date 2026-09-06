@@ -55,6 +55,9 @@ impl Scene for App {
         }
         ui.menu_bar(|ui| {
             ui.menu("Graph", |ui| {
+                if ui.menu_item("New").clicked() {
+                    state.new_project();
+                }
                 if ui.menu_item("Open...").clicked() {
                     state.open_dialog();
                 }

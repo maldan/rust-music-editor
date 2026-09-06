@@ -119,10 +119,9 @@ pub struct Project {
     pub next_inst: u64,
     pub next_sample: u64,
     pub pending_delete_seq: Option<String>,
+    pub pending_delete_inst: Option<String>,
     pub pending_delete_sample: Option<String>,
     pub sample_seek: f64,
-    /// Instrument editor: run transport so Trance Gate / clocked nodes move.
-    pub preview_clock: bool,
 }
 
 impl Project {
@@ -169,9 +168,9 @@ impl Project {
             next_inst: 2,
             next_sample: 1,
             pending_delete_seq: None,
+            pending_delete_inst: None,
             pending_delete_sample: None,
             sample_seek: 0.0,
-            preview_clock: false,
         };
         p.sync_serials();
         p
@@ -260,6 +259,24 @@ impl Project {
         id
     }
 
+    pub fn remove_instrument(&mut self, id: &str) {
+        self.instruments.retain(|i| i.id != id);
+        for n in &mut self.main.nodes {
+            if n.kind == NodeKind::Instrument && n.inst_id == id {
+                n.inst_id.clear();
+            }
+        }
+        for s in &mut self.sequences {
+            if s.play_inst == id {
+                s.play_inst.clear();
+            }
+        }
+        if matches!(&self.view, EditorView::Instrument(cur) if cur == id) {
+            self.select_graph();
+        }
+        self.pending_delete_inst = None;
+    }
+
     pub fn select_graph(&mut self) {
         self.view = EditorView::Graph;
         self.tree_sel = Some("graph".into());
@@ -341,6 +358,10 @@ impl Project {
 
     pub fn sequence_mut(&mut self, id: &str) -> Option<&mut Sequence> {
         self.sequences.iter_mut().find(|s| s.id == id)
+    }
+
+    pub fn instrument_mut(&mut self, id: &str) -> Option<&mut Instrument> {
+        self.instruments.iter_mut().find(|i| i.id == id)
     }
 
     pub fn sample_mut(&mut self, id: &str) -> Option<&mut Sample> {
@@ -474,5 +495,27 @@ mod tests {
                 .filter(|n| n.kind == NodeKind::Sample)
                 .all(|n| n.sample_id != "a1")
         );
+    }
+
+    #[test]
+    fn remove_instrument_clears_refs() {
+        let mut p = Project::new_default();
+        p.sequences[0].play_inst = "i1".into();
+        let id = p.main.spawn_node(NodeKind::Instrument, glam::Vec2::ZERO);
+        if let Some(n) = p.main.nodes.iter_mut().find(|n| n.id == id) {
+            n.inst_id = "i1".into();
+        }
+        p.select_instrument("i1");
+        p.remove_instrument("i1");
+        assert!(p.instruments.iter().all(|i| i.id != "i1"));
+        assert_eq!(p.sequences[0].play_inst, "");
+        assert!(
+            p.main
+                .nodes
+                .iter()
+                .filter(|n| n.kind == NodeKind::Instrument)
+                .all(|n| n.inst_id != "i1")
+        );
+        assert_eq!(p.view, EditorView::Graph);
     }
 }

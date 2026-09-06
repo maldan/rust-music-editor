@@ -205,6 +205,11 @@ impl App {
         let _ = self.tx.send(patch);
     }
 
+    pub fn new_project(&mut self) {
+        self.replace_project(Project::new_default(), None, "New project".into());
+        self.project.main.space.fit_view = true;
+    }
+
     pub fn save(&mut self) {
         if let Some(path) = self.current_path.clone() {
             self.write_to(path);
@@ -250,13 +255,24 @@ impl App {
         };
         match Project::load_from_path(&path) {
             Ok(project) => {
-                self.project = project;
-                self.playing = false;
-                self.current_path = Some(path.clone());
-                self.status = format!("Opened {}", path.display());
+                let status = format!("Opened {}", path.display());
+                self.replace_project(project, Some(path), status);
             }
             Err(e) => self.status = format!("Open failed: {e}"),
         }
+    }
+
+    fn replace_project(&mut self, project: Project, path: Option<PathBuf>, status: String) {
+        self.project = project;
+        self.playing = false;
+        self.current_path = path;
+        self.last_fp = 0;
+        self.last_playing = false;
+        self.last_seek_gen = 0;
+        self.export_open = false;
+        self.export_job = None;
+        self.captures = CaptureBank::new();
+        self.status = status;
     }
 
     pub fn import_midi_dialog(&mut self) {
