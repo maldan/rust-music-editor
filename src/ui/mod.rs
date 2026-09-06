@@ -4,6 +4,7 @@ mod export;
 mod graph;
 mod inspector;
 mod piano;
+mod sample;
 
 pub use graph::DeviceLists;
 
@@ -66,6 +67,9 @@ impl Scene for App {
                 if ui.menu_item("Import MIDI...").clicked() {
                     state.import_midi_dialog();
                 }
+                if ui.menu_item("Import Sample...").clicked() {
+                    state.import_sample_dialog();
+                }
                 if ui.menu_item("Export MP3...").clicked() {
                     state.export_open = true;
                 }
@@ -90,6 +94,7 @@ impl Scene for App {
             .collect();
 
         let mut import_midi = false;
+        let mut import_sample = false;
         let App {
             dock,
             project,
@@ -105,7 +110,7 @@ impl Scene for App {
         let dock_size = Vec2::new(dock_size.x.max(1.0), dock_size.y.max(120.0));
 
         ui.dock_space("main", dock_size, dock, |ui, tab| match tab {
-            "Project" => explorer::draw(ui, project, &mut import_midi),
+            "Project" => explorer::draw(ui, project, &mut import_midi, &mut import_sample),
             "Graph" => draw_editor(ui, project, monitor, preview_tx, &seqs, &insts, devices),
             "Inspector" => {
                 inspector::draw(ui, project, playing, monitor, status, preview_tx);
@@ -120,6 +125,9 @@ impl Scene for App {
         explorer::confirm_delete(ui, project);
         if import_midi {
             state.import_midi_dialog();
+        }
+        if import_sample {
+            state.import_sample_dialog();
         }
         export::draw(ui, state);
         state.sync_audio();
@@ -136,14 +144,32 @@ fn draw_editor(
     insts: &[(String, String)],
     devices: &mut DeviceLists,
 ) {
+    let bpm = project.main.bpm;
     let seek = match project.view.clone() {
-        EditorView::Graph => {
-            graph::draw(ui, &mut project.main, monitor, seqs, insts, devices, false);
-            None
-        }
+        EditorView::Graph => graph::draw(
+            ui,
+            &mut project.main,
+            monitor,
+            seqs,
+            insts,
+            &project.samples,
+            devices,
+            false,
+            bpm,
+        ),
         EditorView::Instrument(id) => {
             if let Some(inst) = project.instruments.iter_mut().find(|i| i.id == id) {
-                graph::draw(ui, &mut inst.graph, monitor, seqs, insts, devices, true);
+                let _ = graph::draw(
+                    ui,
+                    &mut inst.graph,
+                    monitor,
+                    seqs,
+                    insts,
+                    &[],
+                    devices,
+                    true,
+                    bpm,
+                );
             }
             None
         }
@@ -156,8 +182,22 @@ fn draw_editor(
                 None
             }
         }
+        EditorView::Sample(id) => {
+            let play_t = monitor.song_beats() as f32;
+            if let Some(smp) = project.samples.iter().find(|s| s.id == id) {
+                sample::draw_editor(ui, &id, smp, play_t)
+            } else {
+                None
+            }
+        }
     };
     if let Some(beats) = seek {
-        project.main.seek_to(beats);
+        match &project.view {
+            EditorView::Sample(_) => project.seek_sample(beats),
+            _ => project.main.seek_to(beats),
+        }
+    }
+    if matches!(project.view, EditorView::Sample(_)) {
+        ui.request_repaint();
     }
 }

@@ -6,7 +6,9 @@ use mega_ui::{
 };
 
 use crate::compile::WAVEFORMS;
-use crate::fft::{freq_ticks, SPEC_BINS, SPEC_COLS};
+use crate::fft::{
+    freq_ticks, spec_window, t_to_freq, view_freq_ticks, view_note_ticks, SPEC_BINS, SPEC_COLS,
+};
 use crate::graph::{
     port, ARP_NAMES, CHORD_NAMES, FILTER_NAMES, GATE_DIV_NAMES, EqPt, GraphDoc, GraphNode, NodeKind, MIX_INS, MIX_PAN_INS,
     MIX_VOL_INS, NOTE_JOIN_INS, SEQ_OCTAVE_MIN,
@@ -37,6 +39,7 @@ pub enum Spawn {
     Kind(NodeKind),
     Seq(String),
     Inst(String),
+    Sample(String),
 }
 
 pub fn draw(
@@ -45,10 +48,12 @@ pub fn draw(
     monitor: &Arc<Monitor>,
     sequences: &[(String, String)],
     instruments: &[(String, String)],
+    samples: &[crate::graph::Sample],
     devices: &mut DeviceLists,
     instrument_graph: bool,
-) -> bool {
-    let mut keep = false;
+    bpm: f32,
+) -> Option<f64> {
+    let mut seek_beats = None;
     let size = ui.available_size();
     let size = Vec2::new(size.x, size.y.max(120.0));
 
@@ -84,7 +89,7 @@ pub fn draw(
                 let Some(idx) = nodes.iter().position(|n| n.id == id) else {
                     continue;
                 };
-                let title = node_title(&nodes[idx], sequences, instruments);
+                let title = node_title(&nodes[idx], sequences, instruments, samples);
                 let mut pos = nodes[idx].pos;
                 let cutoff_from_cv = cutoff_cv.iter().any(|n| n == &id);
                 let pan_from_cv = pan_cv.iter().any(|n| n == &id);
@@ -95,10 +100,13 @@ pub fn draw(
                         monitor,
                         sequences,
                         instruments,
+                        samples,
                         devices,
                         cutoff_from_cv,
                         pan_from_cv,
                         instrument_graph,
+                        bpm,
+                        &mut seek_beats,
                     );
                 });
                 nodes[idx].pos = pos;
@@ -116,7 +124,7 @@ pub fn draw(
     }
     let mut spawn_kind = None;
     ui.context_menu("music_spawn", bg, |ui| {
-        spawn_kind = spawn_menu(ui, &mut doc.spawn_menu_page, sequences, instruments, instrument_graph);
+        spawn_kind = spawn_menu(ui, &mut doc.spawn_menu_page, sequences, instruments, samples, instrument_graph);
     });
     if !ui.context_menu_open() {
         doc.spawn_menu_page = 0;
@@ -142,17 +150,23 @@ pub fn draw(
                     n.inst_id = inst_id;
                 }
             }
+            Spawn::Sample(sample_id) => {
+                let id = doc.spawn_node(NodeKind::Sample, world);
+                if let Some(n) = doc.nodes.iter_mut().find(|n| n.id == id) {
+                    n.sample_id = sample_id;
+                }
+            }
         }
-        keep = true;
     }
 
-    keep
+    seek_beats
 }
 
 fn node_title(
     node: &GraphNode,
     sequences: &[(String, String)],
     instruments: &[(String, String)],
+    samples: &[crate::graph::Sample],
 ) -> String {
     match node.kind {
         NodeKind::Sequencer => sequences
@@ -165,6 +179,11 @@ fn node_title(
             .find(|(id, _)| *id == node.inst_id)
             .map(|(_, n)| n.clone())
             .unwrap_or_else(|| node.kind.title().into()),
+        NodeKind::Sample => samples
+            .iter()
+            .find(|s| s.id == node.sample_id)
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| node.kind.title().into()),
         _ => node.kind.title().into(),
     }
 }
@@ -174,6 +193,7 @@ fn spawn_menu(
     page: &mut u8,
     sequences: &[(String, String)],
     instruments: &[(String, String)],
+    samples: &[crate::graph::Sample],
     instrument_graph: bool,
 ) -> Option<Spawn> {
     const ROOT: u8 = 0;
@@ -184,6 +204,7 @@ fn spawn_menu(
     const MATH: u8 = 5;
     const SEQS: u8 = 6;
     const INSTS: u8 = 7;
+    const SMPS: u8 = 8;
 
     fn leaf(ui: &mut Ui, label: &str, kind: NodeKind) -> Option<Spawn> {
         ui.menu_item(label).clicked().then_some(Spawn::Kind(kind))
@@ -218,6 +239,17 @@ fn spawn_menu(
             for (id, name) in instruments {
                 if ui.menu_item(name).clicked() {
                     hit = Some(Spawn::Inst(id.clone()));
+                }
+            }
+            hit
+        }
+        SMPS => {
+            back(ui, page);
+            ui.separator();
+            let mut hit = None;
+            for s in samples {
+                if ui.menu_item(&s.name).clicked() {
+                    hit = Some(Spawn::Sample(s.id.clone()));
                 }
             }
             hit
@@ -277,6 +309,7 @@ fn spawn_menu(
             if !instrument_graph {
                 go(ui, "Sequences", page, SEQS);
                 go(ui, "Instruments", page, INSTS);
+                go(ui, "Samples", page, SMPS);
             }
             go(ui, "Notes", page, NOTES);
             go(ui, "Synth", page, SYNTH);
@@ -294,10 +327,13 @@ fn draw_body(
     monitor: &Monitor,
     sequences: &[(String, String)],
     instruments: &[(String, String)],
+    samples: &[crate::graph::Sample],
     devices: &mut DeviceLists,
     cutoff_from_cv: bool,
     pan_from_cv: bool,
     instrument_graph: bool,
+    bpm: f32,
+    seek_beats: &mut Option<f64>,
 ) {
     let names: Vec<&str> = WAVEFORMS.iter().map(|(n, _)| *n).collect();
     match node.kind {
@@ -326,6 +362,22 @@ fn draw_body(
         }
         NodeKind::AudioIn => {
             device_picker(ui, node, &devices.inputs.clone(), devices);
+            ui.node_port(NodePortSide::Output, "out", port::AUDIO);
+        }
+        NodeKind::Sample => {
+            let (name, peaks, dur) = samples
+                .iter()
+                .find(|s| s.id == node.sample_id)
+                .map(|s| (s.name.as_str(), s.peaks.as_slice(), s.duration()))
+                .unwrap_or(("", &[], 0.0));
+            if !name.is_empty() {
+                ui.label(name);
+            }
+            let secs = monitor.song_beats() as f32 * 60.0 / bpm.max(1.0);
+            if let Some(t) = super::sample::draw_preview(ui, peaks, dur, secs) {
+                *seek_beats = Some(t * bpm.max(1.0) as f64 / 60.0);
+            }
+            ui.request_repaint();
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
         NodeKind::Voice => {
@@ -515,8 +567,31 @@ fn draw_body(
         }
         NodeKind::Spectrogram => {
             ui.node_port(NodePortSide::Input, "in", port::AUDIO);
-            let cells = monitor.spectrogram(&node.id);
-            let ticks = freq_ticks(48_000.0);
+            labeled_slider(ui, "Freq pos", &mut node.spec_pos, 0.0..=1.0);
+            labeled_slider(ui, "Freq span", &mut node.spec_span, 0.04..=1.0);
+            labeled_slider(ui, "Gate", &mut node.spec_floor, 0.0..=1.0);
+            node.spec_span = node.spec_span.clamp(0.04, 1.0);
+            node.spec_pos = node.spec_pos.clamp(0.0, 1.0 - node.spec_span);
+            node.spec_floor = node.spec_floor.clamp(0.0, 1.0);
+            let sr = 48_000.0;
+            let t0 = node.spec_pos;
+            let span = node.spec_span;
+            ui.label(&format!(
+                "{:.0}–{:.0} Hz",
+                t_to_freq(t0, sr),
+                t_to_freq(t0 + span, sr)
+            ));
+            let cells = spec_window(
+                &monitor.spectrogram(&node.id),
+                SPEC_COLS,
+                SPEC_BINS,
+                t0,
+                span,
+                node.spec_floor,
+            );
+            let ticks = view_freq_ticks(sr, t0, span);
+            let notes = view_note_ticks(sr, t0, span);
+            let note_refs: Vec<(f32, &str)> = notes.iter().map(|(t, s)| (*t, s.as_str())).collect();
             ui.plot_heatmap(
                 "gram",
                 Vec2::new(420.0, 384.0),
@@ -524,6 +599,7 @@ fn draw_body(
                 SPEC_BINS,
                 &cells,
                 &ticks,
+                &note_refs,
             );
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }

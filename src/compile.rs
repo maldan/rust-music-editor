@@ -14,6 +14,7 @@ use mega_audio::dsp::{
 use mega_audio::graph::{Bypass, Graph, Node, NodeId, ProcessContext};
 use mega_audio::instrument::{KarplusStrong, PolyphonicInstrument};
 use mega_audio::note::NoteEvent;
+use mega_audio::sample::{AudioClip, SamplePlayer};
 use mega_audio::{CaptureSource, CaptureTap};
 
 use crate::fft::{
@@ -73,6 +74,7 @@ pub struct Patch {
     pub nodes: Vec<crate::graph::GraphNode>,
     pub links: Vec<(String, String, String, String)>,
     pub captures: HashMap<String, Arc<CaptureTap>>,
+    pub clips: HashMap<String, Arc<AudioClip>>,
     /// Sequencer id whose note graph receives editor preview events (instrument test).
     pub preview_seq: Option<String>,
 }
@@ -100,6 +102,7 @@ impl Patch {
                 })
                 .collect(),
             captures: HashMap::new(),
+            clips: HashMap::new(),
             preview_seq: None,
         }
     }
@@ -113,6 +116,11 @@ impl Patch {
         if let EditorView::Instrument(id) = &project.view {
             if let Some(inst) = project.instruments.iter().find(|i| i.id == *id) {
                 return instrument_patch(project, inst, playing);
+            }
+        }
+        if let EditorView::Sample(id) = &project.view {
+            if let Some(smp) = project.samples.iter().find(|s| s.id == *id) {
+                return sample_patch(project, smp, playing);
             }
         }
         let mut patch = Self::from_main(project, playing);
@@ -139,7 +147,7 @@ impl Patch {
             .collect();
         expand_instruments(&mut nodes, &mut links, &project.instruments, false);
         Project::apply_seq_notes(&mut nodes, &project.sequences);
-        Self {
+        let mut patch = Self {
             playing,
             bpm: project.main.bpm.max(1.0),
             seek_gen: project.main.seek_gen,
@@ -148,8 +156,11 @@ impl Patch {
             nodes,
             links,
             captures: HashMap::new(),
+            clips: HashMap::new(),
             preview_seq: None,
-        }
+        };
+        fill_clips(&mut patch, &project.samples);
+        patch
     }
 
     pub fn topo_hash(&self) -> u64 {
@@ -166,6 +177,9 @@ impl Patch {
             }
             if n.kind == NodeKind::AudioIn {
                 n.audio_device.hash(&mut h);
+            }
+            if n.kind == NodeKind::Sample {
+                n.sample_id.hash(&mut h);
             }
         }
         for l in &self.links {
@@ -222,6 +236,7 @@ fn sequence_patch(project: &Project, seq: &crate::graph::Sequence, playing: bool
         nodes,
         links,
         captures: HashMap::new(),
+        clips: HashMap::new(),
         preview_seq: Some("seq".into()),
     }
 }
@@ -278,7 +293,7 @@ fn instrument_patch(project: &Project, inst: &Instrument, playing: bool) -> Patc
             }
         }
     }
-    Patch {
+    let mut patch = Patch {
         // Stay audible for inspector key tests even when the demo loop is stopped.
         playing: true,
         bpm: project.main.bpm.max(1.0),
@@ -288,13 +303,50 @@ fn instrument_patch(project: &Project, inst: &Instrument, playing: bool) -> Patc
         nodes,
         links,
         captures: HashMap::new(),
+        clips: HashMap::new(),
         preview_seq: Some("keys".into()),
+    };
+    fill_clips(&mut patch, &project.samples);
+    patch
+}
+
+fn sample_patch(project: &Project, smp: &crate::graph::Sample, playing: bool) -> Patch {
+    let mut n = crate::graph::GraphNode::new("smp".into(), NodeKind::Sample, glam::Vec2::ZERO);
+    n.sample_id = smp.id.clone();
+    let out = crate::graph::GraphNode::new("out".into(), NodeKind::Output, glam::Vec2::ZERO);
+    let mut patch = Patch {
+        playing,
+        bpm: 60.0,
+        seek_gen: project.main.seek_gen,
+        seek_beats: project.sample_seek.max(0.0),
+        output_id: "out".into(),
+        nodes: vec![n, out],
+        links: vec![("smp".into(), "out".into(), "out".into(), "in".into())],
+        captures: HashMap::new(),
+        clips: HashMap::new(),
+        preview_seq: None,
+    };
+    fill_clips(&mut patch, &project.samples);
+    patch
+}
+
+fn fill_clips(patch: &mut Patch, samples: &[crate::graph::Sample]) {
+    for n in &patch.nodes {
+        if n.kind != NodeKind::Sample {
+            continue;
+        }
+        let Some(s) = samples.iter().find(|s| s.id == n.sample_id) else {
+            continue;
+        };
+        if let Some(clip) = &s.clip {
+            patch.clips.insert(n.id.clone(), clip.clone());
+        }
     }
 }
 
 fn dsp_bypass(kind: NodeKind) -> Bypass {
     match kind {
-        NodeKind::Osc | NodeKind::Voice | NodeKind::Guitar | NodeKind::Lfo | NodeKind::AudioIn | NodeKind::Value => {
+        NodeKind::Osc | NodeKind::Voice | NodeKind::Guitar | NodeKind::Lfo | NodeKind::AudioIn | NodeKind::Value | NodeKind::Sample => {
             Bypass::Mute
         }
         NodeKind::Filter
@@ -348,6 +400,7 @@ fn dsp_kind(kind: NodeKind) -> bool {
             | NodeKind::Voice
             | NodeKind::Guitar
             | NodeKind::AudioIn
+            | NodeKind::Sample
     )
 }
 
@@ -464,6 +517,19 @@ fn build_graph_at(patch: &Patch, sample_rate: f32, monitor: &Monitor, block_size
                     .cloned()
                     .unwrap_or_else(CaptureTap::new);
                 let id = graph.add_node(Box::new(CaptureSource::new(tap)));
+                dsp.insert(n.id.clone(), id);
+                out_port.insert((n.id.clone(), "out".into()), Wire::stereo(id, 0, 1));
+            }
+            NodeKind::Sample => {
+                let clip = patch
+                    .clips
+                    .get(&n.id)
+                    .cloned()
+                    .unwrap_or_else(|| Arc::new(AudioClip {
+                        data: Arc::from([]),
+                        sample_rate: 44_100,
+                    }));
+                let id = graph.add_node(Box::new(SamplePlayer::new(clip)));
                 dsp.insert(n.id.clone(), id);
                 out_port.insert((n.id.clone(), "out".into()), Wire::stereo(id, 0, 1));
             }
@@ -815,6 +881,7 @@ impl Live {
         let _ = live.rebuild_seqs(patch, false);
         live.rebuild_preview(patch);
         live.sync_dsp(&mut graph, patch);
+        live.sync_samples(&mut graph, patch, true);
         (live, graph)
     }
 
@@ -1132,7 +1199,8 @@ impl Live {
         }
 
         self.bpm = patch.bpm.max(1.0);
-        if patch.seek_gen != self.seek_gen {
+        let seek = patch.seek_gen != self.seek_gen;
+        if seek {
             self.song_beats = patch.seek_beats.max(0.0);
             self.seek_gen = patch.seek_gen;
             self.silence_seqs(graph);
@@ -1140,6 +1208,26 @@ impl Live {
             self.silence_seqs(graph);
         }
         self.playing = patch.playing;
+        self.sync_samples(graph, &patch, seek || !keep_held);
+    }
+
+    fn sync_samples(&self, graph: &mut Graph, patch: &Patch, seek: bool) {
+        let secs = patch.seek_beats * 60.0 / patch.bpm.max(1.0) as f64;
+        for n in &patch.nodes {
+            if n.kind != NodeKind::Sample {
+                continue;
+            }
+            let Some(&id) = self.dsp.get(&n.id) else {
+                continue;
+            };
+            let Some(p) = graph.node_mut::<SamplePlayer>(id) else {
+                continue;
+            };
+            if seek {
+                p.seek_seconds(secs);
+            }
+            p.playing = patch.playing && !n.bypass;
+        }
     }
 
     fn rebuild_preview(&mut self, patch: &Patch) {
@@ -2360,6 +2448,7 @@ mod tests {
                 .map(|(a, b, c, d)| (a.into(), b.into(), c.into(), d.into()))
                 .collect(),
             captures: HashMap::new(),
+            clips: HashMap::new(),
             preview_seq: None,
         }
     }
@@ -2919,5 +3008,33 @@ mod tests {
             Patch::from_project(&p, false)
         };
         assert!(!silent.nodes.iter().any(|n| n.kind == NodeKind::Clock));
+    }
+
+    #[test]
+    fn sample_view_plays_clip_node() {
+        let mut p = crate::graph::Project::new_default();
+        p.samples.push(crate::graph::Sample {
+            id: "a1".into(),
+            name: "Kick".into(),
+            path: String::new(),
+            sample_rate: 44100,
+            frames: 8,
+            peaks: vec![],
+            clip: Some(std::sync::Arc::new(mega_audio::sample::AudioClip {
+                data: std::sync::Arc::from([0.1f32; 8]),
+                sample_rate: 44100,
+            })),
+        });
+        p.view = crate::graph::EditorView::Sample("a1".into());
+        p.sample_seek = 0.25;
+        let patch = Patch::from_project(&p, true);
+        assert_eq!(patch.bpm, 60.0);
+        assert!((patch.seek_beats - 0.25).abs() < 1e-6);
+        assert!(patch.nodes.iter().any(|n| n.kind == NodeKind::Sample && n.sample_id == "a1"));
+        assert!(patch.clips.contains_key("smp"));
+        let mon = Monitor::default();
+        let (live, mut g) = Live::new(&patch, 48_000.0, std::sync::Arc::new(mon));
+        let id = *live.dsp.get("smp").expect("sample dsp");
+        assert!(g.node_mut::<mega_audio::sample::SamplePlayer>(id).is_some());
     }
 }

@@ -280,4 +280,19 @@ impl App {
             Err(e) => self.status = format!("MIDI import failed: {e}"),
         }
     }
+
+    pub fn import_sample_dialog(&mut self) {
+        let path = rfd::FileDialog::new()
+            .add_filter("Audio", &["wav", "mp3", "ogg", "flac", "aiff", "aif"])
+            .pick_file();
+        let Some(path) = path else {
+            return;
+        };
+        match self.project.import_sample(&path) {
+            Ok(_) => {
+                self.status = format!("Imported sample {}", path.display());
+            }
+            Err(e) => self.status = format!("Sample import failed: {e}"),
+        }
+    }
 }

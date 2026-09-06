@@ -3,7 +3,7 @@ use mega_ui::{Ui, Window};
 
 use crate::graph::{EditorView, Project};
 
-pub fn draw(ui: &mut Ui, project: &mut Project, import_midi: &mut bool) {
+pub fn draw(ui: &mut Ui, project: &mut Project, import_midi: &mut bool, import_sample: &mut bool) {
     let seqs: Vec<(String, String)> = project
         .sequences
         .iter()
@@ -13,6 +13,11 @@ pub fn draw(ui: &mut Ui, project: &mut Project, import_midi: &mut bool) {
         .instruments
         .iter()
         .map(|i| (i.id.clone(), i.name.clone()))
+        .collect();
+    let smps: Vec<(String, String)> = project
+        .samples
+        .iter()
+        .map(|s| (s.id.clone(), s.name.clone()))
         .collect();
 
     ui.tree_scope(&mut project.tree_sel, |ui| {
@@ -25,6 +30,11 @@ pub fn draw(ui: &mut Ui, project: &mut Project, import_midi: &mut bool) {
         ui.tree_node_icon_open("insts", "folder", "Instruments", true, |ui| {
             for (id, name) in &insts {
                 ui.tree_leaf_icon(&format!("inst:{id}"), "file", name);
+            }
+        });
+        ui.tree_node_icon_open("smps", "folder", "Samples", true, |ui| {
+            for (id, name) in &smps {
+                ui.tree_leaf_icon(&format!("smp:{id}"), "file", name);
             }
         });
     });
@@ -49,9 +59,26 @@ pub fn draw(ui: &mut Ui, project: &mut Project, import_midi: &mut bool) {
     if ui.button("New instrument").clicked {
         project.add_instrument();
     }
+    if ui.button("Import sample").clicked {
+        *import_sample = true;
+    }
+    let smp_id = match &project.view {
+        EditorView::Sample(id) => Some(id.clone()),
+        _ => None,
+    };
+    ui.add_enabled(smp_id.is_some(), |ui| {
+        if ui.button("Delete sample").clicked {
+            project.pending_delete_sample = smp_id.clone();
+        }
+    });
 }
 
 pub(crate) fn confirm_delete(ui: &mut Ui, project: &mut Project) {
+    confirm_seq(ui, project);
+    confirm_sample(ui, project);
+}
+
+fn confirm_seq(ui: &mut Ui, project: &mut Project) {
     let Some(id) = project.pending_delete_seq.clone() else {
         return;
     };
@@ -86,5 +113,43 @@ pub(crate) fn confirm_delete(ui: &mut Ui, project: &mut Project) {
         project.remove_sequence(&id);
     } else if !open {
         project.pending_delete_seq = None;
+    }
+}
+
+fn confirm_sample(ui: &mut Ui, project: &mut Project) {
+    let Some(id) = project.pending_delete_sample.clone() else {
+        return;
+    };
+    let name = project
+        .samples
+        .iter()
+        .find(|s| s.id == id)
+        .map(|s| s.name.clone())
+        .unwrap_or_else(|| id.clone());
+    let mut open = true;
+    let mut confirmed = false;
+    ui.modal(
+        Window::new("Delete sample")
+            .size(Vec2::new(320.0, 140.0))
+            .open(&mut open),
+        |ui| {
+            ui.label(&format!("Delete \"{name}\"?"));
+            ui.label("This cannot be undone.");
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked {
+                    ui.close_modal();
+                }
+                if ui.button("Delete").clicked {
+                    confirmed = true;
+                    ui.close_modal();
+                }
+            });
+        },
+    );
+    if confirmed {
+        project.remove_sample(&id);
+    } else if !open {
+        project.pending_delete_sample = None;
     }
 }

@@ -33,14 +33,23 @@ pub fn draw(
         let play = if *playing { "Stop" } else { "Play" };
         if ui.button(play).clicked {
             if *playing {
+                if matches!(project.view, EditorView::Sample(_)) {
+                    project.sample_seek = monitor.song_beats();
+                }
                 *playing = false;
+            } else if matches!(project.view, EditorView::Sample(_)) {
+                *playing = true;
             } else {
                 project.main.cue_play();
                 *playing = true;
             }
         }
         if ui.button("Reset").clicked {
-            project.main.reset_tick();
+            if matches!(project.view, EditorView::Sample(_)) {
+                project.seek_sample(0.0);
+            } else {
+                project.main.reset_tick();
+            }
         }
     });
 
@@ -78,6 +87,20 @@ pub fn draw(
                 };
                 if ui.button("Delete sequence").clicked {
                     project.pending_delete_seq = Some(id.clone());
+                }
+            }
+        }
+        EditorView::Sample(id) => {
+            ui.label("Sample");
+            if let Some(smp) = project.sample_mut(&id) {
+                ui.label("Name");
+                ui.text_input("smp_name", &mut smp.name);
+                ui.label(&format!("{:.2} s", smp.duration()));
+                if !smp.path.is_empty() {
+                    ui.label(&smp.path);
+                }
+                if ui.button("Delete sample").clicked {
+                    project.pending_delete_sample = Some(id.clone());
                 }
             }
         }

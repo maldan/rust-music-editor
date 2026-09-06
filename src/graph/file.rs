@@ -6,7 +6,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use super::doc::GraphDoc;
 use super::node::{parse_tick, GraphNode, NodeKind};
-use super::project::{Instrument, Project, Sequence};
+use super::project::{Instrument, Project, Sample, Sequence};
 
 /// On-disk extension; payload is still JSON.
 pub const FILE_EXT: &str = "megp";
@@ -36,6 +36,8 @@ struct ProjectFile {
     sequences: Vec<Sequence>,
     #[serde(default)]
     instruments: Vec<InstrumentFile>,
+    #[serde(default)]
+    samples: Vec<Sample>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -203,6 +205,7 @@ impl Project {
                     graph: i.graph.to_file(),
                 })
                 .collect(),
+            samples: self.samples.clone(),
         };
         serde_json::to_string_pretty(&file).map_err(|e| e.to_string())
     }
@@ -222,11 +225,15 @@ impl Project {
             main: GraphDoc::from_file(file.graph)?,
             sequences: file.sequences,
             instruments: Vec::new(),
+            samples: file.samples,
             view: super::project::EditorView::Graph,
             tree_sel: Some("graph".into()),
             next_seq: 1,
             next_inst: 1,
+            next_sample: 1,
             pending_delete_seq: None,
+            pending_delete_sample: None,
+            sample_seek: 0.0,
             preview_clock: false,
         };
         for inst in file.instruments {
@@ -238,6 +245,9 @@ impl Project {
         }
         if p.sequences.is_empty() {
             extract_sequences(&mut p.main, &mut p.sequences);
+        }
+        for s in &mut p.samples {
+            s.reload();
         }
         p.sync_serials();
         Ok(p)
@@ -260,11 +270,15 @@ fn migrate_v1(mut graph: GraphDoc) -> Project {
         main: graph,
         sequences,
         instruments: Vec::new(),
+        samples: Vec::new(),
         view: super::project::EditorView::Graph,
         tree_sel: Some("graph".into()),
         next_seq: 1,
         next_inst: 1,
+        next_sample: 1,
         pending_delete_seq: None,
+        pending_delete_sample: None,
+        sample_seek: 0.0,
         preview_clock: false,
     };
         p.sync_serials();
@@ -315,7 +329,7 @@ fn remap_mix_port(nodes: &[GraphNode], to_node: &str, to_port: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::Project;
+    use crate::graph::{Project, Sample};
 
     #[test]
     fn default_project_roundtrip() {
@@ -325,7 +339,27 @@ mod tests {
         assert_eq!(a.main.nodes.len(), b.main.nodes.len());
         assert_eq!(a.sequences.len(), b.sequences.len());
         assert_eq!(a.instruments.len(), b.instruments.len());
+        assert_eq!(a.samples.len(), b.samples.len());
         assert_eq!(a.fingerprint(), b.fingerprint());
+    }
+
+    #[test]
+    fn samples_roundtrip_path_and_peaks() {
+        let mut a = Project::new_default();
+        a.samples.push(Sample {
+            id: "a1".into(),
+            name: "Kick".into(),
+            path: "C:/sounds/kick.wav".into(),
+            sample_rate: 44100,
+            frames: 100,
+            peaks: vec![-0.2, 0.5, -0.1, 0.4],
+            clip: None,
+        });
+        let b = Project::from_json(&a.to_json().unwrap()).unwrap();
+        assert_eq!(b.samples.len(), 1);
+        assert_eq!(b.samples[0].path, "C:/sounds/kick.wav");
+        assert_eq!(b.samples[0].peaks.len(), 4);
+        assert_eq!(b.samples[0].name, "Kick");
     }
 
     #[test]

@@ -12,4 +12,4 @@ pub use node::{
     EqPt, MIX_INS,
     MIX_PAN_INS, MIX_VOL_INS, NOTE_JOIN_INS, SEQ_OCTAVE_MIN, SEQ_PITCHES, SEQ_STEPS,
 };
-pub use project::{EditorView, Instrument, Project, Sequence};
+pub use project::{EditorView, Instrument, Project, Sample, Sequence};

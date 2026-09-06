@@ -259,6 +259,7 @@ impl GraphDoc {
             n.seq_loop_bars.hash(&mut h);
             n.seq_id.hash(&mut h);
             n.inst_id.hash(&mut h);
+            n.sample_id.hash(&mut h);
             n.notes.len().hash(&mut h);
             for note in &n.notes {
                 note.step.hash(&mut h);

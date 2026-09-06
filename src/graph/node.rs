@@ -60,6 +60,7 @@ pub enum NodeKind {
     Clock,
     Sequencer,
     Instrument,
+    Sample,
     Voice,
     Guitar,
     Input,
@@ -100,6 +101,7 @@ impl NodeKind {
             Self::Clock => "Clock",
             Self::Sequencer => "Sequencer",
             Self::Instrument => "Instrument",
+            Self::Sample => "Sample",
             Self::Voice => "Basic Synth",
             Self::Guitar => "Guitar",
             Self::Input => "In",
@@ -261,6 +263,9 @@ pub struct GraphNode {
     /// Instrument entity id for [`NodeKind::Instrument`].
     #[serde(default)]
     pub inst_id: String,
+    /// Sample entity id for [`NodeKind::Sample`].
+    #[serde(default)]
+    pub sample_id: String,
     #[serde(default)]
     pub notes: Vec<SeqNote>,
     #[serde(default)]
@@ -290,6 +295,15 @@ pub struct GraphNode {
     /// Output / Audio In device name. Empty = system default.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub audio_device: String,
+    /// Spectrogram log-frequency window start (`0` = 20 Hz).
+    #[serde(default)]
+    pub spec_pos: f32,
+    /// Spectrogram log-frequency window width (`1` = full 20 Hz–Nyquist).
+    #[serde(default = "default_spec_span")]
+    pub spec_span: f32,
+    /// Spectrogram intensity gate (`0` = show all, `1` = only peaks).
+    #[serde(default)]
+    pub spec_floor: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -447,6 +461,9 @@ fn default_adsr_release() -> f32 {
 fn default_eq_pts() -> Vec<EqPt> {
     vec![EqPt { t: 0.0, v: 1.0 }, EqPt { t: 1.0, v: 1.0 }]
 }
+fn default_spec_span() -> f32 {
+    1.0
+}
 
 impl GraphNode {
     pub fn new(id: String, kind: NodeKind, pos: Vec2) -> Self {
@@ -518,6 +535,7 @@ impl GraphNode {
             },
             seq_id: String::new(),
             inst_id: String::new(),
+            sample_id: String::new(),
             notes: Vec::new(),
             transpose_notes: 0,
             transpose_octaves: 0,
@@ -531,6 +549,9 @@ impl GraphNode {
             adsr_release: 0.2,
             eq_pts: default_eq_pts(),
             audio_device: String::new(),
+            spec_pos: 0.0,
+            spec_span: 1.0,
+            spec_floor: 0.0,
         }
     }
 
@@ -972,6 +993,8 @@ mod tests {
         assert!(!NodeKind::Input.can_bypass());
         assert!(NodeKind::AudioIn.can_bypass());
         assert!(NodeKind::AudioIn.can_delete());
+        assert!(NodeKind::Sample.can_bypass());
+        assert!(NodeKind::Sample.can_delete());
         assert!(!NodeKind::NoteJoin.can_bypass());
         assert!(NodeKind::Chord.can_bypass());
         assert!(NodeKind::Eq.can_bypass());
