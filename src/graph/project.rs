@@ -54,6 +54,8 @@ pub struct Project {
     pub next_seq: u64,
     pub next_inst: u64,
     pub pending_delete_seq: Option<String>,
+    /// Instrument editor: run transport so Trance Gate / clocked nodes move.
+    pub preview_clock: bool,
 }
 
 impl Project {
@@ -98,6 +100,7 @@ impl Project {
             next_seq: 3,
             next_inst: 2,
             pending_delete_seq: None,
+            preview_clock: false,
         };
         p.sync_serials();
         p

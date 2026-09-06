@@ -48,9 +48,11 @@ pub enum NodeKind {
     Reverb,
     Compressor,
     Eq,
+    TranceGate,
     Mul,
     Clamp,
     Remap,
+    Value,
     Scope,
     Spectrum,
     Spectrogram,
@@ -86,9 +88,11 @@ impl NodeKind {
             Self::Reverb => "Reverb",
             Self::Compressor => "Comp / Limit",
             Self::Eq => "EQ Curve",
+            Self::TranceGate => "Trance Gate",
             Self::Mul => "Multiply",
             Self::Clamp => "Clamp",
             Self::Remap => "Remap",
+            Self::Value => "Value",
             Self::Scope => "Waveform",
             Self::Spectrum => "Spectrum",
             Self::Spectrogram => "Spectrogram",
@@ -96,7 +100,7 @@ impl NodeKind {
             Self::Clock => "Clock",
             Self::Sequencer => "Sequencer",
             Self::Instrument => "Instrument",
-            Self::Voice => "Voice",
+            Self::Voice => "Basic Synth",
             Self::Guitar => "Guitar",
             Self::Input => "In",
             Self::AudioIn => "Audio In",
@@ -159,9 +163,27 @@ pub struct GraphNode {
     pub drive: f32,
     #[serde(default = "default_pulse_width")]
     pub pulse_width: f32,
-    /// Voice dual-osc spread, cents (0 = unison).
+    /// Unison oscillator count (1 = one osc, no stack).
+    #[serde(default = "default_unison")]
+    pub unison: f32,
+    /// Unison spread, cents (lowest to highest osc).
     #[serde(default)]
     pub detune: f32,
+    /// Unison stereo width, 0 = center, 1 = hard L/R spread.
+    #[serde(default)]
+    pub unison_pan: f32,
+    #[serde(default)]
+    pub value: f32,
+    #[serde(default = "default_gate_pattern")]
+    pub gate_pattern: u16,
+    #[serde(default = "default_gate_smooth")]
+    pub gate_smooth: f32,
+    /// 0 = dry, 1 = fully gated.
+    #[serde(default = "default_gate_mix")]
+    pub gate_mix: f32,
+    /// Index into [`GATE_DIV_NAMES`] (1/1 … 1/32).
+    #[serde(default = "default_gate_div")]
+    pub gate_div: usize,
     #[serde(default = "default_clamp_min")]
     pub clamp_min: f32,
     #[serde(default = "default_clamp_max")]
@@ -308,6 +330,21 @@ fn default_drive() -> f32 {
 fn default_pulse_width() -> f32 {
     0.5
 }
+fn default_unison() -> f32 {
+    1.0
+}
+fn default_gate_pattern() -> u16 {
+    0x5555
+}
+fn default_gate_smooth() -> f32 {
+    0.004
+}
+fn default_gate_mix() -> f32 {
+    1.0
+}
+fn default_gate_div() -> usize {
+    4
+}
 fn default_clamp_min() -> f32 {
     -1.0
 }
@@ -432,7 +469,14 @@ impl GraphNode {
             pan: 0.0,
             drive: 4.0,
             pulse_width: 0.5,
+            unison: 1.0,
             detune: 0.0,
+            unison_pan: 0.0,
+            value: 0.0,
+            gate_pattern: 0x5555,
+            gate_smooth: 0.004,
+            gate_mix: 1.0,
+            gate_div: 4,
             clamp_min: -1.0,
             clamp_max: 1.0,
             map_in_min: -1.0,
@@ -513,6 +557,13 @@ impl GraphNode {
 
     pub fn arp_step_beats(&self) -> f64 {
         self.arp_rate.clamp(0.25, 8.0) as f64 * BEATS_PER_STEP as f64
+    }
+
+    pub fn gate_step_beats(&self) -> f64 {
+        GATE_DIV_BEATS
+            .get(self.gate_div.min(GATE_DIV_BEATS.len() - 1))
+            .copied()
+            .unwrap_or(0.25)
     }
 
     /// Root `pitch` (semitone offset) → staggered chord tones.
@@ -667,6 +718,10 @@ pub const CHORD_NAMES: [&str; 9] = [
 pub const ARP_NAMES: [&str; 3] = ["Up", "Down", "UpDown"];
 
 pub const FILTER_NAMES: [&str; 4] = ["Low pass", "High pass", "Band pass", "Notch"];
+
+/// Musical length of one Trance Gate step, synced to BPM.
+pub const GATE_DIV_NAMES: [&str; 6] = ["1/1", "1/2", "1/4", "1/8", "1/16", "1/32"];
+pub const GATE_DIV_BEATS: [f64; 6] = [4.0, 2.0, 1.0, 0.5, 0.25, 0.125];
 
 pub fn chord_intervals(kind: usize) -> &'static [i32] {
     match kind {
@@ -887,6 +942,15 @@ mod tests {
         assert!((n.pulse_width - 0.5).abs() < 1e-6);
         let v = GraphNode::new("v".into(), NodeKind::Voice, Vec2::ZERO);
         assert_eq!(v.detune, 0.0);
+        assert_eq!(v.unison, 1.0);
+        assert_eq!(v.unison_pan, 0.0);
+        let num = GraphNode::new("k".into(), NodeKind::Value, Vec2::ZERO);
+        assert_eq!(num.value, 0.0);
+        let g = GraphNode::new("g".into(), NodeKind::TranceGate, Vec2::ZERO);
+        assert_eq!(g.gate_pattern, 0x5555);
+        assert!((g.gate_mix - 1.0).abs() < 1e-6);
+        assert_eq!(g.gate_div, 4);
+        assert!((g.gate_step_beats() - 0.25).abs() < 1e-9);
     }
 
     #[test]

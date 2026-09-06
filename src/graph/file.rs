@@ -227,6 +227,7 @@ impl Project {
             next_seq: 1,
             next_inst: 1,
             pending_delete_seq: None,
+            preview_clock: false,
         };
         for inst in file.instruments {
             p.instruments.push(Instrument {
@@ -264,6 +265,7 @@ fn migrate_v1(mut graph: GraphDoc) -> Project {
         next_seq: 1,
         next_inst: 1,
         pending_delete_seq: None,
+        preview_clock: false,
     };
         p.sync_serials();
         p

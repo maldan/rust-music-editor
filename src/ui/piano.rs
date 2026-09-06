@@ -265,6 +265,113 @@ pub(crate) fn set_preview(tx: &mut EventSender<NoteEvent>, held: &mut Option<u8>
     *held = pitch;
 }
 
+const TEST_OCTAVES: [u8; 3] = [3, 4, 5];
+const WHITE_PC: [u8; 7] = [0, 2, 4, 5, 7, 9, 11];
+/// Pitch class + center in white-key units (1 = C/D boundary).
+const BLACK_PC: [(u8, f32); 5] = [(1, 1.0), (3, 2.0), (6, 4.0), (8, 5.0), (10, 6.0)];
+
+fn octave_c(oct: u8) -> u8 {
+    12 * oct.saturating_add(1)
+}
+
+fn octave_pitch(pos: Vec2, keys: Rect, base: u8) -> Option<u8> {
+    if pos.x < keys.min.x || pos.y < keys.min.y || pos.x >= keys.max.x || pos.y >= keys.max.y {
+        return None;
+    }
+    let w = keys.width().max(1.0);
+    let h = keys.height().max(1.0);
+    let white_w = w / 7.0;
+    let rel = pos - keys.min;
+    let black_w = white_w * 0.58;
+    let black_h = h * 0.58;
+    if rel.y < black_h {
+        for &(pc, slot) in &BLACK_PC {
+            let x0 = slot * white_w - black_w * 0.5;
+            if rel.x >= x0 && rel.x < x0 + black_w {
+                return Some(base.saturating_add(pc));
+            }
+        }
+    }
+    let i = (rel.x / white_w).floor() as i32;
+    if (0..7).contains(&i) {
+        Some(base.saturating_add(WHITE_PC[i as usize]))
+    } else {
+        None
+    }
+}
+
+pub(crate) fn draw_test_keyboard(
+    ui: &mut Ui,
+    tx: &mut EventSender<NoteEvent>,
+    held: &mut Option<u8>,
+) {
+    ui.separator();
+    ui.label("Test notes");
+    let z = ui.scale();
+    let row_h = 34.0 * z;
+    let label_w = 28.0 * z;
+    let keys_w = 196.0 * z;
+    let ptr = ui.pointer();
+    let mut want = None;
+    for oct in TEST_OCTAVES {
+        let base = octave_c(oct);
+        let area = ui.area(&format!("oct{oct}"), Vec2::new(label_w + keys_w, row_h));
+        let rect = area.rect;
+        let keys = Rect {
+            min: Vec2::new(rect.min.x + label_w, rect.min.y),
+            max: rect.max,
+        };
+        ui.fill_rect(rect, [0.07, 0.07, 0.08, 1.0]);
+        let white_w = keys.width() / 7.0;
+        let black_w = white_w * 0.58;
+        let black_h = keys.height() * 0.58;
+        for i in 0..7 {
+            let p = base + WHITE_PC[i];
+            let x = keys.min.x + i as f32 * white_w;
+            let mut color = [0.26, 0.27, 0.30, 1.0];
+            if *held == Some(p) {
+                color = [0.95, 0.72, 0.22, 0.85];
+            }
+            ui.fill_rect(
+                Rect::from_min_size(Vec2::new(x + 0.5, keys.min.y), Vec2::new(white_w - 1.0, keys.height())),
+                color,
+            );
+        }
+        for &(pc, slot) in &BLACK_PC {
+            let p = base + pc;
+            let x = keys.min.x + slot * white_w - black_w * 0.5;
+            let mut color = [0.11, 0.12, 0.15, 1.0];
+            if *held == Some(p) {
+                color = [0.95, 0.72, 0.22, 0.85];
+            }
+            ui.fill_rect(
+                Rect::from_min_size(Vec2::new(x, keys.min.y), Vec2::new(black_w, black_h)),
+                color,
+            );
+        }
+        let name = format!("C{oct}");
+        let th = (12.0 * z).max(8.0);
+        ui.text_at_size(
+            Vec2::new(rect.min.x + 4.0 * z, rect.min.y + (row_h - th) * 0.5),
+            &name,
+            th,
+        );
+        if area.hovered {
+            ui.set_mouse_cursor(CursorIcon::Pointer);
+            if ptr.down {
+                want = octave_pitch(ptr.pos, keys, base).or(want);
+            }
+        }
+    }
+    if !ptr.down {
+        want = None;
+    }
+    set_preview(tx, held, want);
+    if held.is_some() {
+        ui.request_repaint();
+    }
+}
+
 fn cell_at(grid: Rect, stride: Vec2, pos: Vec2, steps: u32, rows: u32, base: u8) -> Option<(u32, u8)> {
     if pos.x < grid.min.x || pos.y < grid.min.y || pos.x >= grid.max.x || pos.y >= grid.max.y {
         return None;
@@ -1284,6 +1391,16 @@ mod tests {
             Some((1, pitch_of_row(base, 1, SEQ_PITCHES)))
         );
         assert_eq!(cell_at(grid, stride, Vec2::new(9.0, 20.0), 16, SEQ_PITCHES, base), None);
+    }
+
+    #[test]
+    fn octave_keys_hit_c_and_csharp() {
+        let keys = Rect::from_min_size(Vec2::new(0.0, 0.0), Vec2::new(140.0, 40.0));
+        let base = octave_c(4);
+        assert_eq!(octave_pitch(Vec2::new(5.0, 30.0), keys, base), Some(60));
+        assert_eq!(octave_pitch(Vec2::new(25.0, 30.0), keys, base), Some(62));
+        assert_eq!(octave_pitch(Vec2::new(20.0, 8.0), keys, base), Some(61));
+        assert_eq!(octave_pitch(Vec2::new(-1.0, 10.0), keys, base), None);
     }
 
     #[test]

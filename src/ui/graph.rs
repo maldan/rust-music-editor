@@ -2,13 +2,13 @@ use std::sync::Arc;
 
 use glam::Vec2;
 use mega_ui::{
-    AnimationCurve, CurvePoint, CurvePreset, NodePortSide, PlotView, Ui, flat_pass_curve,
+    AnimationCurve, CurvePoint, CurvePreset, CursorIcon, NodePortSide, PlotView, Ui, flat_pass_curve,
 };
 
 use crate::compile::WAVEFORMS;
 use crate::fft::{freq_ticks, SPEC_BINS, SPEC_COLS};
 use crate::graph::{
-    port, ARP_NAMES, CHORD_NAMES, FILTER_NAMES, EqPt, GraphDoc, GraphNode, NodeKind, MIX_INS, MIX_PAN_INS,
+    port, ARP_NAMES, CHORD_NAMES, FILTER_NAMES, GATE_DIV_NAMES, EqPt, GraphDoc, GraphNode, NodeKind, MIX_INS, MIX_PAN_INS,
     MIX_VOL_INS, NOTE_JOIN_INS, SEQ_OCTAVE_MIN,
 };
 use crate::monitor::Monitor;
@@ -236,7 +236,7 @@ fn spawn_menu(
             back(ui, page);
             ui.separator();
             leaf(ui, "Oscillator", NodeKind::Osc)
-                .or_else(|| leaf(ui, "Voice", NodeKind::Voice))
+                .or_else(|| leaf(ui, "Basic Synth", NodeKind::Voice))
                 .or_else(|| leaf(ui, "Guitar", NodeKind::Guitar))
                 .or_else(|| leaf(ui, "LFO", NodeKind::Lfo))
         }
@@ -263,11 +263,13 @@ fn spawn_menu(
                 .or_else(|| leaf(ui, "Reverb", NodeKind::Reverb))
                 .or_else(|| leaf(ui, "Comp / Limit", NodeKind::Compressor))
                 .or_else(|| leaf(ui, "EQ Curve", NodeKind::Eq))
+                .or_else(|| leaf(ui, "Trance Gate", NodeKind::TranceGate))
         }
         MATH => {
             back(ui, page);
             ui.separator();
-            leaf(ui, "Multiply", NodeKind::Mul)
+            leaf(ui, "Value", NodeKind::Value)
+                .or_else(|| leaf(ui, "Multiply", NodeKind::Mul))
                 .or_else(|| leaf(ui, "Clamp", NodeKind::Clamp))
                 .or_else(|| leaf(ui, "Remap", NodeKind::Remap))
         }
@@ -328,7 +330,7 @@ fn draw_body(
         }
         NodeKind::Voice => {
             ui.node_port(NodePortSide::Input, "notes", port::NOTES);
-            ui.node_port(NodePortSide::Input, "pitch", port::AUDIO);
+            ui.node_port(NodePortSide::Input, "freq", port::AUDIO);
             ui.node_port(NodePortSide::Input, "amp", port::AUDIO);
             ui.node_port(NodePortSide::Input, "pwm", port::AUDIO);
             ui.label("Waveform");
@@ -336,7 +338,13 @@ fn draw_body(
             ui.label("Pulse width");
             ui.drag_float("pw", &mut node.pulse_width, 0.01);
             node.pulse_width = node.pulse_width.clamp(0.02, 0.98);
-            labeled_slider(ui, "Detune, cents", &mut node.detune, 0.0..=50.0);
+            ui.group("Unison", |ui| {
+                ui.horizontal(|ui| {
+                    ui.knob("Amount", &mut node.unison, 1.0..=16.0);
+                    ui.knob("Detune", &mut node.detune, 0.0..=100.0);
+                    ui.knob("Pan", &mut node.unison_pan, 0.0..=1.0);
+                });
+            });
             super::adsr::draw(ui, node);
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
@@ -386,6 +394,43 @@ fn draw_body(
             if resp.changed {
                 node.eq_pts = curve_to_eq(&curve);
             }
+            ui.node_port(NodePortSide::Output, "out", port::AUDIO);
+        }
+        NodeKind::TranceGate => {
+            ui.node_port(NodePortSide::Input, "clock", port::CLOCK);
+            ui.node_port(NodePortSide::Input, "in", port::AUDIO);
+            ui.label("Steps");
+            let ptr = ui.pointer();
+            let z = ui.scale();
+            let cell = 18.0 * z;
+            for row in 0..2 {
+                ui.horizontal(|ui| {
+                    for col in 0..8 {
+                        let i = row * 8 + col;
+                        let on = node.gate_pattern & (1u16 << i) != 0;
+                        let area = ui.area(&format!("gs{i}"), Vec2::new(cell, cell + 4.0 * z));
+                        let color = if on {
+                            [0.95, 0.72, 0.22, 1.0]
+                        } else {
+                            [0.16, 0.16, 0.18, 1.0]
+                        };
+                        ui.fill_round(area.rect.inset(1.0 * z), 2.0 * z, color);
+                        if area.hovered {
+                            ui.set_mouse_cursor(CursorIcon::Pointer);
+                            if ptr.pressed {
+                                node.gate_pattern ^= 1u16 << i;
+                            }
+                        }
+                    }
+                });
+            }
+            ui.label("Rate");
+            ui.select("gate_div", &mut node.gate_div, &GATE_DIV_NAMES);
+            ui.label("Smooth, sec");
+            ui.drag_float("gate_smooth", &mut node.gate_smooth, 0.001);
+            node.gate_smooth = node.gate_smooth.clamp(0.0, 0.08);
+            ui.knob("Wet", &mut node.gate_mix, 0.0..=1.0);
+            node.gate_mix = node.gate_mix.clamp(0.0, 1.0);
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
         NodeKind::Gain => {
@@ -545,6 +590,11 @@ fn draw_body(
             labeled_slider(ui, "Attack, sec", &mut node.comp_attack, 0.001..=0.15);
             labeled_slider(ui, "Release, sec", &mut node.comp_release, 0.02..=0.8);
             labeled_slider(ui, "Makeup", &mut node.comp_makeup, 0.5..=4.0);
+            ui.node_port(NodePortSide::Output, "out", port::AUDIO);
+        }
+        NodeKind::Value => {
+            ui.label("Value");
+            ui.drag_float("value", &mut node.value, 0.01);
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
         NodeKind::Mul => {

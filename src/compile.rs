@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use mega_audio::dsp::{
     AdsrParams, BiquadFilter, Chorus, Clamp, Compressor, Delay, Distortion, FilterKind, Flanger,
-    GainCv, Mul, Oscillator, Remap, Reverb, StereoGain, StereoJoin, StereoMixer, StereoPan, Waveform,
+    GainCv, Mul, Oscillator, Remap, Reverb, StereoGain, StereoJoin, StereoMixer, StereoPan,
+    TranceGate, Waveform, Const,
 };
 use mega_audio::graph::{Bypass, Graph, Node, NodeId, ProcessContext};
 use mega_audio::instrument::{KarplusStrong, PolyphonicInstrument};
@@ -136,7 +137,7 @@ impl Patch {
                 )
             })
             .collect();
-        expand_instruments(&mut nodes, &mut links, &project.instruments);
+        expand_instruments(&mut nodes, &mut links, &project.instruments, false);
         Project::apply_seq_notes(&mut nodes, &project.sequences);
         Self {
             playing,
@@ -210,7 +211,7 @@ fn sequence_patch(project: &Project, seq: &crate::graph::Sequence, playing: bool
         ("play".into(), "out".into(), "out".into(), "in".into()),
     ];
     if inst_ok {
-        expand_instruments(&mut nodes, &mut links, &project.instruments);
+        expand_instruments(&mut nodes, &mut links, &project.instruments, false);
     }
     Patch {
         playing,
@@ -221,8 +222,12 @@ fn sequence_patch(project: &Project, seq: &crate::graph::Sequence, playing: bool
         nodes,
         links,
         captures: HashMap::new(),
-        preview_seq: None,
+        preview_seq: Some("seq".into()),
     }
+}
+
+fn patch_audible(patch: &Patch) -> bool {
+    patch.playing || patch.preview_seq.is_some()
 }
 
 fn instrument_patch(project: &Project, inst: &Instrument, playing: bool) -> Patch {
@@ -242,14 +247,37 @@ fn instrument_patch(project: &Project, inst: &Instrument, playing: bool) -> Patc
         ("keys".into(), "notes".into(), "play".into(), "notes".into()),
         ("play".into(), "out".into(), "out".into(), "in".into()),
     ];
-    if playing {
-        nodes.insert(
-            0,
-            crate::graph::GraphNode::new("clk".into(), NodeKind::Clock, glam::Vec2::ZERO),
-        );
-        links.insert(0, ("clk".into(), "clock".into(), "keys".into(), "clock".into()));
+    expand_instruments(&mut nodes, &mut links, &project.instruments, true);
+    if project.preview_clock || playing {
+        let clock_id = if let Some(n) = nodes.iter().find(|n| n.kind == NodeKind::Clock) {
+            n.id.clone()
+        } else {
+            nodes.insert(
+                0,
+                crate::graph::GraphNode::new("clk".into(), NodeKind::Clock, glam::Vec2::ZERO),
+            );
+            "clk".into()
+        };
+        if playing && !links.iter().any(|l| l.2 == "keys" && l.3 == "clock") {
+            links.insert(
+                0,
+                (clock_id.clone(), "clock".into(), "keys".into(), "clock".into()),
+            );
+        }
+        if project.preview_clock {
+            let gates: Vec<String> = nodes
+                .iter()
+                .filter(|n| n.kind == NodeKind::TranceGate)
+                .map(|n| n.id.clone())
+                .collect();
+            for gid in gates {
+                if links.iter().any(|l| l.2 == gid && l.3 == "clock") {
+                    continue;
+                }
+                links.push((clock_id.clone(), "clock".into(), gid, "clock".into()));
+            }
+        }
     }
-    expand_instruments(&mut nodes, &mut links, &project.instruments);
     Patch {
         // Stay audible for inspector key tests even when the demo loop is stopped.
         playing: true,
@@ -266,7 +294,7 @@ fn instrument_patch(project: &Project, inst: &Instrument, playing: bool) -> Patc
 
 fn dsp_bypass(kind: NodeKind) -> Bypass {
     match kind {
-        NodeKind::Osc | NodeKind::Voice | NodeKind::Guitar | NodeKind::Lfo | NodeKind::AudioIn => {
+        NodeKind::Osc | NodeKind::Voice | NodeKind::Guitar | NodeKind::Lfo | NodeKind::AudioIn | NodeKind::Value => {
             Bypass::Mute
         }
         NodeKind::Filter
@@ -281,6 +309,7 @@ fn dsp_bypass(kind: NodeKind) -> Bypass {
         | NodeKind::Reverb
         | NodeKind::Compressor
         | NodeKind::Eq
+        | NodeKind::TranceGate
         | NodeKind::Mul
         | NodeKind::Clamp
         | NodeKind::Remap
@@ -308,9 +337,11 @@ fn dsp_kind(kind: NodeKind) -> bool {
             | NodeKind::Reverb
             | NodeKind::Compressor
             | NodeKind::Eq
+            | NodeKind::TranceGate
             | NodeKind::Mul
             | NodeKind::Clamp
             | NodeKind::Remap
+            | NodeKind::Value
             | NodeKind::Scope
             | NodeKind::Spectrum
             | NodeKind::Spectrogram
@@ -365,6 +396,7 @@ pub struct Build {
     pub dsp: HashMap<String, NodeId>,
     pub lfo_mix: HashMap<String, NodeId>,
     pub master: NodeId,
+    pub gates: Vec<NodeId>,
 }
 
 pub fn build_graph(patch: &Patch, sample_rate: f32, monitor: &Monitor) -> Build {
@@ -379,6 +411,7 @@ fn build_graph_at(patch: &Patch, sample_rate: f32, monitor: &Monitor, block_size
     let mut voices = HashMap::new();
     let mut dsp = HashMap::new();
     let mut lfo_mix_ids = HashMap::new();
+    let mut gates = Vec::new();
 
     for n in &patch.nodes {
         match n.kind {
@@ -403,11 +436,14 @@ fn build_graph_at(patch: &Patch, sample_rate: f32, monitor: &Monitor, block_size
                         voice_adsr(n),
                         n.pulse_width,
                     );
+                    inst.set_unison(n.unison.round().clamp(1.0, 16.0) as usize);
                     inst.set_detune(n.detune);
+                    inst.set_unison_pan(n.unison_pan);
                     inst
                 }));
                 voices.insert(n.id.clone(), id);
                 dsp.insert(n.id.clone(), id);
+                in_port.insert((n.id.clone(), "freq".into()), Wire::mono(id, 0));
                 in_port.insert((n.id.clone(), "pitch".into()), Wire::mono(id, 0));
                 in_port.insert((n.id.clone(), "amp".into()), Wire::mono(id, 1));
                 in_port.insert((n.id.clone(), "pwm".into()), Wire::mono(id, 2));
@@ -473,6 +509,18 @@ fn build_graph_at(patch: &Patch, sample_rate: f32, monitor: &Monitor, block_size
                 eq.set_curve(&n.eq_pairs());
                 let id = graph.add_node(Box::new(eq));
                 dsp.insert(n.id.clone(), id);
+                in_port.insert((n.id.clone(), "in".into()), Wire::stereo(id, 0, 1));
+                out_port.insert((n.id.clone(), "out".into()), Wire::stereo(id, 0, 1));
+            }
+            NodeKind::TranceGate => {
+                let mut g = TranceGate::new(sample_rate);
+                g.pattern = n.gate_pattern;
+                g.smooth = n.gate_smooth.clamp(0.0, 0.08);
+                g.mix = n.gate_mix.clamp(0.0, 1.0);
+                g.step_beats = n.gate_step_beats();
+                let id = graph.add_node(Box::new(g));
+                dsp.insert(n.id.clone(), id);
+                gates.push(id);
                 in_port.insert((n.id.clone(), "in".into()), Wire::stereo(id, 0, 1));
                 out_port.insert((n.id.clone(), "out".into()), Wire::stereo(id, 0, 1));
             }
@@ -602,6 +650,11 @@ fn build_graph_at(patch: &Patch, sample_rate: f32, monitor: &Monitor, block_size
                 in_port.insert((n.id.clone(), "in".into()), Wire::stereo(id, 0, 1));
                 out_port.insert((n.id.clone(), "out".into()), Wire::stereo(id, 0, 1));
             }
+            NodeKind::Value => {
+                let id = graph.add_node(Box::new(Const::new(n.value)));
+                dsp.insert(n.id.clone(), id);
+                out_port.insert((n.id.clone(), "out".into()), Wire::mono(id, 0));
+            }
             NodeKind::Mul => {
                 let id = graph.add_node(Box::new(Mul));
                 dsp.insert(n.id.clone(), id);
@@ -642,7 +695,7 @@ fn build_graph_at(patch: &Patch, sample_rate: f32, monitor: &Monitor, block_size
         connect_wire(&mut graph, src, dst);
     }
 
-    let master = StereoGain::new(if patch.playing { MASTER_GAIN } else { 0.0 });
+    let master = StereoGain::new(if patch_audible(patch) { MASTER_GAIN } else { 0.0 });
     let master_id = graph.add_node(Box::new(master));
 
     if let Some((from, from_p, _, _)) = patch
@@ -662,6 +715,7 @@ fn build_graph_at(patch: &Patch, sample_rate: f32, monitor: &Monitor, block_size
         dsp,
         lfo_mix: lfo_mix_ids,
         master: master_id,
+        gates,
     }
 }
 
@@ -704,6 +758,7 @@ pub struct Live {
     dsp: HashMap<String, NodeId>,
     lfo_mix: HashMap<String, NodeId>,
     master: NodeId,
+    gates: Vec<NodeId>,
     preview: NodeId,
     preview_targets: Vec<SeqTarget>,
     clocks: HashMap<String, ClockRun>,
@@ -741,6 +796,7 @@ impl Live {
             dsp: build.dsp,
             lfo_mix: build.lfo_mix,
             master: build.master,
+            gates: build.gates,
             preview,
             preview_targets: Vec::new(),
             clocks: HashMap::new(),
@@ -883,7 +939,9 @@ impl Live {
                     if let Some(inst) = graph.node_mut::<PolyphonicInstrument>(id) {
                         inst.set_adsr(voice_adsr(n));
                         inst.set_pulse_width(n.pulse_width);
+                        inst.set_unison(n.unison.round().clamp(1.0, 16.0) as usize);
                         inst.set_detune(n.detune);
+                        inst.set_unison_pan(n.unison_pan);
                     }
                 }
                 NodeKind::Guitar => {
@@ -906,6 +964,20 @@ impl Live {
                         if let Some(g) = graph.node_mut::<GainCv>(amp_id) {
                             g.gain = n.lfo_depth.max(0.0);
                         }
+                    }
+                }
+                NodeKind::Value => {
+                    if let Some(c) = graph.node_mut::<Const>(id) {
+                        c.value = n.value;
+                    }
+                }
+                NodeKind::TranceGate => {
+                    if let Some(g) = graph.node_mut::<TranceGate>(id) {
+                        g.pattern = n.gate_pattern;
+                        g.smooth = n.gate_smooth.clamp(0.0, 0.08);
+                        g.mix = n.gate_mix.clamp(0.0, 1.0);
+                        g.step_beats = n.gate_step_beats();
+                        g.armed = seq_clock_id(patch, &n.id).is_some();
                     }
                 }
                 NodeKind::Clamp => {
@@ -1034,6 +1106,7 @@ impl Live {
             self.dsp = build.dsp;
             self.lfo_mix = build.lfo_mix;
             self.master = build.master;
+            self.gates = build.gates;
             self.preview = attach_preview(graph, self.master, self.sample_rate, self.block_size);
             self.topo = topo;
             self.voice_holds.clear();
@@ -1055,7 +1128,7 @@ impl Live {
         self.sync_dsp(graph, &patch);
 
         if let Some(gain) = graph.node_mut::<StereoGain>(self.master) {
-            gain.gain = if patch.playing { MASTER_GAIN } else { 0.0 };
+            gain.gain = if patch_audible(&patch) { MASTER_GAIN } else { 0.0 };
         }
 
         self.bpm = patch.bpm.max(1.0);
@@ -1138,9 +1211,11 @@ impl Live {
     }
 
     pub fn tick_block(&mut self, graph: &mut Graph, samples: usize) {
+        let samples = samples.max(1);
+        let start = self.song_beats;
         if self.playing {
             let step = self.bpm as f64 / (self.sample_rate as f64 * 60.0);
-            self.song_beats += step * samples.max(1) as f64;
+            self.song_beats += step * samples as f64;
             let song = self.song_beats;
             for seq in self.seqs.values_mut() {
                 tick_seq(
@@ -1154,6 +1229,16 @@ impl Live {
             }
         } else {
             self.clear_taps();
+        }
+        let gates = self.gates.clone();
+        let bpm = self.bpm;
+        let playing = self.playing;
+        for id in gates {
+            if let Some(g) = graph.node_mut::<TranceGate>(id) {
+                g.beats = start;
+                g.bpm = bpm;
+                g.playing = playing;
+            }
         }
         self.publish_time();
     }
@@ -1850,6 +1935,7 @@ fn expand_instruments(
     nodes: &mut Vec<crate::graph::GraphNode>,
     links: &mut Vec<(String, String, String, String)>,
     instruments: &[crate::graph::Instrument],
+    keep_ids: bool,
 ) {
     let hosts: Vec<_> = nodes
         .iter()
@@ -1876,7 +1962,11 @@ fn expand_instruments(
         let Some(inst) = instruments.iter().find(|i| i.id == host.inst_id) else {
             continue;
         };
-        let prefix = format!("{}__", host.id);
+        let prefix = if keep_ids {
+            String::new()
+        } else {
+            format!("{}__", host.id)
+        };
         let input_id = inst.graph.input_id.as_str();
         let output_id = inst.graph.output_id.as_str();
 
@@ -2733,6 +2823,22 @@ mod tests {
         let patch = Patch::from_project(&p, true);
         assert!(!patch.nodes.iter().any(|n| n.kind == NodeKind::Instrument));
         assert!(patch.nodes.iter().any(|n| n.kind == NodeKind::Voice && n.id.starts_with("play__")));
+        assert_eq!(patch.preview_seq.as_deref(), Some("seq"));
+        let mon = Monitor::default();
+        let (live, _) = Live::new(&patch, 48_000.0, std::sync::Arc::new(mon));
+        assert!(!live.preview_targets.is_empty());
+    }
+
+    #[test]
+    fn sequence_view_preview_uses_play_voice() {
+        let mut p = crate::graph::Project::new_default();
+        p.view = crate::graph::EditorView::Sequence("s1".into());
+        let patch = Patch::from_project(&p, false);
+        assert_eq!(patch.preview_seq.as_deref(), Some("seq"));
+        assert!(!patch.playing);
+        let mon = Monitor::default();
+        let (live, _) = Live::new(&patch, 48_000.0, std::sync::Arc::new(mon));
+        assert!(!live.preview_targets.is_empty());
     }
 
     #[test]
@@ -2744,7 +2850,7 @@ mod tests {
         assert_eq!(patch.preview_seq.as_deref(), Some("keys"));
         assert!(patch.playing);
         assert!(!patch.nodes.iter().any(|n| n.kind == NodeKind::Sequencer && n.id != "keys"));
-        assert!(patch.nodes.iter().any(|n| n.kind == NodeKind::Voice && n.id.starts_with("play__")));
+        assert!(patch.nodes.iter().any(|n| n.kind == NodeKind::Voice && !n.id.starts_with("play__")));
         let mon = Monitor::default();
         let (live, _) = Live::new(&patch, 48_000.0, std::sync::Arc::new(mon));
         assert!(!live.preview_targets.is_empty());
@@ -2761,5 +2867,57 @@ mod tests {
             keys.notes.iter().map(|n| n.pitch).collect::<Vec<_>>(),
             vec![48, 60, 72]
         );
+    }
+
+    #[test]
+    fn instrument_view_keeps_scope_id() {
+        let mut p = crate::graph::Project::new_default();
+        let inst_id = p.instruments[0].id.clone();
+        let g = &mut p.instruments[0].graph;
+        let voice = g
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Voice)
+            .unwrap()
+            .id
+            .clone();
+        let scope = g.spawn_node(NodeKind::Scope, glam::Vec2::ZERO);
+        let out = g.output_id.clone();
+        g.space.links.retain(|l| l.to_node != out);
+        let _ = g.connect(&voice, "out", &scope, "in");
+        let _ = g.connect(&scope, "out", &out, "in");
+        p.view = crate::graph::EditorView::Instrument(inst_id);
+        let patch = Patch::from_project(&p, false);
+        assert!(
+            patch
+                .nodes
+                .iter()
+                .any(|n| n.kind == NodeKind::Scope && n.id == scope),
+            "scope id must match the editor node so Waveform can read the tap"
+        );
+    }
+
+    #[test]
+    fn instrument_clock_feeds_trance_gate() {
+        let mut p = crate::graph::Project::new_default();
+        let inst_id = p.instruments[0].id.clone();
+        let g = &mut p.instruments[0].graph;
+        let gate = g.spawn_node(NodeKind::TranceGate, glam::Vec2::ZERO);
+        p.view = crate::graph::EditorView::Instrument(inst_id);
+        p.preview_clock = true;
+        let patch = Patch::from_project(&p, false);
+        assert!(patch.nodes.iter().any(|n| n.kind == NodeKind::Clock));
+        assert!(
+            patch
+                .links
+                .iter()
+                .any(|l| l.2 == gate && l.3 == "clock"),
+            "preview clock must reach Trance Gate"
+        );
+        let silent = {
+            p.preview_clock = false;
+            Patch::from_project(&p, false)
+        };
+        assert!(!silent.nodes.iter().any(|n| n.kind == NodeKind::Clock));
     }
 }
