@@ -248,6 +248,9 @@ impl Project {
         if p.sequences.is_empty() {
             extract_sequences(&mut p.main, &mut p.sequences);
         }
+        for s in &mut p.sequences {
+            s.ensure_groups();
+        }
         for s in &mut p.samples {
             s.reload();
         }
@@ -283,9 +286,12 @@ fn migrate_v1(mut graph: GraphDoc) -> Project {
         pending_delete_sample: None,
         sample_seek: 0.0,
     };
-        p.sync_serials();
-        p
+    for s in &mut p.sequences {
+        s.ensure_groups();
     }
+    p.sync_serials();
+    p
+}
 
 fn extract_sequences(graph: &mut GraphDoc, sequences: &mut Vec<Sequence>) {
     let mut n = sequences.len() as u64 + 1;
@@ -302,6 +308,8 @@ fn extract_sequences(graph: &mut GraphDoc, sequences: &mut Vec<Sequence>) {
             seq_octave: node.seq_octave,
             notes: node.notes.clone(),
             play_inst: String::new(),
+            groups: vec![super::project::default_note_group(String::new())],
+            next_group: 1,
         });
         node.seq_id = id;
     }
@@ -376,6 +384,7 @@ mod tests {
                 step: 0,
                 pitch: 60,
                 len: 2,
+                group: 0,
             }];
         }
         doc.output_id = out;

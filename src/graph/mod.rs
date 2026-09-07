@@ -11,4 +11,7 @@ pub use node::{
     NodeKind, SeqNote, ARP_NAMES, BEATS_PER_BAR, BEATS_PER_STEP, CHORD_NAMES, FILTER_NAMES, GATE_DIV_NAMES,
     EqPt, MIX_INS, NOTE_JOIN_INS, SEQ_OCTAVE_MIN, SEQ_PITCHES, SEQ_STEPS,
 };
-pub use project::{EditorView, Instrument, Project, Sample, Sequence};
+pub use project::{
+    default_note_group, EditorView, Instrument, NoteGroup, Project, Sample, Sequence,
+    DEFAULT_GROUP_COLOR, DEFAULT_GROUP_ID,
+};

@@ -23,6 +23,19 @@ pub struct SeqNote {
     pub step: u32,
     pub pitch: u8,
     pub len: u32,
+    #[serde(default)]
+    pub group: u32,
+}
+
+impl Default for SeqNote {
+    fn default() -> Self {
+        Self {
+            step: 0,
+            pitch: 60,
+            len: 1,
+            group: 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -777,6 +790,7 @@ impl GraphNode {
                 step,
                 pitch,
                 len: 1,
+                group: 0,
             });
         }
     }
@@ -937,7 +951,7 @@ mod tests {
     fn toggle_note_is_one_step() {
         let mut n = GraphNode::new("n1".into(), NodeKind::Sequencer, Vec2::ZERO);
         n.toggle_note(3, 60);
-        assert_eq!(n.notes, vec![SeqNote { step: 3, pitch: 60, len: 1 }]);
+        assert_eq!(n.notes, vec![SeqNote { step: 3, pitch: 60, len: 1, group: 0 }]);
         n.toggle_note(3, 60);
         assert!(n.notes.is_empty());
     }

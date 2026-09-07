@@ -6,9 +6,22 @@ use std::sync::Arc;
 use mega_audio::sample::{peaks, AudioClip, load_audio_file};
 
 use super::doc::GraphDoc;
-use super::node::{GraphNode, NodeKind, SeqNote};
+use super::node::{GraphNode, NodeKind, SeqNote, SEQ_STEPS};
 
 const SAMPLE_PEAKS: usize = 2048;
+
+pub const DEFAULT_GROUP_ID: u32 = 0;
+pub const DEFAULT_GROUP_COLOR: [f32; 4] = [0.32, 0.72, 0.40, 1.0];
+
+const GROUP_PALETTE: [[f32; 4]; 7] = [
+    [0.28, 0.62, 0.92, 1.0],
+    [0.92, 0.62, 0.22, 1.0],
+    [0.72, 0.38, 0.92, 1.0],
+    [0.92, 0.82, 0.22, 1.0],
+    [0.22, 0.78, 0.72, 1.0],
+    [0.92, 0.38, 0.55, 1.0],
+    [0.55, 0.72, 0.28, 1.0],
+];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EditorView {
@@ -16,6 +29,36 @@ pub enum EditorView {
     Sequence(String),
     Instrument(String),
     Sample(String),
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct NoteGroup {
+    pub id: u32,
+    pub name: String,
+    #[serde(default = "default_group_color")]
+    pub color: [f32; 4],
+    #[serde(default = "default_true")]
+    pub visible: bool,
+    #[serde(default)]
+    pub play_inst: String,
+}
+
+fn default_group_color() -> [f32; 4] {
+    DEFAULT_GROUP_COLOR
+}
+
+fn default_true() -> bool {
+    true
+}
+
+pub fn default_note_group(play_inst: String) -> NoteGroup {
+    NoteGroup {
+        id: DEFAULT_GROUP_ID,
+        name: "Default".into(),
+        color: DEFAULT_GROUP_COLOR,
+        visible: true,
+        play_inst,
+    }
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -29,8 +72,17 @@ pub struct Sequence {
     #[serde(default)]
     pub notes: Vec<SeqNote>,
     /// Empty = built-in sine. Otherwise an instrument entity id.
+    /// Kept in sync with the default group's `play_inst`.
     #[serde(default)]
     pub play_inst: String,
+    #[serde(default)]
+    pub groups: Vec<NoteGroup>,
+    #[serde(default = "default_next_group")]
+    pub next_group: u32,
+}
+
+fn default_next_group() -> u32 {
+    1
 }
 
 fn default_seq_loop_bars() -> u32 {
@@ -43,6 +95,78 @@ fn default_seq_octave() -> i32 {
 impl Sequence {
     pub fn loop_bars(&self) -> u32 {
         self.seq_loop_bars.max(1)
+    }
+
+    pub fn ensure_groups(&mut self) {
+        if self.groups.is_empty() {
+            self.groups.push(default_note_group(self.play_inst.clone()));
+        } else if !self.groups.iter().any(|g| g.id == DEFAULT_GROUP_ID) {
+            self.groups.insert(0, default_note_group(self.play_inst.clone()));
+        }
+        if let Some(g) = self.groups.iter_mut().find(|g| g.id == DEFAULT_GROUP_ID) {
+            if g.play_inst.is_empty() && !self.play_inst.is_empty() {
+                g.play_inst = self.play_inst.clone();
+            }
+            self.play_inst = g.play_inst.clone();
+        }
+        let max_id = self.groups.iter().map(|g| g.id).max().unwrap_or(0);
+        self.next_group = self.next_group.max(max_id.saturating_add(1)).max(1);
+    }
+
+    pub fn group(&self, id: u32) -> Option<&NoteGroup> {
+        self.groups.iter().find(|g| g.id == id)
+    }
+
+    pub fn group_visible(&self, id: u32) -> bool {
+        self.groups
+            .iter()
+            .find(|g| g.id == id)
+            .map(|g| g.visible)
+            .unwrap_or(true)
+    }
+
+    pub fn visible_notes(&self) -> Vec<SeqNote> {
+        self.notes
+            .iter()
+            .copied()
+            .filter(|n| self.group_visible(n.group))
+            .collect()
+    }
+
+    pub fn add_group(&mut self) -> u32 {
+        self.ensure_groups();
+        let id = self.next_group.max(1);
+        self.next_group = id.saturating_add(1);
+        let color = GROUP_PALETTE[(id as usize).saturating_sub(1) % GROUP_PALETTE.len()];
+        self.groups.push(NoteGroup {
+            id,
+            name: format!("Group {id}"),
+            color,
+            visible: true,
+            play_inst: String::new(),
+        });
+        id
+    }
+
+    pub fn remove_group(&mut self, id: u32) {
+        if id == DEFAULT_GROUP_ID {
+            return;
+        }
+        self.groups.retain(|g| g.id != id);
+        for n in &mut self.notes {
+            if n.group == id {
+                n.group = DEFAULT_GROUP_ID;
+            }
+        }
+    }
+
+    pub fn set_group_play_inst(&mut self, id: u32, inst: String) {
+        if let Some(g) = self.groups.iter_mut().find(|g| g.id == id) {
+            g.play_inst = inst.clone();
+        }
+        if id == DEFAULT_GROUP_ID {
+            self.play_inst = inst;
+        }
     }
 }
 
@@ -135,12 +259,14 @@ impl Project {
                     seq_loop_bars: 1,
                     seq_octave: 4,
                     notes: vec![
-                        SeqNote { step: 0, pitch: 60, len: 1 },
-                        SeqNote { step: 4, pitch: 64, len: 1 },
-                        SeqNote { step: 8, pitch: 67, len: 1 },
-                        SeqNote { step: 12, pitch: 64, len: 1 },
+                        SeqNote { step: 0, pitch: 60, len: 1, group: 0 },
+                        SeqNote { step: 4, pitch: 64, len: 1, group: 0 },
+                        SeqNote { step: 8, pitch: 67, len: 1, group: 0 },
+                        SeqNote { step: 12, pitch: 64, len: 1, group: 0 },
                     ],
                     play_inst: String::new(),
+                    groups: vec![default_note_group(String::new())],
+                    next_group: 1,
                 },
                 Sequence {
                     id: "s2".into(),
@@ -148,12 +274,14 @@ impl Project {
                     seq_loop_bars: 1,
                     seq_octave: 4,
                     notes: vec![
-                        SeqNote { step: 2, pitch: 62, len: 1 },
-                        SeqNote { step: 6, pitch: 65, len: 1 },
-                        SeqNote { step: 10, pitch: 69, len: 1 },
-                        SeqNote { step: 14, pitch: 71, len: 1 },
+                        SeqNote { step: 2, pitch: 62, len: 1, group: 0 },
+                        SeqNote { step: 6, pitch: 65, len: 1, group: 0 },
+                        SeqNote { step: 10, pitch: 69, len: 1, group: 0 },
+                        SeqNote { step: 14, pitch: 71, len: 1, group: 0 },
                     ],
                     play_inst: String::new(),
+                    groups: vec![default_note_group(String::new())],
+                    next_group: 1,
                 },
             ],
             instruments: vec![Instrument {
@@ -187,6 +315,8 @@ impl Project {
             seq_octave: 4,
             notes: Vec::new(),
             play_inst: String::new(),
+            groups: vec![default_note_group(String::new())],
+            next_group: 1,
         });
         self.select_sequence(&id);
         id
@@ -205,6 +335,8 @@ impl Project {
                 seq_octave: t.octave,
                 notes: t.notes,
                 play_inst: String::new(),
+                groups: vec![default_note_group(String::new())],
+                next_group: 1,
             });
         }
         Ok(n)
@@ -222,6 +354,54 @@ impl Project {
             self.select_graph();
         }
         self.pending_delete_seq = None;
+    }
+
+    pub fn merge_sequence(&mut self, into_id: &str, from_id: &str) -> bool {
+        if into_id == from_id {
+            return false;
+        }
+        let Some(from_i) = self.sequences.iter().position(|s| s.id == from_id) else {
+            return false;
+        };
+        if self.sequences.iter().all(|s| s.id != into_id) {
+            return false;
+        }
+        let src = self.sequences[from_i].clone();
+        let Some(dst) = self.sequence_mut(into_id) else {
+            return false;
+        };
+        dst.ensure_groups();
+        let gid = dst.add_group();
+        let play = src
+            .groups
+            .iter()
+            .find(|g| g.id == DEFAULT_GROUP_ID)
+            .map(|g| g.play_inst.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| src.play_inst.clone());
+        if let Some(g) = dst.groups.iter_mut().find(|g| g.id == gid) {
+            g.name = src.name.clone();
+            g.play_inst = play;
+        }
+        let mut notes = src.notes;
+        for n in &mut notes {
+            n.group = gid;
+        }
+        let end = notes
+            .iter()
+            .map(|n| n.step + n.len.max(1))
+            .max()
+            .unwrap_or(0);
+        let bars = end.div_ceil(SEQ_STEPS).max(1);
+        dst.seq_loop_bars = dst.seq_loop_bars.max(src.seq_loop_bars).max(bars);
+        dst.notes.extend(notes);
+        for n in &mut self.main.nodes {
+            if n.kind == NodeKind::Sequencer && n.seq_id == from_id {
+                n.seq_id = into_id.to_string();
+            }
+        }
+        self.remove_sequence(from_id);
+        true
     }
 
     pub fn import_sample(&mut self, path: &Path) -> Result<String, String> {
@@ -269,6 +449,11 @@ impl Project {
         for s in &mut self.sequences {
             if s.play_inst == id {
                 s.play_inst.clear();
+            }
+            for g in &mut s.groups {
+                if g.play_inst == id {
+                    g.play_inst.clear();
+                }
             }
         }
         if matches!(&self.view, EditorView::Instrument(cur) if cur == id) {
@@ -374,7 +559,7 @@ impl Project {
                 continue;
             }
             if let Some(seq) = sequences.iter().find(|s| s.id == n.seq_id) {
-                n.notes = seq.notes.clone();
+                n.notes = seq.visible_notes();
                 n.seq_loop_bars = seq.seq_loop_bars;
                 n.seq_octave = seq.seq_octave;
             }
@@ -404,11 +589,22 @@ impl Project {
             s.name.hash(&mut h);
             s.seq_loop_bars.hash(&mut h);
             s.play_inst.hash(&mut h);
+            s.groups.len().hash(&mut h);
+            for g in &s.groups {
+                g.id.hash(&mut h);
+                g.name.hash(&mut h);
+                g.visible.hash(&mut h);
+                g.play_inst.hash(&mut h);
+                for c in g.color {
+                    c.to_bits().hash(&mut h);
+                }
+            }
             s.notes.len().hash(&mut h);
             for n in &s.notes {
                 n.step.hash(&mut h);
                 n.pitch.hash(&mut h);
                 n.len.hash(&mut h);
+                n.group.hash(&mut h);
             }
         }
         for i in &self.instruments {
@@ -517,5 +713,68 @@ mod tests {
                 .all(|n| n.inst_id != "i1")
         );
         assert_eq!(p.view, EditorView::Graph);
+    }
+
+    #[test]
+    fn hidden_group_notes_leave_graph_sequencer() {
+        let mut p = Project::new_default();
+        p.sequences[0].add_group();
+        let gid = p.sequences[0].groups[1].id;
+        p.sequences[0].notes[0].group = gid;
+        p.sequences[0].groups[1].visible = false;
+        let seq_id = p.sequences[0].id.clone();
+        let node = p
+            .main
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Sequencer)
+            .map(|n| n.id.clone())
+            .expect("seq node");
+        if let Some(n) = p.main.nodes.iter_mut().find(|n| n.id == node) {
+            n.seq_id = seq_id;
+        }
+        Project::apply_seq_notes(&mut p.main.nodes, &p.sequences);
+        let n = p.main.nodes.iter().find(|n| n.id == node).unwrap();
+        assert!(n.notes.iter().all(|note| note.group != gid));
+        assert!(!n.notes.is_empty());
+    }
+
+    #[test]
+    fn remove_group_moves_notes_to_default() {
+        let mut p = Project::new_default();
+        let gid = p.sequences[0].add_group();
+        p.sequences[0].notes[0].group = gid;
+        p.sequences[0].remove_group(gid);
+        assert_eq!(p.sequences[0].notes[0].group, DEFAULT_GROUP_ID);
+        assert!(p.sequences[0].groups.iter().all(|g| g.id != gid));
+        p.sequences[0].remove_group(DEFAULT_GROUP_ID);
+        assert!(p.sequences[0].groups.iter().any(|g| g.id == DEFAULT_GROUP_ID));
+    }
+
+    #[test]
+    fn merge_sequence_becomes_group() {
+        let mut p = Project::new_default();
+        let n0 = p.sequences[0].notes.len();
+        let n1 = p.sequences[1].notes.len();
+        let name = p.sequences[1].name.clone();
+        assert!(p.merge_sequence("s1", "s2"));
+        assert_eq!(p.sequences.len(), 1);
+        assert_eq!(p.sequences[0].id, "s1");
+        assert_eq!(p.sequences[0].notes.len(), n0 + n1);
+        let g = p.sequences[0]
+            .groups
+            .iter()
+            .find(|g| g.name == name)
+            .expect("merged group");
+        assert_ne!(g.id, DEFAULT_GROUP_ID);
+        assert_eq!(
+            p.sequences[0]
+                .notes
+                .iter()
+                .filter(|n| n.group == g.id)
+                .count(),
+            n1
+        );
+        assert!(!p.merge_sequence("s1", "s1"));
     }
 }

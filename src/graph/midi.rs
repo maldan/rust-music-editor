@@ -92,7 +92,12 @@ fn parse_track(track: &[midly::TrackEvent], tpq: u32, index: usize) -> Option<Mi
         let end = tick_to_step(end_tick.max(start_tick), tpq).max(start + 1);
         let step = start as u32;
         let len = (end - start).clamp(1, u32::MAX as u64) as u32;
-        notes.push(SeqNote { step, pitch, len });
+        notes.push(SeqNote {
+            step,
+            pitch,
+            len,
+            group: 0,
+        });
         last_end = last_end.max(start + u64::from(len));
         min_pitch = min_pitch.min(pitch);
     }
@@ -180,8 +185,8 @@ mod tests {
         let tracks = parse_midi(&write(vec![t0, t1])).unwrap();
         assert_eq!(tracks.len(), 2);
         assert_eq!(tracks[0].name, "Lead");
-        assert_eq!(tracks[0].notes, vec![SeqNote { step: 0, pitch: 60, len: 1 }]);
-        assert_eq!(tracks[1].notes, vec![SeqNote { step: 0, pitch: 64, len: 2 }]);
+        assert_eq!(tracks[0].notes, vec![SeqNote { step: 0, pitch: 60, len: 1, group: 0 }]);
+        assert_eq!(tracks[1].notes, vec![SeqNote { step: 0, pitch: 64, len: 2, group: 0 }]);
         assert_eq!(tracks[0].bars, 1);
     }
 

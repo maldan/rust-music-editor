@@ -10,6 +10,7 @@ use crate::ui::piano::{self, set_preview};
 
 thread_local! {
     static TEST_HELD: RefCell<Option<u8>> = const { RefCell::new(None) };
+    static MERGE_SEL: RefCell<usize> = const { RefCell::new(0) };
 }
 
 pub fn draw(
@@ -57,8 +58,12 @@ pub fn draw(
 
     match project.view.clone() {
         EditorView::Sequence(id) => {
-            let inst_ids: Vec<String> = project.instruments.iter().map(|i| i.id.clone()).collect();
-            let inst_names: Vec<String> = project.instruments.iter().map(|i| i.name.clone()).collect();
+            let others: Vec<(String, String)> = project
+                .sequences
+                .iter()
+                .filter(|s| s.id != id)
+                .map(|s| (s.id.clone(), s.name.clone()))
+                .collect();
             ui.label("Sequence");
             if let Some(seq) = project.sequence_mut(&id) {
                 ui.label("Name");
@@ -69,24 +74,24 @@ pub fn draw(
                     ui.drag_int("seq_bars", &mut bars, 1);
                     seq.seq_loop_bars = bars.max(1) as u32;
                 });
-                ui.label("Play with");
-                let mut labels: Vec<&str> = vec!["Default"];
-                for n in &inst_names {
-                    labels.push(n.as_str());
-                }
-                let mut sel = inst_ids
-                    .iter()
-                    .position(|i| *i == seq.play_inst)
-                    .map(|i| i + 1)
-                    .unwrap_or(0);
-                ui.select("seq_play_inst", &mut sel, &labels);
-                seq.play_inst = if sel == 0 {
-                    String::new()
-                } else {
-                    inst_ids[sel - 1].clone()
-                };
                 if ui.button("Delete sequence").clicked {
                     project.pending_delete_seq = Some(id.clone());
+                }
+            }
+            if !others.is_empty() {
+                ui.separator();
+                ui.label("Merge with");
+                let mut sel = MERGE_SEL.with(|s| *s.borrow());
+                if sel >= others.len() {
+                    sel = 0;
+                }
+                let labels: Vec<&str> = others.iter().map(|(_, n)| n.as_str()).collect();
+                ui.select("seq_merge", &mut sel, &labels);
+                MERGE_SEL.with(|s| *s.borrow_mut() = sel);
+                if ui.button("Merge with").clicked {
+                    if let Some((from, _)) = others.get(sel) {
+                        project.merge_sequence(&id, from);
+                    }
                 }
             }
         }

@@ -267,6 +267,7 @@ impl GraphDoc {
                 note.step.hash(&mut h);
                 note.pitch.hash(&mut h);
                 note.len.hash(&mut h);
+                note.group.hash(&mut h);
             }
             n.transpose_notes.hash(&mut h);
             n.transpose_octaves.hash(&mut h);

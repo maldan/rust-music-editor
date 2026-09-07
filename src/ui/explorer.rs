@@ -1,9 +1,9 @@
 use glam::Vec2;
 use mega_ui::{Ui, Window};
 
-use crate::graph::{EditorView, Project};
+use crate::graph::Project;
 
-pub fn draw(ui: &mut Ui, project: &mut Project, import_midi: &mut bool, import_sample: &mut bool) {
+pub fn draw(ui: &mut Ui, project: &mut Project) {
     let seqs: Vec<(String, String)> = project
         .sequences
         .iter()
@@ -39,47 +39,6 @@ pub fn draw(ui: &mut Ui, project: &mut Project, import_midi: &mut bool, import_s
         });
     });
     project.apply_tree_sel();
-
-    ui.separator();
-    if ui.button("New sequence").clicked {
-        project.add_sequence();
-    }
-    if ui.button("Import MIDI").clicked {
-        *import_midi = true;
-    }
-    let seq_id = match &project.view {
-        EditorView::Sequence(id) => Some(id.clone()),
-        _ => None,
-    };
-    ui.add_enabled(seq_id.is_some(), |ui| {
-        if ui.button("Delete sequence").clicked {
-            project.pending_delete_seq = seq_id.clone();
-        }
-    });
-    if ui.button("New instrument").clicked {
-        project.add_instrument();
-    }
-    let inst_id = match &project.view {
-        EditorView::Instrument(id) => Some(id.clone()),
-        _ => None,
-    };
-    ui.add_enabled(inst_id.is_some(), |ui| {
-        if ui.button("Delete instrument").clicked {
-            project.pending_delete_inst = inst_id.clone();
-        }
-    });
-    if ui.button("Import sample").clicked {
-        *import_sample = true;
-    }
-    let smp_id = match &project.view {
-        EditorView::Sample(id) => Some(id.clone()),
-        _ => None,
-    };
-    ui.add_enabled(smp_id.is_some(), |ui| {
-        if ui.button("Delete sample").clicked {
-            project.pending_delete_sample = smp_id.clone();
-        }
-    });
 }
 
 pub(crate) fn confirm_delete(ui: &mut Ui, project: &mut Project) {

@@ -2,6 +2,7 @@ mod adsr;
 mod explorer;
 mod export;
 mod graph;
+mod groups;
 mod inspector;
 mod piano;
 mod sample;
@@ -24,7 +25,11 @@ pub fn default_dock() -> DockState {
         DockNode::split_h(
             0.80,
             DockNode::leaf(&["Graph"]),
-            DockNode::leaf(&["Inspector"]),
+            DockNode::split_v(
+                0.62,
+                DockNode::leaf(&["Inspector"]),
+                DockNode::leaf(&["Groups"]),
+            ),
         ),
     ))
 }
@@ -54,7 +59,7 @@ impl Scene for App {
             state.save();
         }
         ui.menu_bar(|ui| {
-            ui.menu("Graph", |ui| {
+            ui.menu("File", |ui| {
                 if ui.menu_item("New").clicked() {
                     state.new_project();
                 }
@@ -67,14 +72,22 @@ impl Scene for App {
                 if ui.menu_item("Save As...").clicked() {
                     state.save_dialog();
                 }
+                if ui.menu_item("Export MP3...").clicked() {
+                    state.export_open = true;
+                }
+            });
+            ui.menu("Graph", |ui| {
+                if ui.menu_item("New sequence").clicked() {
+                    state.project.add_sequence();
+                }
+                if ui.menu_item("New instrument").clicked() {
+                    state.project.add_instrument();
+                }
                 if ui.menu_item("Import MIDI...").clicked() {
                     state.import_midi_dialog();
                 }
                 if ui.menu_item("Import Sample...").clicked() {
                     state.import_sample_dialog();
-                }
-                if ui.menu_item("Export MP3...").clicked() {
-                    state.export_open = true;
                 }
                 ui.separator();
                 if ui.menu_item("Fit view").clicked() {
@@ -96,8 +109,6 @@ impl Scene for App {
             .map(|i| (i.id.clone(), i.name.clone()))
             .collect();
 
-        let mut import_midi = false;
-        let mut import_sample = false;
         let App {
             dock,
             project,
@@ -113,11 +124,12 @@ impl Scene for App {
         let dock_size = Vec2::new(dock_size.x.max(1.0), dock_size.y.max(120.0));
 
         ui.dock_space("main", dock_size, dock, |ui, tab| match tab {
-            "Project" => explorer::draw(ui, project, &mut import_midi, &mut import_sample),
+            "Project" => explorer::draw(ui, project),
             "Graph" => draw_editor(ui, project, monitor, preview_tx, &seqs, &insts, devices),
             "Inspector" => {
                 inspector::draw(ui, project, playing, monitor, status, preview_tx);
             }
+            "Groups" => groups::draw(ui, project),
             _ => {}
         });
 
@@ -126,12 +138,7 @@ impl Scene for App {
             doc.apply_clones();
         }
         explorer::confirm_delete(ui, project);
-        if import_midi {
-            state.import_midi_dialog();
-        }
-        if import_sample {
-            state.import_sample_dialog();
-        }
+        groups::draw_modals(ui, project);
         export::draw(ui, state);
         state.sync_audio();
         true
@@ -180,7 +187,8 @@ fn draw_editor(
             let song = monitor.song_beats();
             if let Some(seq) = project.sequence_mut(&id) {
                 let bars = seq.loop_bars();
-                piano::draw_editor(ui, &id, &mut seq.notes, bars, song, preview_tx)
+                let groups = seq.groups.clone();
+                piano::draw_editor(ui, &id, &mut seq.notes, &groups, bars, song, preview_tx)
             } else {
                 None
             }

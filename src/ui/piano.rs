@@ -7,7 +7,7 @@ use mega_ui::{CursorIcon, LayoutOpts, Rect, ScrollAxes, Ui};
 
 use mega_audio::events::EventSender;
 use mega_audio::note::NoteEvent;
-use crate::graph::{GraphNode, SeqNote, BEATS_PER_STEP, SEQ_PITCHES, SEQ_STEPS};
+use crate::graph::{GraphNode, NoteGroup, SeqNote, BEATS_PER_STEP, SEQ_PITCHES, SEQ_STEPS, DEFAULT_GROUP_COLOR};
 use crate::monitor::Monitor;
 
 const NAMES: [&str; 12] = [
@@ -23,12 +23,11 @@ const ED_CELL_W: f32 = 20.0;
 const ED_CELL_H: f32 = 18.0;
 const ED_HEAD_H: f32 = 22.0;
 const GAP: f32 = 1.0;
-const HANDLE: f32 = 8.0;
+const HANDLE: f32 = 4.0;
 const FADE_SEC: f32 = 0.45;
 const ZOOM_MIN: f32 = 0.12;
 const ZOOM_MAX: f32 = 4.0;
-const NOTE_FILL: [f32; 4] = [0.32, 0.72, 0.40, 1.0];
-const NOTE_PLAY: [f32; 4] = [0.48, 0.88, 0.52, 1.0];
+const NOTE_FILL: [f32; 4] = DEFAULT_GROUP_COLOR;
 const NOTE_SEL: [f32; 4] = [0.82, 0.28, 0.32, 1.0];
 const NOTE_SEL_PLAY: [f32; 4] = [0.95, 0.42, 0.44, 1.0];
 
@@ -49,6 +48,7 @@ struct Roll {
     sel: Vec<usize>,
     header: Rect,
     view: Rect,
+    active_group: u32,
 }
 
 impl Default for Roll {
@@ -69,6 +69,7 @@ impl Default for Roll {
                 min: Vec2::ZERO,
                 max: Vec2::ZERO,
             },
+            active_group: 0,
         }
     }
 }
@@ -120,6 +121,64 @@ fn row_of_pitch(base: u8, pitch: u8, rows: u32) -> Option<u32> {
         return None;
     }
     Some((max - pitch) as u32)
+}
+
+fn group_visible(groups: &[NoteGroup], id: u32) -> bool {
+    groups
+        .iter()
+        .find(|g| g.id == id)
+        .map(|g| g.visible)
+        .unwrap_or(true)
+}
+
+fn group_color(groups: &[NoteGroup], id: u32) -> [f32; 4] {
+    groups
+        .iter()
+        .find(|g| g.id == id)
+        .map(|g| g.color)
+        .unwrap_or(NOTE_FILL)
+}
+
+fn lift(c: [f32; 4], t: f32) -> [f32; 4] {
+    [
+        c[0] + (1.0 - c[0]) * t,
+        c[1] + (1.0 - c[1]) * t,
+        c[2] + (1.0 - c[2]) * t,
+        c[3],
+    ]
+}
+
+fn note_draw_color(base: [f32; 4], selected: bool, playing: bool) -> [f32; 4] {
+    match (selected, playing) {
+        (true, true) => NOTE_SEL_PLAY,
+        (true, false) => NOTE_SEL,
+        (false, true) => lift(base, 0.35),
+        (false, false) => base,
+    }
+}
+
+fn place_group(active: u32, groups: &[NoteGroup]) -> u32 {
+    if group_visible(groups, active) {
+        return active;
+    }
+    groups
+        .iter()
+        .find(|g| g.visible)
+        .map(|g| g.id)
+        .unwrap_or(0)
+}
+
+pub fn editor_selection(id: &str) -> Vec<usize> {
+    ROLLS.with(|m| m.borrow().get(id).map(|r| r.sel.clone()).unwrap_or_default())
+}
+
+pub fn set_editor_selection(id: &str, sel: Vec<usize>, active_group: u32) {
+    ROLLS.with(|m| {
+        let mut map = m.borrow_mut();
+        let roll = map.entry(id.to_string()).or_default();
+        roll.sel = sel;
+        roll.active_group = active_group;
+    });
 }
 
 fn clamp_note(n: &mut SeqNote, steps: u32) {
@@ -230,6 +289,7 @@ fn paste_at(notes: &mut Vec<SeqNote>, clip: &[SeqNote], step: u32, pitch: u8, st
 
 fn notes_in_box(
     notes: &[SeqNote],
+    groups: &[NoteGroup],
     grid: Rect,
     stride: Vec2,
     a: Vec2,
@@ -242,6 +302,9 @@ fn notes_in_box(
     let boxr = Rect { min, max };
     let mut out = Vec::new();
     for (i, n) in notes.iter().copied().enumerate() {
+        if !group_visible(groups, n.group) {
+            continue;
+        }
         let Some(r) = note_rect(grid, stride, n, base, rows) else {
             continue;
         };
@@ -394,7 +457,7 @@ fn note_rect(grid: Rect, stride: Vec2, note: SeqNote, base: u8, rows: u32) -> Op
 }
 
 fn handle_w(r: Rect) -> f32 {
-    HANDLE.min(r.width() * 0.45).max(3.0)
+    HANDLE.min(r.width() * 0.22).max(2.0)
 }
 
 fn edge_at(r: Rect, pos: Vec2) -> Edge {
@@ -410,6 +473,7 @@ fn edge_at(r: Rect, pos: Vec2) -> Edge {
 
 fn hit_note(
     notes: &[SeqNote],
+    groups: &[NoteGroup],
     grid: Rect,
     stride: Vec2,
     pos: Vec2,
@@ -417,6 +481,9 @@ fn hit_note(
     rows: u32,
 ) -> Option<(usize, Edge)> {
     for (i, n) in notes.iter().enumerate().rev() {
+        if !group_visible(groups, n.group) {
+            continue;
+        }
         let Some(r) = note_rect(grid, stride, *n, base, rows) else {
             continue;
         };
@@ -455,13 +522,14 @@ fn resize_note(n: &mut SeqNote, step: u32, left: bool, steps: u32) {
 
 fn erase_at(
     notes: &mut Vec<SeqNote>,
+    groups: &[NoteGroup],
     grid: Rect,
     stride: Vec2,
     pos: Vec2,
     base: u8,
     rows: u32,
 ) -> bool {
-    if let Some((i, _)) = hit_note(notes, grid, stride, pos, base, rows) {
+    if let Some((i, _)) = hit_note(notes, groups, grid, stride, pos, base, rows) {
         notes.remove(i);
         true
     } else {
@@ -708,7 +776,7 @@ pub fn draw_in_node(ui: &mut Ui, node_id: &str, node: &mut GraphNode, playhead: 
     let mut roll = ROLLS.with(|m| m.borrow().get(node_id).cloned().unwrap_or_default());
 
     if area.hovered || area.active {
-        match hit_note(&node.notes, grid, g.stride, ptr.pos, base, g.rows) {
+        match hit_note(&node.notes, &[], grid, g.stride, ptr.pos, base, g.rows) {
             Some((_, Edge::Left | Edge::Right)) if !matches!(roll.drag, Some(Drag::Move { .. })) => {
                 ui.set_mouse_cursor(CursorIcon::ResizeEw);
             }
@@ -719,14 +787,14 @@ pub fn draw_in_node(ui: &mut Ui, node_id: &str, node: &mut GraphNode, playhead: 
     }
 
     if ptr.right_pressed && (area.hovered || area.active) {
-        erase_at(&mut node.notes, grid, g.stride, ptr.pos, base, g.rows);
+        erase_at(&mut node.notes, &[], grid, g.stride, ptr.pos, base, g.rows);
         roll.drag = Some(Drag::Erase);
         ui.request_repaint();
     } else if matches!(roll.drag, Some(Drag::Erase)) && ptr.right_down && area.active {
-        erase_at(&mut node.notes, grid, g.stride, ptr.pos, base, g.rows);
+        erase_at(&mut node.notes, &[], grid, g.stride, ptr.pos, base, g.rows);
         ui.request_repaint();
     } else if ptr.pressed && area.hovered {
-        match hit_note(&node.notes, grid, g.stride, ptr.pos, base, g.rows) {
+        match hit_note(&node.notes, &[], grid, g.stride, ptr.pos, base, g.rows) {
             Some((idx, edge)) if edge != Edge::Body => {
                 roll.last_len = node.notes[idx].len.max(1);
                 roll.drag = Some(Drag::Resize {
@@ -748,7 +816,12 @@ pub fn draw_in_node(ui: &mut Ui, node_id: &str, node: &mut GraphNode, playhead: 
             None => {
                 if let Some((step, pitch)) = cell_at(grid, g.stride, ptr.pos, steps, g.rows, base) {
                     let len = roll.last_len.max(1).min(steps - step);
-                    node.notes.push(SeqNote { step, pitch, len });
+                    node.notes.push(SeqNote {
+                        step,
+                        pitch,
+                        len,
+                        group: 0,
+                    });
                     roll.drag = Some(Drag::Move {
                         press_step: step,
                         press_pitch: pitch,
@@ -840,6 +913,7 @@ pub fn draw_editor(
     ui: &mut Ui,
     id: &str,
     notes: &mut Vec<SeqNote>,
+    groups: &[NoteGroup],
     loop_bars: u32,
     song_beats: f64,
     preview: &mut EventSender<NoteEvent>,
@@ -913,7 +987,7 @@ pub fn draw_editor(
                         };
 
                         if area.hovered || area.active {
-                            match hit_note(notes, grid, g.stride, ptr.pos, base, g.rows) {
+                            match hit_note(notes, groups, grid, g.stride, ptr.pos, base, g.rows) {
                                 Some((_, Edge::Left | Edge::Right))
                                     if !matches!(roll.drag, Some(Drag::Move { .. })) =>
                                 {
@@ -928,6 +1002,7 @@ pub fn draw_editor(
                         editor_interact(
                             ui,
                             notes,
+                            groups,
                             &mut roll,
                             preview,
                             area,
@@ -941,6 +1016,9 @@ pub fn draw_editor(
 
                         let grid = draw_grid(ui, rect, &g, base, false, false);
                         for (i, note) in notes.iter().copied().enumerate() {
+                            if !group_visible(groups, note.group) {
+                                continue;
+                            }
                             let Some(r) = note_rect(grid, g.stride, note, base, g.rows) else {
                                 continue;
                             };
@@ -948,12 +1026,11 @@ pub fn draw_editor(
                                 s >= note.step && s < note.step + note.len.max(1)
                             }) == Some(true);
                             let selected = sel_has(&roll.sel, i);
-                            let color = match (selected, playing) {
-                                (true, true) => NOTE_SEL_PLAY,
-                                (true, false) => NOTE_SEL,
-                                (false, true) => NOTE_PLAY,
-                                (false, false) => NOTE_FILL,
-                            };
+                            let color = note_draw_color(
+                                group_color(groups, note.group),
+                                selected,
+                                playing,
+                            );
                             ui.fill_round(r, 2.0 * g.s.min(1.5), color);
                             draw_note_handles(ui, r);
                         }
@@ -993,7 +1070,12 @@ pub fn draw_editor(
                 if keys.hovered {
                     ui.set_mouse_cursor(CursorIcon::Pointer);
                     if ptr.select_all {
-                        roll.sel = (0..notes.len()).collect();
+                        roll.sel = notes
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, n)| group_visible(groups, n.group))
+                            .map(|(i, _)| i)
+                            .collect();
                         ui.request_repaint();
                     }
                     let wheel = ui.take_scroll();
@@ -1083,6 +1165,7 @@ fn apply_h_zoom(ui: &mut Ui, old: &RollGeom, scale: f32, steps: u32, zoom: f32, 
 fn editor_interact(
     ui: &mut Ui,
     notes: &mut Vec<SeqNote>,
+    groups: &[NoteGroup],
     roll: &mut Roll,
     preview: &mut EventSender<NoteEvent>,
     area: mega_ui::Area,
@@ -1095,7 +1178,12 @@ fn editor_interact(
 ) {
     let hot = area.hovered || area.active;
     if ptr.select_all && hot {
-        roll.sel = (0..notes.len()).collect();
+        roll.sel = notes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| group_visible(groups, n.group))
+            .map(|(i, _)| i)
+            .collect();
         ui.request_repaint();
     }
     if ptr.delete && hot && !roll.sel.is_empty() {
@@ -1130,7 +1218,7 @@ fn editor_interact(
     }
 
     if ptr.right_pressed && hot {
-        if let Some((idx, _)) = hit_note(notes, grid, stride, ptr.pos, base, rows) {
+        if let Some((idx, _)) = hit_note(notes, groups, grid, stride, ptr.pos, base, rows) {
             if sel_has(&roll.sel, idx) {
                 remove_sel(notes, &mut roll.sel);
             } else {
@@ -1142,12 +1230,13 @@ fn editor_interact(
         set_preview(preview, &mut roll.preview, None);
         ui.request_repaint();
     } else if matches!(roll.drag, Some(Drag::Erase)) && ptr.right_down && area.active {
-        erase_at(notes, grid, stride, ptr.pos, base, rows);
+        erase_at(notes, groups, grid, stride, ptr.pos, base, rows);
         ui.request_repaint();
     } else if ptr.pressed && area.hovered {
-        match hit_note(notes, grid, stride, ptr.pos, base, rows) {
+        match hit_note(notes, groups, grid, stride, ptr.pos, base, rows) {
             Some((idx, edge)) if edge != Edge::Body && !ptr.ctrl => {
                 roll.last_len = notes[idx].len.max(1);
+                roll.active_group = notes[idx].group;
                 roll.sel = vec![idx];
                 roll.drag = Some(Drag::Resize {
                     idx,
@@ -1157,11 +1246,13 @@ fn editor_interact(
             }
             Some((idx, _)) if ptr.ctrl => {
                 toggle_sel(&mut roll.sel, idx);
+                roll.active_group = notes[idx].group;
                 set_preview(preview, &mut roll.preview, Some(notes[idx].pitch));
             }
             Some((idx, _)) => {
                 let n = notes[idx];
                 roll.last_len = n.len.max(1);
+                roll.active_group = n.group;
                 if !sel_has(&roll.sel, idx) {
                     roll.sel = vec![idx];
                 }
@@ -1190,7 +1281,13 @@ fn editor_interact(
                 if let Some((step, pitch)) = cell_at(grid, stride, ptr.pos, steps, rows, base)
                 {
                     let len = roll.last_len.max(1).min(steps - step);
-                    notes.push(SeqNote { step, pitch, len });
+                    let group = place_group(roll.active_group, groups);
+                    notes.push(SeqNote {
+                        step,
+                        pitch,
+                        len,
+                        group,
+                    });
                     let idx = notes.len() - 1;
                     roll.sel = vec![idx];
                     roll.drag = Some(Drag::Move {
@@ -1245,7 +1342,7 @@ fn editor_interact(
 
     if ptr.released {
         if let Some(Drag::Box { a, b }) = roll.drag.take() {
-            let hit = notes_in_box(notes, grid, stride, a, b, base, rows);
+            let hit = notes_in_box(notes, groups, grid, stride, a, b, base, rows);
             if ptr.ctrl {
                 for i in hit {
                     if !sel_has(&roll.sel, i) {
@@ -1254,6 +1351,11 @@ fn editor_interact(
                 }
             } else {
                 roll.sel = hit;
+            }
+            if let Some(&i) = roll.sel.first() {
+                if let Some(n) = notes.get(i) {
+                    roll.active_group = n.group;
+                }
             }
         } else {
             roll.drag = None;
@@ -1413,18 +1515,19 @@ mod tests {
             step: 0,
             pitch,
             len: 4,
+            group: 0,
         }];
         let r = note_rect(grid, stride, notes[0], base, SEQ_PITCHES).unwrap();
         assert_eq!(
-            hit_note(&notes, grid, stride, Vec2::new(r.max.x - 1.0, r.min.y + 2.0), base, SEQ_PITCHES),
+            hit_note(&notes, &[], grid, stride, Vec2::new(r.max.x - 1.0, r.min.y + 2.0), base, SEQ_PITCHES),
             Some((0, Edge::Right))
         );
         assert_eq!(
-            hit_note(&notes, grid, stride, Vec2::new(r.min.x + 1.0, r.min.y + 2.0), base, SEQ_PITCHES),
+            hit_note(&notes, &[], grid, stride, Vec2::new(r.min.x + 1.0, r.min.y + 2.0), base, SEQ_PITCHES),
             Some((0, Edge::Left))
         );
         assert_eq!(
-            hit_note(&notes, grid, stride, r.min + Vec2::new(r.width() * 0.5, 2.0), base, SEQ_PITCHES),
+            hit_note(&notes, &[], grid, stride, r.min + Vec2::new(r.width() * 0.5, 2.0), base, SEQ_PITCHES),
             Some((0, Edge::Body))
         );
     }
@@ -1435,6 +1538,7 @@ mod tests {
             step: 4,
             pitch: 60,
             len: 4,
+            group: 0,
         };
         resize_note(&mut n, 10, false, 16);
         assert_eq!(n.step, 4);
@@ -1450,6 +1554,7 @@ mod tests {
             step: 14,
             pitch: 60,
             len: 8,
+            group: 0,
         };
         clamp_note(&mut n, 16);
         assert_eq!(n.step, 14);
@@ -1474,8 +1579,8 @@ mod tests {
     #[test]
     fn group_shift_stays_in_grid() {
         let mut notes = vec![
-            SeqNote { step: 0, pitch: 60, len: 2 },
-            SeqNote { step: 2, pitch: 64, len: 2 },
+            SeqNote { step: 0, pitch: 60, len: 2, group: 0 },
+            SeqNote { step: 2, pitch: 64, len: 2, group: 0 },
         ];
         let orig = vec![(0, 0, 60), (1, 2, 64)];
         shift_sel(&mut notes, &orig, -4, -2, 16);
@@ -1495,14 +1600,14 @@ mod tests {
     #[test]
     fn paste_at_cursor_keeps_shape() {
         let clip = vec![
-            SeqNote { step: 4, pitch: 60, len: 2 },
-            SeqNote { step: 6, pitch: 64, len: 1 },
+            SeqNote { step: 4, pitch: 60, len: 2, group: 0 },
+            SeqNote { step: 6, pitch: 64, len: 1, group: 0 },
         ];
         let mut notes = Vec::new();
         let sel = paste_at(&mut notes, &clip, 8, 72, 32);
         assert_eq!(sel, vec![0, 1]);
-        assert_eq!(notes[0], SeqNote { step: 8, pitch: 72, len: 2 });
-        assert_eq!(notes[1], SeqNote { step: 10, pitch: 76, len: 1 });
+        assert_eq!(notes[0], SeqNote { step: 8, pitch: 72, len: 2, group: 0 });
+        assert_eq!(notes[1], SeqNote { step: 10, pitch: 76, len: 1, group: 0 });
     }
 
     #[test]
@@ -1539,12 +1644,36 @@ mod tests {
             step: 0,
             pitch: 60,
             len: 1,
+            group: 0,
         };
         let r = note_rect(grid, stride, note, EDITOR_BASE, EDITOR_ROWS).unwrap();
         let row = row_of_pitch(EDITOR_BASE, 60, EDITOR_ROWS).unwrap();
         assert_eq!(r.min.y, row as f32 * stride.y);
-        assert!(hit_note(&[note], grid, stride, r.min + Vec2::new(2.0, 2.0), EDITOR_BASE, EDITOR_ROWS).is_some());
+        assert!(hit_note(&[note], &[], grid, stride, r.min + Vec2::new(2.0, 2.0), EDITOR_BASE, EDITOR_ROWS).is_some());
         assert!(note_rect(grid, stride, note, EDITOR_BASE, SEQ_PITCHES).is_none());
+    }
+
+    #[test]
+    fn hidden_group_notes_are_not_hittable() {
+        let grid = Rect::from_min_size(Vec2::ZERO, Vec2::new(200.0, 200.0));
+        let stride = Vec2::new(12.0, 11.0);
+        let base = 60;
+        let pitch = pitch_of_row(base, 2, SEQ_PITCHES);
+        let notes = vec![SeqNote {
+            step: 0,
+            pitch,
+            len: 4,
+            group: 1,
+        }];
+        let groups = [crate::graph::NoteGroup {
+            id: 1,
+            name: "G".into(),
+            color: NOTE_FILL,
+            visible: false,
+            play_inst: String::new(),
+        }];
+        let r = note_rect(grid, stride, notes[0], base, SEQ_PITCHES).unwrap();
+        assert!(hit_note(&notes, &groups, grid, stride, r.min + Vec2::new(2.0, 2.0), base, SEQ_PITCHES).is_none());
     }
 
     #[test]

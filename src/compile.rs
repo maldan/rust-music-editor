@@ -199,33 +199,104 @@ impl Patch {
 }
 
 fn sequence_patch(project: &Project, seq: &crate::graph::Sequence, playing: bool) -> Patch {
-    let clock = crate::graph::GraphNode::new("clk".into(), NodeKind::Clock, glam::Vec2::ZERO);
-    let mut seq_n = crate::graph::GraphNode::new("seq".into(), NodeKind::Sequencer, glam::Vec2::ZERO);
-    seq_n.seq_loop_bars = seq.seq_loop_bars;
-    seq_n.seq_octave = seq.seq_octave;
-    seq_n.notes = seq.notes.clone();
-
-    let inst_ok = !seq.play_inst.is_empty()
-        && project.instruments.iter().any(|i| i.id == seq.play_inst);
-    let play = if inst_ok {
-        let mut n = crate::graph::GraphNode::new("play".into(), NodeKind::Instrument, glam::Vec2::ZERO);
-        n.inst_id = seq.play_inst.clone();
-        n
+    let groups = if seq.groups.is_empty() {
+        vec![crate::graph::default_note_group(seq.play_inst.clone())]
     } else {
-        let mut n = crate::graph::GraphNode::new("play".into(), NodeKind::Voice, glam::Vec2::ZERO);
-        n.waveform = 0;
-        n
+        seq.groups.clone()
     };
-
+    let clock = crate::graph::GraphNode::new("clk".into(), NodeKind::Clock, glam::Vec2::ZERO);
     let out = crate::graph::GraphNode::new("out".into(), NodeKind::Output, glam::Vec2::ZERO);
-    let mut nodes = vec![clock, seq_n, play, out];
-    let mut links = vec![
-        ("clk".into(), "clock".into(), "seq".into(), "clock".into()),
-        ("clk".into(), "clock".into(), "play".into(), "clock".into()),
-        ("seq".into(), "notes".into(), "play".into(), "notes".into()),
-        ("play".into(), "out".into(), "out".into(), "in".into()),
-    ];
-    if inst_ok {
+    let mut nodes = vec![clock];
+    let mut links: Vec<(String, String, String, String)> = Vec::new();
+    let mut plays: Vec<String> = Vec::new();
+    let mut any_inst = false;
+
+    let def = groups.iter().find(|g| g.id == crate::graph::DEFAULT_GROUP_ID);
+    let def_visible = def.map(|g| g.visible).unwrap_or(true);
+    let def_inst = def
+        .map(|g| g.play_inst.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(seq.play_inst.as_str());
+    let mut lanes: Vec<(String, Vec<SeqNote>, String)> = vec![(
+        String::new(),
+        if def_visible {
+            seq.notes
+                .iter()
+                .copied()
+                .filter(|n| n.group == crate::graph::DEFAULT_GROUP_ID)
+                .collect()
+        } else {
+            Vec::new()
+        },
+        def_inst.to_string(),
+    )];
+    for g in &groups {
+        if g.id == crate::graph::DEFAULT_GROUP_ID || !g.visible {
+            continue;
+        }
+        let notes: Vec<SeqNote> = seq.notes.iter().copied().filter(|n| n.group == g.id).collect();
+        if notes.is_empty() {
+            continue;
+        }
+        if lanes.len() >= MIX_INS.len() {
+            break;
+        }
+        lanes.push((g.id.to_string(), notes, g.play_inst.clone()));
+    }
+
+    for (suffix, notes, inst) in lanes {
+        let seq_id = if suffix.is_empty() {
+            "seq".to_string()
+        } else {
+            format!("seq{suffix}")
+        };
+        let play_id = if suffix.is_empty() {
+            "play".to_string()
+        } else {
+            format!("play{suffix}")
+        };
+        let mut seq_n = crate::graph::GraphNode::new(seq_id.clone(), NodeKind::Sequencer, glam::Vec2::ZERO);
+        seq_n.seq_loop_bars = seq.seq_loop_bars;
+        seq_n.seq_octave = seq.seq_octave;
+        seq_n.notes = notes;
+        let inst_ok = !inst.is_empty() && project.instruments.iter().any(|i| i.id == inst);
+        let play = if inst_ok {
+            let mut n = crate::graph::GraphNode::new(play_id.clone(), NodeKind::Instrument, glam::Vec2::ZERO);
+            n.inst_id = inst;
+            n
+        } else {
+            let mut n = crate::graph::GraphNode::new(play_id.clone(), NodeKind::Voice, glam::Vec2::ZERO);
+            n.waveform = 0;
+            n
+        };
+        links.push(("clk".into(), "clock".into(), seq_id.clone(), "clock".into()));
+        links.push(("clk".into(), "clock".into(), play_id.clone(), "clock".into()));
+        links.push((seq_id, "notes".into(), play_id.clone(), "notes".into()));
+        nodes.push(seq_n);
+        nodes.push(play);
+        plays.push(play_id);
+        any_inst |= inst_ok;
+    }
+
+    if plays.len() == 1 {
+        links.push((plays[0].clone(), "out".into(), "out".into(), "in".into()));
+        nodes.push(out);
+    } else {
+        let mix = crate::graph::GraphNode::new("mix".into(), NodeKind::Mixer, glam::Vec2::ZERO);
+        for (i, play) in plays.iter().enumerate() {
+            links.push((
+                play.clone(),
+                "out".into(),
+                "mix".into(),
+                MIX_INS[i].to_string(),
+            ));
+        }
+        links.push(("mix".into(), "out".into(), "out".into(), "in".into()));
+        nodes.push(mix);
+        nodes.push(out);
+    }
+
+    if any_inst {
         expand_instruments(&mut nodes, &mut links, &project.instruments, false);
     }
     Patch {
@@ -250,9 +321,9 @@ fn instrument_patch(project: &Project, inst: &Instrument, playing: bool) -> Patc
     let mut keys = crate::graph::GraphNode::new("keys".into(), NodeKind::Sequencer, glam::Vec2::ZERO);
     if playing {
         keys.notes = vec![
-            SeqNote { step: 0, pitch: 48, len: 4 },
-            SeqNote { step: 4, pitch: 60, len: 4 },
-            SeqNote { step: 8, pitch: 72, len: 4 },
+            SeqNote { step: 0, pitch: 48, len: 4, group: 0 },
+            SeqNote { step: 4, pitch: 60, len: 4, group: 0 },
+            SeqNote { step: 8, pitch: 72, len: 4, group: 0 },
         ];
     }
     let clock = crate::graph::GraphNode::new("clk".into(), NodeKind::Clock, glam::Vec2::ZERO);
@@ -2580,6 +2651,7 @@ mod tests {
             step: 0,
             pitch: 60,
             len: 4,
+            group: 0,
         }];
         let song = 0.1;
         assert!(sounding_at(
@@ -2605,12 +2677,14 @@ mod tests {
                 step: (i * 3) % 32,
                 pitch: 40 + (i % 20) as u8,
                 len: 1 + (i % 5) as u32,
+                group: 0,
             })
             .collect();
         notes.push(SeqNote {
             step: 30,
             pitch: 72,
             len: 8,
+            group: 0,
         });
         let targets = [SeqTarget {
             voice,
@@ -3263,6 +3337,27 @@ mod tests {
         let mon = Monitor::default();
         let (live, _) = Live::new(&patch, 48_000.0, std::sync::Arc::new(mon));
         assert!(!live.preview_targets.is_empty());
+    }
+
+    #[test]
+    fn sequence_view_skips_hidden_group_and_mixes_instruments() {
+        let mut p = crate::graph::Project::new_default();
+        p.add_instrument();
+        let gid = p.sequences[0].add_group();
+        p.sequences[0].notes[0].group = gid;
+        p.sequences[0].set_group_play_inst(gid, p.instruments[1].id.clone());
+        p.sequences[0].groups[0].visible = false;
+        p.view = crate::graph::EditorView::Sequence("s1".into());
+        let patch = Patch::from_project(&p, true);
+        let seq = patch.nodes.iter().find(|n| n.id == "seq").unwrap();
+        assert!(seq.notes.is_empty());
+        let extra = patch
+            .nodes
+            .iter()
+            .find(|n| n.id == format!("seq{gid}"))
+            .unwrap();
+        assert_eq!(extra.notes.len(), 1);
+        assert!(patch.nodes.iter().any(|n| n.kind == NodeKind::Mixer));
     }
 
     #[test]
