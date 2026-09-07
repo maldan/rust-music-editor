@@ -219,6 +219,7 @@ impl GraphDoc {
             n.unison.to_bits().hash(&mut h);
             n.detune.to_bits().hash(&mut h);
             n.unison_pan.to_bits().hash(&mut h);
+            n.pitch.to_bits().hash(&mut h);
             n.value.to_bits().hash(&mut h);
             n.gate_pattern.hash(&mut h);
             n.gate_smooth.to_bits().hash(&mut h);

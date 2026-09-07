@@ -8,12 +8,12 @@ use std::sync::Arc;
 
 use mega_audio::dsp::{
     AdsrParams, BiquadFilter, Chorus, Clamp, Compressor, Delay, Distortion, FilterKind, Flanger,
-    GainCv, Mul, Oscillator, Remap, Reverb, StereoGain, StereoJoin, StereoMixer, StereoPan,
+    GainCv, Mul, Oscillator, Remap, Reverb, Slew, StereoGain, StereoJoin, StereoMixer, StereoPan,
     TranceGate, Waveform, Const,
 };
 use mega_audio::graph::{Bypass, Graph, Node, NodeId, ProcessContext};
 use mega_audio::instrument::{AdditivePiano, AnalogDrums, KarplusStrong, PolyphonicInstrument};
-use mega_audio::note::NoteEvent;
+use mega_audio::note::{midi_to_freq, NoteEvent};
 use mega_audio::sample::{AudioClip, SamplePlayer};
 use mega_audio::{CaptureSource, CaptureTap};
 
@@ -320,9 +320,18 @@ fn fill_clips(patch: &mut Patch, samples: &[crate::graph::Sample]) {
 
 fn dsp_bypass(kind: NodeKind) -> Bypass {
     match kind {
-        NodeKind::Osc | NodeKind::Voice | NodeKind::Guitar | NodeKind::Piano | NodeKind::Drums | NodeKind::Lfo | NodeKind::AudioIn | NodeKind::Value | NodeKind::Sample => {
-            Bypass::Mute
-        }
+        NodeKind::Osc
+        | NodeKind::Voice
+        | NodeKind::Guitar
+        | NodeKind::Piano
+        | NodeKind::Drums
+        | NodeKind::Lfo
+        | NodeKind::AudioIn
+        | NodeKind::Value
+        | NodeKind::Sample
+        | NodeKind::NoteGate
+        | NodeKind::NoteHold
+        | NodeKind::NoteFreq => Bypass::Mute,
         NodeKind::Filter
         | NodeKind::Gain
         | NodeKind::Pan
@@ -339,6 +348,8 @@ fn dsp_bypass(kind: NodeKind) -> Bypass {
         | NodeKind::Mul
         | NodeKind::Clamp
         | NodeKind::Remap
+        | NodeKind::Smooth
+        | NodeKind::Readout
         | NodeKind::Scope
         | NodeKind::Spectrum
         | NodeKind::Spectrogram => Bypass::Thru,
@@ -367,7 +378,12 @@ fn dsp_kind(kind: NodeKind) -> bool {
             | NodeKind::Mul
             | NodeKind::Clamp
             | NodeKind::Remap
+            | NodeKind::Smooth
             | NodeKind::Value
+            | NodeKind::Readout
+            | NodeKind::NoteGate
+            | NodeKind::NoteHold
+            | NodeKind::NoteFreq
             | NodeKind::Scope
             | NodeKind::Spectrum
             | NodeKind::Spectrogram
@@ -468,6 +484,7 @@ fn build_graph_at(patch: &Patch, sample_rate: f32, monitor: &Monitor, block_size
                     inst.set_unison(n.unison.round().clamp(1.0, 16.0) as usize);
                     inst.set_detune(n.detune);
                     inst.set_unison_pan(n.unison_pan);
+                    inst.set_pitch(n.pitch);
                     inst
                 }));
                 voices.insert(n.id.clone(), id);
@@ -632,6 +649,14 @@ fn build_graph_at(patch: &Patch, sample_rate: f32, monitor: &Monitor, block_size
                 in_port.insert((n.id.clone(), "in".into()), Wire::stereo(id, 0, 1));
                 out_port.insert((n.id.clone(), "out".into()), Wire::stereo(id, 0, 1));
             }
+            NodeKind::Readout => {
+                let id = graph.add_node(Box::new(MeterTap {
+                    slot: monitor.meter_slot(&n.id),
+                }));
+                dsp.insert(n.id.clone(), id);
+                in_port.insert((n.id.clone(), "in".into()), Wire::mono(id, 0));
+                out_port.insert((n.id.clone(), "out".into()), Wire::mono(id, 0));
+            }
             NodeKind::Spectrum | NodeKind::Spectrogram => {
                 let tap = FftTap::new(monitor.fft_buf(&n.id), sample_rate);
                 let id = graph.add_node(Box::new(tap));
@@ -701,6 +726,23 @@ fn build_graph_at(patch: &Patch, sample_rate: f32, monitor: &Monitor, block_size
             NodeKind::Value => {
                 let id = graph.add_node(Box::new(Const::new(n.value)));
                 dsp.insert(n.id.clone(), id);
+                out_port.insert((n.id.clone(), "out".into()), Wire::mono(id, 0));
+            }
+            NodeKind::NoteGate | NodeKind::NoteHold | NodeKind::NoteFreq => {
+                let kind = match n.kind {
+                    NodeKind::NoteHold => NoteCvKind::Hold,
+                    NodeKind::NoteFreq => NoteCvKind::Freq,
+                    _ => NoteCvKind::Gate,
+                };
+                let id = graph.add_node(Box::new(NoteCv::new(kind)));
+                voices.insert(n.id.clone(), id);
+                dsp.insert(n.id.clone(), id);
+                out_port.insert((n.id.clone(), "out".into()), Wire::mono(id, 0));
+            }
+            NodeKind::Smooth => {
+                let id = graph.add_node(Box::new(Slew::new(n.smooth_ms.max(0.0) / 1000.0)));
+                dsp.insert(n.id.clone(), id);
+                in_port.insert((n.id.clone(), "in".into()), Wire::mono(id, 0));
                 out_port.insert((n.id.clone(), "out".into()), Wire::mono(id, 0));
             }
             NodeKind::Mul => {
@@ -991,6 +1033,7 @@ impl Live {
                         inst.set_unison(n.unison.round().clamp(1.0, 16.0) as usize);
                         inst.set_detune(n.detune);
                         inst.set_unison_pan(n.unison_pan);
+                        inst.set_pitch(n.pitch);
                     }
                 }
                 NodeKind::Guitar => {
@@ -1023,6 +1066,11 @@ impl Live {
                 NodeKind::Value => {
                     if let Some(c) = graph.node_mut::<Const>(id) {
                         c.value = n.value;
+                    }
+                }
+                NodeKind::Smooth => {
+                    if let Some(s) = graph.node_mut::<Slew>(id) {
+                        s.time = n.smooth_ms.max(0.0) / 1000.0;
                     }
                 }
                 NodeKind::TranceGate => {
@@ -1279,6 +1327,7 @@ impl Live {
             seq.need_init = true;
         }
         self.voice_holds.clear();
+        panic_instruments(graph, &self.voices);
     }
 
     pub fn tick(&mut self, graph: &mut Graph) {
@@ -1718,6 +1767,124 @@ fn sounding_at(song: f64, on: f64, off: f64, period: f64, dur: f64) -> bool {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NoteCvKind {
+    Gate,
+    Hold,
+    Freq,
+}
+
+struct NoteCv {
+    kind: NoteCvKind,
+    counts: [u8; 128],
+    n_held: u32,
+    last: u8,
+    hold: f32,
+}
+
+impl NoteCv {
+    fn new(kind: NoteCvKind) -> Self {
+        Self {
+            kind,
+            counts: [0; 128],
+            n_held: 0,
+            last: 60,
+            hold: 0.0,
+        }
+    }
+
+    fn handle_event(&mut self, event: NoteEvent) {
+        match event {
+            NoteEvent::NoteOn { note, .. } => {
+                let i = note as usize;
+                if self.counts[i] == 0 {
+                    self.n_held += 1;
+                    if self.n_held == 1 {
+                        self.hold = 0.0;
+                    }
+                }
+                self.counts[i] = self.counts[i].saturating_add(1);
+                self.last = note;
+            }
+            NoteEvent::NoteOff { note } => {
+                let i = note as usize;
+                if self.counts[i] == 0 {
+                    return;
+                }
+                self.counts[i] -= 1;
+                if self.counts[i] == 0 {
+                    self.n_held = self.n_held.saturating_sub(1);
+                    if self.n_held == 0 {
+                        self.hold = 0.0;
+                    } else if self.last == note {
+                        self.last = self.highest_held().unwrap_or(self.last);
+                    }
+                }
+            }
+        }
+    }
+
+    fn highest_held(&self) -> Option<u8> {
+        self.counts.iter().rposition(|&c| c > 0).map(|i| i as u8)
+    }
+
+    fn panic(&mut self) {
+        self.counts = [0; 128];
+        self.n_held = 0;
+        self.hold = 0.0;
+    }
+
+    fn value(&self) -> f32 {
+        if self.n_held == 0 {
+            return 0.0;
+        }
+        match self.kind {
+            NoteCvKind::Gate => 1.0,
+            NoteCvKind::Hold => self.hold,
+            NoteCvKind::Freq => midi_to_freq(self.last),
+        }
+    }
+}
+
+impl Node for NoteCv {
+    fn num_inputs(&self) -> usize {
+        0
+    }
+
+    fn num_outputs(&self) -> usize {
+        1
+    }
+
+    fn process(&mut self, ctx: &ProcessContext, _inputs: &[&[f32]], outputs: &mut [&mut [f32]]) {
+        let out = &mut outputs[0];
+        let dt = 1.0 / ctx.sample_rate.max(1.0);
+        for i in 0..ctx.block_size {
+            if self.kind == NoteCvKind::Hold && self.n_held > 0 {
+                self.hold += dt;
+            }
+            out[i] = self.value();
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "NoteCv"
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+fn panic_instruments(graph: &mut Graph, voices: &HashMap<String, NodeId>) {
+    for &id in voices.values() {
+        if let Some(inst) = graph.node_mut::<PolyphonicInstrument>(id) {
+            inst.panic();
+        } else if let Some(cv) = graph.node_mut::<NoteCv>(id) {
+            cv.panic();
+        }
+    }
+}
+
 fn emit_voice(graph: &mut Graph, id: NodeId, event: NoteEvent) {
     if let Some(inst) = graph.node_mut::<PolyphonicInstrument>(id) {
         inst.handle_event(event);
@@ -1727,6 +1894,8 @@ fn emit_voice(graph: &mut Graph, id: NodeId, event: NoteEvent) {
         pno.handle_event(event);
     } else if let Some(drm) = graph.node_mut::<AnalogDrums>(id) {
         drm.handle_event(event);
+    } else if let Some(cv) = graph.node_mut::<NoteCv>(id) {
+        cv.handle_event(event);
     }
 }
 
@@ -1756,6 +1925,46 @@ fn voice_note(
                 emit_voice(graph, id, NoteEvent::NoteOff { note });
             }
         }
+    }
+}
+
+struct MeterTap {
+    slot: Arc<AtomicU32>,
+}
+
+impl Node for MeterTap {
+    fn num_inputs(&self) -> usize {
+        1
+    }
+
+    fn num_outputs(&self) -> usize {
+        1
+    }
+
+    fn process(&mut self, ctx: &ProcessContext, inputs: &[&[f32]], outputs: &mut [&mut [f32]]) {
+        let n = ctx.block_size;
+        let inp = inputs.first().copied().unwrap_or(&[]);
+        if let Some(out) = outputs.get_mut(0) {
+            let k = n.min(inp.len()).min(out.len());
+            out[..k].copy_from_slice(&inp[..k]);
+            if k < out.len() {
+                out[k..].fill(0.0);
+            }
+        }
+        let last = if n == 0 {
+            0.0
+        } else {
+            inp.get(n - 1).copied().unwrap_or(0.0)
+        };
+        self.slot.store(last.to_bits(), Ordering::Relaxed);
+    }
+
+    fn name(&self) -> &'static str {
+        "Meter"
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
     }
 }
 
@@ -2204,7 +2413,18 @@ fn seq_routes(
                 continue;
             }
             match (kind_of(to), to_p.as_str()) {
-                (Some(NodeKind::Voice | NodeKind::Guitar | NodeKind::Piano | NodeKind::Drums), "notes") => {
+                (
+                    Some(
+                        NodeKind::Voice
+                        | NodeKind::Guitar
+                        | NodeKind::Piano
+                        | NodeKind::Drums
+                        | NodeKind::NoteGate
+                        | NodeKind::NoteHold
+                        | NodeKind::NoteFreq,
+                    ),
+                    "notes",
+                ) => {
                     if let Some(&id) = voices.get(to) {
                         out.push(SeqTarget {
                             voice: id,
@@ -2526,6 +2746,77 @@ mod tests {
     }
 
     #[test]
+    fn note_cv_is_seq_target() {
+        let seq = crate::graph::GraphNode::new("seq".into(), NodeKind::Sequencer, glam::Vec2::ZERO);
+        let gate = crate::graph::GraphNode::new("gate".into(), NodeKind::NoteGate, glam::Vec2::ZERO);
+        let patch = patch_with(vec![seq, gate], vec![("seq", "notes", "gate", "notes")]);
+        let mon = Monitor::default();
+        let build = build_graph(&patch, 48_000.0, &mon);
+        assert!(build.dsp.contains_key("gate"));
+        let (targets, _) = seq_routes(&patch, "seq", &build.voices);
+        assert_eq!(targets.len(), 1);
+    }
+
+    #[test]
+    fn note_cv_gate_hold_freq() {
+        let ctx = ProcessContext {
+            sample_rate: 100.0,
+            block_size: 1,
+        };
+        let mut gate = NoteCv::new(NoteCvKind::Gate);
+        let mut hold = NoteCv::new(NoteCvKind::Hold);
+        let mut freq = NoteCv::new(NoteCvKind::Freq);
+        let mut o = [0.0f32];
+        gate.process(&ctx, &[], &mut [&mut o]);
+        assert_eq!(o[0], 0.0);
+        gate.handle_event(NoteEvent::NoteOn {
+            note: 60,
+            velocity: 1.0,
+        });
+        hold.handle_event(NoteEvent::NoteOn {
+            note: 60,
+            velocity: 1.0,
+        });
+        freq.handle_event(NoteEvent::NoteOn {
+            note: 69,
+            velocity: 1.0,
+        });
+        gate.process(&ctx, &[], &mut [&mut o]);
+        assert_eq!(o[0], 1.0);
+        for _ in 0..50 {
+            hold.process(&ctx, &[], &mut [&mut o]);
+        }
+        assert!((o[0] - 0.5).abs() < 1e-4, "hold {}", o[0]);
+        freq.process(&ctx, &[], &mut [&mut o]);
+        assert!((o[0] - 440.0).abs() < 0.01);
+        hold.handle_event(NoteEvent::NoteOff { note: 60 });
+        hold.process(&ctx, &[], &mut [&mut o]);
+        assert_eq!(o[0], 0.0);
+        freq.handle_event(NoteEvent::NoteOff { note: 69 });
+        freq.process(&ctx, &[], &mut [&mut o]);
+        assert_eq!(o[0], 0.0);
+    }
+
+    #[test]
+    fn readout_stores_last_sample() {
+        let mon = Monitor::default();
+        let node = crate::graph::GraphNode::new("r".into(), NodeKind::Readout, glam::Vec2::ZERO);
+        let patch = patch_with(vec![node], vec![]);
+        let mut build = build_graph(&patch, 48_000.0, &mon);
+        let id = *build.dsp.get("r").expect("readout dsp");
+        let tap = build.graph.node_mut::<MeterTap>(id).expect("meter tap");
+        let ctx = ProcessContext {
+            sample_rate: 48_000.0,
+            block_size: 3,
+        };
+        let inp = [0.1f32, 0.2, 0.5];
+        let mut out = [0.0f32; 3];
+        tap.process(&ctx, &[&inp], &mut [&mut out]);
+        assert_eq!(out, inp);
+        assert!((mon.meter_value("r") - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
     fn notes_link_does_not_rebuild_dsp_topo() {
         let voice = crate::graph::GraphNode::new("voice".into(), NodeKind::Voice, glam::Vec2::ZERO);
         let seq = crate::graph::GraphNode::new("seq".into(), NodeKind::Sequencer, glam::Vec2::ZERO);
@@ -2681,8 +2972,10 @@ mod tests {
     fn spectrum_nodes_are_thru_dsp() {
         assert!(dsp_kind(NodeKind::Spectrum));
         assert!(dsp_kind(NodeKind::Spectrogram));
+        assert!(dsp_kind(NodeKind::Readout));
         assert_eq!(dsp_bypass(NodeKind::Spectrum), Bypass::Thru);
         assert_eq!(dsp_bypass(NodeKind::Spectrogram), Bypass::Thru);
+        assert_eq!(dsp_bypass(NodeKind::Readout), Bypass::Thru);
         let spec = crate::graph::GraphNode::new("s".into(), NodeKind::Spectrum, glam::Vec2::ZERO);
         let gram = crate::graph::GraphNode::new("g".into(), NodeKind::Spectrogram, glam::Vec2::ZERO);
         let patch = patch_with(vec![spec, gram], vec![]);

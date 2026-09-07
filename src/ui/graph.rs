@@ -263,6 +263,9 @@ fn spawn_menu(
                 .or_else(|| leaf(ui, "Chord", NodeKind::Chord))
                 .or_else(|| leaf(ui, "Arp", NodeKind::Arp))
                 .or_else(|| leaf(ui, "Notes", NodeKind::NoteScope))
+                .or_else(|| leaf(ui, "Note Gate", NodeKind::NoteGate))
+                .or_else(|| leaf(ui, "Note Hold", NodeKind::NoteHold))
+                .or_else(|| leaf(ui, "Note Freq", NodeKind::NoteFreq))
         }
         SYNTH => {
             back(ui, page);
@@ -303,9 +306,11 @@ fn spawn_menu(
             back(ui, page);
             ui.separator();
             leaf(ui, "Value", NodeKind::Value)
+                .or_else(|| leaf(ui, "Readout", NodeKind::Readout))
                 .or_else(|| leaf(ui, "Multiply", NodeKind::Mul))
                 .or_else(|| leaf(ui, "Clamp", NodeKind::Clamp))
                 .or_else(|| leaf(ui, "Remap", NodeKind::Remap))
+                .or_else(|| leaf(ui, "Smooth", NodeKind::Smooth))
         }
         _ => {
             if !instrument_graph {
@@ -407,6 +412,9 @@ fn draw_body(
             ui.label("Pulse width");
             ui.drag_float("pw", &mut node.pulse_width, 0.01);
             node.pulse_width = node.pulse_width.clamp(0.02, 0.98);
+            ui.label("Pitch");
+            ui.drag_float("pitch", &mut node.pitch, 0.01);
+            node.pitch = node.pitch.max(0.01);
             ui.group("Unison", |ui| {
                 ui.horizontal(|ui| {
                     ui.knob("Amount", &mut node.unison, 1.0..=16.0);
@@ -706,6 +714,23 @@ fn draw_body(
         NodeKind::Value => {
             ui.label("Value");
             ui.drag_float("value", &mut node.value, 0.01);
+            ui.node_port(NodePortSide::Output, "out", port::AUDIO);
+        }
+        NodeKind::Readout => {
+            ui.node_port(NodePortSide::Input, "in", port::AUDIO);
+            ui.label(&format!("{:.4}", monitor.meter_value(&node.id)));
+            ui.request_repaint();
+            ui.node_port(NodePortSide::Output, "out", port::AUDIO);
+        }
+        NodeKind::NoteGate | NodeKind::NoteHold | NodeKind::NoteFreq => {
+            ui.node_port(NodePortSide::Input, "notes", port::NOTES);
+            ui.node_port(NodePortSide::Output, "out", port::AUDIO);
+        }
+        NodeKind::Smooth => {
+            ui.node_port(NodePortSide::Input, "in", port::AUDIO);
+            ui.label("Time, ms");
+            ui.drag_float("smooth_ms", &mut node.smooth_ms, 1.0);
+            node.smooth_ms = node.smooth_ms.clamp(0.0, 5_000.0);
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
         NodeKind::Mul => {

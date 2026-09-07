@@ -50,7 +50,12 @@ pub enum NodeKind {
     Mul,
     Clamp,
     Remap,
+    Smooth,
     Value,
+    Readout,
+    NoteGate,
+    NoteHold,
+    NoteFreq,
     Scope,
     Spectrum,
     Spectrogram,
@@ -93,7 +98,12 @@ impl NodeKind {
             Self::Mul => "Multiply",
             Self::Clamp => "Clamp",
             Self::Remap => "Remap",
+            Self::Smooth => "Smooth",
             Self::Value => "Value",
+            Self::Readout => "Readout",
+            Self::NoteGate => "Note Gate",
+            Self::NoteHold => "Note Hold",
+            Self::NoteFreq => "Note Freq",
             Self::Scope => "Waveform",
             Self::Spectrum => "Spectrum",
             Self::Spectrogram => "Spectrogram",
@@ -178,8 +188,14 @@ pub struct GraphNode {
     /// Unison stereo width, 0 = center, 1 = hard L/R spread.
     #[serde(default)]
     pub unison_pan: f32,
+    /// Frequency multiplier for Basic Synth (1 = unchanged, 2 = octave up).
+    #[serde(default = "default_pitch")]
+    pub pitch: f32,
     #[serde(default)]
     pub value: f32,
+    /// Smooth node: time to reach a new value, milliseconds.
+    #[serde(default = "default_smooth_ms")]
+    pub smooth_ms: f32,
     #[serde(default = "default_gate_pattern")]
     pub gate_pattern: u16,
     #[serde(default = "default_gate_smooth")]
@@ -353,6 +369,12 @@ fn default_pulse_width() -> f32 {
 fn default_unison() -> f32 {
     1.0
 }
+fn default_pitch() -> f32 {
+    1.0
+}
+fn default_smooth_ms() -> f32 {
+    100.0
+}
 fn default_gate_pattern() -> u16 {
     0x5555
 }
@@ -495,7 +517,9 @@ impl GraphNode {
             unison: 1.0,
             detune: 0.0,
             unison_pan: 0.0,
+            pitch: 1.0,
             value: 0.0,
+            smooth_ms: 100.0,
             gate_pattern: 0x5555,
             gate_smooth: 0.004,
             gate_mix: 1.0,
@@ -997,8 +1021,15 @@ mod tests {
         assert_eq!(v.detune, 0.0);
         assert_eq!(v.unison, 1.0);
         assert_eq!(v.unison_pan, 0.0);
+        assert_eq!(v.pitch, 1.0);
         let num = GraphNode::new("k".into(), NodeKind::Value, Vec2::ZERO);
         assert_eq!(num.value, 0.0);
+        let sm = GraphNode::new("sm".into(), NodeKind::Smooth, Vec2::ZERO);
+        assert!((sm.smooth_ms - 100.0).abs() < 1e-6);
+        assert_eq!(NodeKind::NoteGate.title(), "Note Gate");
+        assert_eq!(NodeKind::NoteHold.title(), "Note Hold");
+        assert_eq!(NodeKind::NoteFreq.title(), "Note Freq");
+        assert_eq!(NodeKind::Readout.title(), "Readout");
         let g = GraphNode::new("g".into(), NodeKind::TranceGate, Vec2::ZERO);
         assert_eq!(g.gate_pattern, 0x5555);
         assert!((g.gate_mix - 1.0).abs() < 1e-6);

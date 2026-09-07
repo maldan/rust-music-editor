@@ -161,6 +161,7 @@ impl PitchSet {
 #[derive(Default)]
 pub struct Monitor {
     playheads: Mutex<HashMap<String, Arc<AtomicU32>>>,
+    meters: Mutex<HashMap<String, Arc<AtomicU32>>>,
     scopes: Mutex<HashMap<String, Arc<ScopeBuf>>>,
     ffts: Mutex<HashMap<String, Arc<FftBuf>>>,
     notes: Mutex<HashMap<String, Arc<PitchSet>>>,
@@ -186,6 +187,20 @@ impl Monitor {
     pub fn playhead(&self, id: &str) -> Option<f32> {
         let m = self.playheads.lock().ok()?;
         m.get(id).map(|a| f32::from_bits(a.load(Ordering::Relaxed)))
+    }
+
+    pub fn meter_slot(&self, id: &str) -> Arc<AtomicU32> {
+        let mut m = self.meters.lock().unwrap_or_else(|e| e.into_inner());
+        m.entry(id.to_string())
+            .or_insert_with(|| Arc::new(AtomicU32::new(0)))
+            .clone()
+    }
+
+    pub fn meter_value(&self, id: &str) -> f32 {
+        let m = self.meters.lock().unwrap_or_else(|e| e.into_inner());
+        m.get(id)
+            .map(|a| f32::from_bits(a.load(Ordering::Relaxed)))
+            .unwrap_or(0.0)
     }
 
     pub fn scope_buf(&self, id: &str) -> Arc<ScopeBuf> {
@@ -262,5 +277,14 @@ mod tests {
         assert_eq!(g[last + 3], 1.0);
         assert_eq!(g[prev], 1.0);
         assert_eq!(g[0], 0.0);
+    }
+
+    #[test]
+    fn meter_slot_holds_last() {
+        let m = Monitor::default();
+        let slot = m.meter_slot("n1");
+        slot.store(1.25f32.to_bits(), Ordering::Relaxed);
+        assert!((m.meter_value("n1") - 1.25).abs() < 1e-6);
+        assert_eq!(m.meter_value("missing"), 0.0);
     }
 }
