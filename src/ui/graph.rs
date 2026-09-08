@@ -76,10 +76,34 @@ pub fn draw(
             .filter(|l| l.to_port == "cutoff")
             .map(|l| l.to_node.clone())
             .collect();
+        let q_cv: Vec<String> = space
+            .links
+            .iter()
+            .filter(|l| l.to_port == "q")
+            .map(|l| l.to_node.clone())
+            .collect();
         let pan_cv: Vec<String> = space
             .links
             .iter()
             .filter(|l| l.to_port == "pan")
+            .map(|l| l.to_node.clone())
+            .collect();
+        let gain_cv: Vec<String> = space
+            .links
+            .iter()
+            .filter(|l| l.to_port == "gain")
+            .map(|l| l.to_node.clone())
+            .collect();
+        let lfo_rate_cv: Vec<String> = space
+            .links
+            .iter()
+            .filter(|l| l.to_port == "rate")
+            .map(|l| l.to_node.clone())
+            .collect();
+        let lfo_depth_cv: Vec<String> = space
+            .links
+            .iter()
+            .filter(|l| l.to_port == "depth")
             .map(|l| l.to_node.clone())
             .collect();
 
@@ -92,7 +116,11 @@ pub fn draw(
                 let title = node_title(&nodes[idx], sequences, instruments, samples);
                 let mut pos = nodes[idx].pos;
                 let cutoff_from_cv = cutoff_cv.iter().any(|n| n == &id);
+                let q_from_cv = q_cv.iter().any(|n| n == &id);
                 let pan_from_cv = pan_cv.iter().any(|n| n == &id);
+                let gain_from_cv = gain_cv.iter().any(|n| n == &id);
+                let lfo_rate_from_cv = lfo_rate_cv.iter().any(|n| n == &id);
+                let lfo_depth_from_cv = lfo_depth_cv.iter().any(|n| n == &id);
                 ui.node(&id, &title, &mut pos, |ui| {
                     draw_body(
                         ui,
@@ -103,7 +131,11 @@ pub fn draw(
                         samples,
                         devices,
                         cutoff_from_cv,
+                        q_from_cv,
                         pan_from_cv,
+                        gain_from_cv,
+                        lfo_rate_from_cv,
+                        lfo_depth_from_cv,
                         instrument_graph,
                         bpm,
                         &mut seek_beats,
@@ -266,6 +298,7 @@ fn spawn_menu(
                 .or_else(|| leaf(ui, "Note Gate", NodeKind::NoteGate))
                 .or_else(|| leaf(ui, "Note Hold", NodeKind::NoteHold))
                 .or_else(|| leaf(ui, "Note Freq", NodeKind::NoteFreq))
+                .or_else(|| leaf(ui, "Envelope", NodeKind::Envelope))
         }
         SYNTH => {
             back(ui, page);
@@ -340,7 +373,11 @@ fn draw_body(
     samples: &[crate::graph::Sample],
     devices: &mut DeviceLists,
     cutoff_from_cv: bool,
+    q_from_cv: bool,
     pan_from_cv: bool,
+    gain_from_cv: bool,
+    lfo_rate_from_cv: bool,
+    lfo_depth_from_cv: bool,
     instrument_graph: bool,
     bpm: f32,
     seek_beats: &mut Option<f64>,
@@ -436,10 +473,20 @@ fn draw_body(
         }
         NodeKind::Shape => {
             ui.node_port(NodePortSide::Input, "notes", port::NOTES);
+            ui.node_port(NodePortSide::Input, "freq", port::AUDIO);
             let mut preview = [0.0f32; 128];
             wave_shape_of(node).fill_preview(&mut preview);
             let view = PlotView::new(0.0, 1.0, -1.0, 1.0);
             ui.plot_with_view("shape_wave", Vec2::new(220.0, 72.0), &preview, &view);
+            ui.label("OSC  (1 = note, 2 = octave, …)");
+            node.ensure_wave_harms();
+            let osc_ticks = [(0.0, "1"), (7.0 / 15.0, "8"), (1.0, "16")];
+            ui.plot_bars_edit(
+                "shape_osc",
+                Vec2::new(220.0, 64.0),
+                &mut node.wave_harms,
+                &osc_ticks,
+            );
             ui.horizontal(|ui| {
                 ui.checkbox("Half", &mut node.wave_half);
                 ui.checkbox("Pulse", &mut node.wave_pulse);
@@ -455,6 +502,16 @@ fn draw_body(
                     ui.knob("SN", &mut node.wave_sine, 0.0..=1.0);
                     ui.knob("FL", &mut node.wave_flip, 0.0..=1.0);
                     ui.knob("NS", &mut node.wave_noise, 0.0..=1.0);
+                });
+            });
+            ui.label("Pitch");
+            ui.drag_float("pitch", &mut node.pitch, 0.01);
+            node.pitch = node.pitch.max(0.01);
+            ui.group("Unison", |ui| {
+                ui.horizontal(|ui| {
+                    ui.knob("Amount", &mut node.unison, 1.0..=16.0);
+                    ui.knob("Detune", &mut node.detune, 0.0..=100.0);
+                    ui.knob("Pan", &mut node.unison_pan, 0.0..=1.0);
                 });
             });
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
@@ -487,23 +544,30 @@ fn draw_body(
         }
         NodeKind::Lfo => {
             ui.node_port(NodePortSide::Input, "rate", port::AUDIO);
-            ui.label("Rate, Hz");
-            ui.drag_float("lfo_rate", &mut node.lfo_rate, 0.1);
-            node.lfo_rate = node.lfo_rate.max(0.01);
+            if !lfo_rate_from_cv {
+                ui.label("Rate, Hz");
+                ui.drag_float("lfo_rate", &mut node.lfo_rate, 0.1);
+                node.lfo_rate = node.lfo_rate.max(0.01);
+            }
             ui.node_port(NodePortSide::Input, "depth", port::AUDIO);
-            ui.label("Depth");
-            ui.drag_float("lfo_depth", &mut node.lfo_depth, 1.0);
-            node.lfo_depth = node.lfo_depth.max(0.0);
+            if !lfo_depth_from_cv {
+                ui.label("Depth");
+                ui.drag_float("lfo_depth", &mut node.lfo_depth, 1.0);
+                node.lfo_depth = node.lfo_depth.max(0.0);
+            }
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
         NodeKind::Filter => {
             ui.node_port(NodePortSide::Input, "in", port::AUDIO);
             ui.node_port(NodePortSide::Input, "cutoff", port::AUDIO);
+            ui.node_port(NodePortSide::Input, "q", port::AUDIO);
             ui.select("filter_kind", &mut node.filter_kind, &FILTER_NAMES);
             if !cutoff_from_cv {
                 labeled_slider(ui, "Cutoff, Hz", &mut node.cutoff, 20.0..=16_000.0);
             }
-            labeled_slider(ui, "Resonance", &mut node.q, 0.3..=8.0);
+            if !q_from_cv {
+                labeled_slider(ui, "Resonance", &mut node.q, 0.3..=8.0);
+            }
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
         NodeKind::Eq => {
@@ -556,7 +620,10 @@ fn draw_body(
         }
         NodeKind::Gain => {
             ui.node_port(NodePortSide::Input, "in", port::AUDIO);
-            labeled_slider(ui, "Volume", &mut node.gain, 0.0..=1.5);
+            ui.node_port(NodePortSide::Input, "gain", port::AUDIO);
+            if !gain_from_cv {
+                labeled_slider(ui, "Volume", &mut node.gain, 0.0..=1.5);
+            }
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
         NodeKind::Pan => {
@@ -765,6 +832,11 @@ fn draw_body(
         }
         NodeKind::NoteGate | NodeKind::NoteHold | NodeKind::NoteFreq => {
             ui.node_port(NodePortSide::Input, "notes", port::NOTES);
+            ui.node_port(NodePortSide::Output, "out", port::AUDIO);
+        }
+        NodeKind::Envelope => {
+            ui.node_port(NodePortSide::Input, "notes", port::NOTES);
+            super::env::draw(ui, node, monitor.playhead(&node.id));
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
         NodeKind::Smooth => {

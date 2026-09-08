@@ -9,7 +9,7 @@ use std::sync::Arc;
 use mega_audio::dsp::{
     AdsrParams, BiquadFilter, Chorus, Clamp, Compressor, Delay, Distortion, FilterKind, Flanger,
     GainCv, Mul, Oscillator, Remap, Reverb, Slew, StereoGain, StereoJoin, StereoMixer, StereoPan,
-    TranceGate, WaveShape, Waveform, Const,
+    TranceGate, WaveShape, Waveform, Const, CurveEnv,
 };
 use mega_audio::graph::{Bypass, Graph, Node, NodeId, ProcessContext};
 use mega_audio::instrument::{AdditivePiano, AnalogDrums, KarplusStrong, PolyphonicInstrument};
@@ -84,6 +84,7 @@ pub(crate) fn wave_shape_of(n: &crate::graph::GraphNode) -> WaveShape {
         half: n.wave_half,
         pulse: n.wave_pulse,
         abs: n.wave_abs,
+        harms: n.wave_harms_array(),
     }
 }
 
@@ -372,7 +373,7 @@ fn instrument_patch(project: &Project, inst: &Instrument, playing: bool) -> Patc
     let mut keys = crate::graph::GraphNode::new("keys".into(), NodeKind::Sequencer, glam::Vec2::ZERO);
     if playing {
         if let Some(seq) = project.sequences.iter().find(|s| s.id == inst.play_seq) {
-            keys.notes = seq.visible_notes();
+            keys.notes = seq.notes_for_play(inst.play_group);
             keys.seq_loop_bars = seq.seq_loop_bars;
             keys.seq_octave = seq.seq_octave;
         } else {
@@ -457,7 +458,8 @@ fn dsp_bypass(kind: NodeKind) -> Bypass {
         | NodeKind::Sample
         | NodeKind::NoteGate
         | NodeKind::NoteHold
-        | NodeKind::NoteFreq => Bypass::Mute,
+        | NodeKind::NoteFreq
+        | NodeKind::Envelope => Bypass::Mute,
         NodeKind::Filter
         | NodeKind::Gain
         | NodeKind::Pan
@@ -512,6 +514,7 @@ fn dsp_kind(kind: NodeKind) -> bool {
             | NodeKind::NoteGate
             | NodeKind::NoteHold
             | NodeKind::NoteFreq
+            | NodeKind::Envelope
             | NodeKind::Scope
             | NodeKind::Spectrum
             | NodeKind::Spectrogram
@@ -649,9 +652,14 @@ fn build_graph_at(patch: &Patch, sample_rate: f32, monitor: &Monitor, block_size
                     0.5,
                 );
                 inst.set_wave_shape(wave_shape_of(n));
+                inst.set_unison(n.unison.round().clamp(1.0, 16.0) as usize);
+                inst.set_detune(n.detune);
+                inst.set_unison_pan(n.unison_pan);
+                inst.set_pitch(n.pitch);
                 let id = graph.add_node(Box::new(inst));
                 voices.insert(n.id.clone(), id);
                 dsp.insert(n.id.clone(), id);
+                in_port.insert((n.id.clone(), "freq".into()), Wire::mono(id, 0));
                 out_port.insert((n.id.clone(), "out".into()), Wire::stereo(id, 0, 1));
             }
             NodeKind::Guitar => {
@@ -710,11 +718,12 @@ fn build_graph_at(patch: &Patch, sample_rate: f32, monitor: &Monitor, block_size
                 in_port.insert((n.id.clone(), "pwm".into()), Wire::mono(id, 1));
             }
             NodeKind::Lfo => {
-                let osc = graph.add_node(Box::new(Oscillator::new(
-                    Waveform::Sine,
-                    n.lfo_rate.max(0.01),
-                )));
-                let amp = graph.add_node(Box::new(GainCv::new(n.lfo_depth.max(0.0))));
+                let mut osc = Oscillator::new(Waveform::Sine, n.lfo_rate.max(0.01));
+                osc.freq_from_cv = audio_in_wired(patch, &n.id, "rate");
+                let osc = graph.add_node(Box::new(osc));
+                let mut amp = GainCv::new(n.lfo_depth.max(0.0));
+                amp.gain_from_cv = audio_in_wired(patch, &n.id, "depth");
+                let amp = graph.add_node(Box::new(amp));
                 dsp.insert(n.id.clone(), osc);
                 lfo_mix_ids.insert(n.id.clone(), amp);
                 graph.connect(osc, 0, amp, 0);
@@ -730,10 +739,12 @@ fn build_graph_at(patch: &Patch, sample_rate: f32, monitor: &Monitor, block_size
                     sample_rate,
                 );
                 filt.cutoff_from_cv = audio_in_wired(patch, &n.id, "cutoff");
+                filt.q_from_cv = audio_in_wired(patch, &n.id, "q");
                 let id = graph.add_node(Box::new(filt));
                 dsp.insert(n.id.clone(), id);
                 in_port.insert((n.id.clone(), "in".into()), Wire::stereo(id, 0, 1));
                 in_port.insert((n.id.clone(), "cutoff".into()), Wire::mono(id, 2));
+                in_port.insert((n.id.clone(), "q".into()), Wire::mono(id, 3));
                 out_port.insert((n.id.clone(), "out".into()), Wire::stereo(id, 0, 1));
             }
             NodeKind::Eq => {
@@ -757,9 +768,12 @@ fn build_graph_at(patch: &Patch, sample_rate: f32, monitor: &Monitor, block_size
                 out_port.insert((n.id.clone(), "out".into()), Wire::stereo(id, 0, 1));
             }
             NodeKind::Gain => {
-                let id = graph.add_node(Box::new(StereoGain::new(n.gain)));
+                let mut g = StereoGain::new(n.gain);
+                g.gain_from_cv = audio_in_wired(patch, &n.id, "gain");
+                let id = graph.add_node(Box::new(g));
                 dsp.insert(n.id.clone(), id);
                 in_port.insert((n.id.clone(), "in".into()), Wire::stereo(id, 0, 1));
+                in_port.insert((n.id.clone(), "gain".into()), Wire::mono(id, 2));
                 out_port.insert((n.id.clone(), "out".into()), Wire::stereo(id, 0, 1));
             }
             NodeKind::Pan => {
@@ -905,6 +919,16 @@ fn build_graph_at(patch: &Patch, sample_rate: f32, monitor: &Monitor, block_size
                     _ => NoteCvKind::Gate,
                 };
                 let id = graph.add_node(Box::new(NoteCv::new(kind)));
+                voices.insert(n.id.clone(), id);
+                dsp.insert(n.id.clone(), id);
+                out_port.insert((n.id.clone(), "out".into()), Wire::mono(id, 0));
+            }
+            NodeKind::Envelope => {
+                let mut env = CurveEnv::new();
+                env.set_curve(&n.env_knots(), n.env_time);
+                env.set_range(n.env_lo, n.env_hi);
+                env.playhead = Some(monitor.playhead_slot(&n.id));
+                let id = graph.add_node(Box::new(env));
                 voices.insert(n.id.clone(), id);
                 dsp.insert(n.id.clone(), id);
                 out_port.insert((n.id.clone(), "out".into()), Wire::mono(id, 0));
@@ -1209,6 +1233,10 @@ impl Live {
                 NodeKind::Shape => {
                     if let Some(inst) = graph.node_mut::<PolyphonicInstrument>(id) {
                         inst.set_wave_shape(wave_shape_of(n));
+                        inst.set_unison(n.unison.round().clamp(1.0, 16.0) as usize);
+                        inst.set_detune(n.detune);
+                        inst.set_unison_pan(n.unison_pan);
+                        inst.set_pitch(n.pitch);
                     }
                 }
                 NodeKind::Guitar => {
@@ -1231,16 +1259,24 @@ impl Live {
                 NodeKind::Lfo => {
                     if let Some(osc) = graph.node_mut::<Oscillator>(id) {
                         osc.frequency = n.lfo_rate.max(0.01);
+                        osc.freq_from_cv = audio_in_wired(patch, &n.id, "rate");
                     }
                     if let Some(&amp_id) = self.lfo_mix.get(&n.id) {
                         if let Some(g) = graph.node_mut::<GainCv>(amp_id) {
                             g.gain = n.lfo_depth.max(0.0);
+                            g.gain_from_cv = audio_in_wired(patch, &n.id, "depth");
                         }
                     }
                 }
                 NodeKind::Value => {
                     if let Some(c) = graph.node_mut::<Const>(id) {
                         c.value = n.value;
+                    }
+                }
+                NodeKind::Envelope => {
+                    if let Some(env) = graph.node_mut::<CurveEnv>(id) {
+                        env.set_curve(&n.env_knots(), n.env_time);
+                        env.set_range(n.env_lo, n.env_hi);
                     }
                 }
                 NodeKind::Smooth => {
@@ -1284,6 +1320,7 @@ impl Live {
                         f.cutoff = n.cutoff.max(20.0);
                         f.q = n.q.max(0.1);
                         f.cutoff_from_cv = audio_in_wired(patch, &n.id, "cutoff");
+                        f.q_from_cv = audio_in_wired(patch, &n.id, "q");
                     }
                 }
                 NodeKind::Eq => {
@@ -1294,6 +1331,7 @@ impl Live {
                 NodeKind::Gain => {
                     if let Some(g) = graph.node_mut::<StereoGain>(id) {
                         g.gain = n.gain;
+                        g.gain_from_cv = audio_in_wired(patch, &n.id, "gain");
                     }
                 }
                 NodeKind::Pan => {
@@ -2063,6 +2101,8 @@ fn panic_instruments(graph: &mut Graph, voices: &HashMap<String, NodeId>) {
             inst.panic();
         } else if let Some(cv) = graph.node_mut::<NoteCv>(id) {
             cv.panic();
+        } else if let Some(env) = graph.node_mut::<CurveEnv>(id) {
+            env.panic();
         }
     }
 }
@@ -2078,6 +2118,8 @@ fn emit_voice(graph: &mut Graph, id: NodeId, event: NoteEvent) {
         drm.handle_event(event);
     } else if let Some(cv) = graph.node_mut::<NoteCv>(id) {
         cv.handle_event(event);
+    } else if let Some(env) = graph.node_mut::<CurveEnv>(id) {
+        env.handle_event(event);
     }
 }
 
@@ -2605,7 +2647,8 @@ fn seq_routes(
                         | NodeKind::Drums
                         | NodeKind::NoteGate
                         | NodeKind::NoteHold
-                        | NodeKind::NoteFreq,
+                        | NodeKind::NoteFreq
+                        | NodeKind::Envelope,
                     ),
                     "notes",
                 ) => {
@@ -2947,6 +2990,24 @@ mod tests {
     }
 
     #[test]
+    fn shape_freq_cable_is_hz_offset() {
+        let osc = crate::graph::GraphNode::new("osc".into(), NodeKind::Osc, glam::Vec2::ZERO);
+        let shape = crate::graph::GraphNode::new("shp".into(), NodeKind::Shape, glam::Vec2::ZERO);
+        let patch = patch_with(
+            vec![osc, shape],
+            vec![("osc", "out", "shp", "freq")],
+        );
+        let mon = Monitor::default();
+        let mut build = build_graph(&patch, 48_000.0, &mon);
+        let id = *build.dsp.get("shp").expect("shape dsp");
+        let inst = build
+            .graph
+            .node_mut::<PolyphonicInstrument>(id)
+            .expect("shape inst");
+        assert!(!inst.pitch_from_cv);
+    }
+
+    #[test]
     fn morph_crossfades_a_to_b() {
         let mut n = crate::graph::GraphNode::new("m".into(), NodeKind::Morph, glam::Vec2::ZERO);
         n.morph = 0.25;
@@ -2979,6 +3040,19 @@ mod tests {
         let mon = Monitor::default();
         let build = build_graph(&patch, 48_000.0, &mon);
         assert!(build.dsp.contains_key("gate"));
+        let (targets, _) = seq_routes(&patch, "seq", &build.voices);
+        assert_eq!(targets.len(), 1);
+    }
+
+    #[test]
+    fn envelope_is_seq_target() {
+        let seq = crate::graph::GraphNode::new("seq".into(), NodeKind::Sequencer, glam::Vec2::ZERO);
+        let env = crate::graph::GraphNode::new("env".into(), NodeKind::Envelope, glam::Vec2::ZERO);
+        let patch = patch_with(vec![seq, env], vec![("seq", "notes", "env", "notes")]);
+        let mon = Monitor::default();
+        let mut build = build_graph(&patch, 48_000.0, &mon);
+        let id = *build.dsp.get("env").expect("env dsp");
+        assert!(build.graph.node_mut::<CurveEnv>(id).is_some());
         let (targets, _) = seq_routes(&patch, "seq", &build.voices);
         assert_eq!(targets.len(), 1);
     }
@@ -3192,6 +3266,24 @@ mod tests {
         let id = *build.dsp.get("f").expect("filter dsp");
         let f = build.graph.node_mut::<BiquadFilter>(id).expect("biquad");
         assert!(f.cutoff_from_cv);
+        assert!(!f.q_from_cv);
+    }
+
+    #[test]
+    fn filter_q_cable_replaces_knob() {
+        let osc = crate::graph::GraphNode::new("osc".into(), NodeKind::Osc, glam::Vec2::ZERO);
+        let mut filt = crate::graph::GraphNode::new("f".into(), NodeKind::Filter, glam::Vec2::ZERO);
+        filt.q = 0.5;
+        let patch = patch_with(
+            vec![osc, filt],
+            vec![("osc", "out", "f", "q")],
+        );
+        let mon = Monitor::default();
+        let mut build = build_graph(&patch, 48_000.0, &mon);
+        let id = *build.dsp.get("f").expect("filter dsp");
+        let f = build.graph.node_mut::<BiquadFilter>(id).expect("biquad");
+        assert!(f.q_from_cv);
+        assert!(!f.cutoff_from_cv);
     }
 
     #[test]
@@ -3413,6 +3505,41 @@ mod tests {
     }
 
     #[test]
+    fn gain_node_cv_replaces_knob() {
+        let osc = crate::graph::GraphNode::new("osc".into(), NodeKind::Osc, glam::Vec2::ZERO);
+        let gain = crate::graph::GraphNode::new("g".into(), NodeKind::Gain, glam::Vec2::ZERO);
+        let patch = patch_with(vec![osc, gain], vec![("osc", "out", "g", "gain")]);
+        let mon = Monitor::default();
+        let mut build = build_graph(&patch, 48_000.0, &mon);
+        let id = *build.dsp.get("g").expect("gain dsp");
+        let g = build.graph.node_mut::<StereoGain>(id).expect("stereo gain");
+        assert!(g.gain_from_cv);
+    }
+
+    #[test]
+    fn lfo_rate_and_depth_cables_replace_knobs() {
+        let osc = crate::graph::GraphNode::new("osc".into(), NodeKind::Osc, glam::Vec2::ZERO);
+        let mut lfo = crate::graph::GraphNode::new("lfo".into(), NodeKind::Lfo, glam::Vec2::ZERO);
+        lfo.lfo_rate = 5.0;
+        lfo.lfo_depth = 32.0;
+        let patch = patch_with(
+            vec![osc, lfo],
+            vec![
+                ("osc", "out", "lfo", "rate"),
+                ("osc", "out", "lfo", "depth"),
+            ],
+        );
+        let mon = Monitor::default();
+        let mut build = build_graph(&patch, 48_000.0, &mon);
+        let osc_id = *build.dsp.get("lfo").expect("lfo osc");
+        let o = build.graph.node_mut::<Oscillator>(osc_id).expect("osc");
+        assert!(o.freq_from_cv);
+        let amp_id = *build.lfo_mix.get("lfo").expect("lfo amp");
+        let g = build.graph.node_mut::<GainCv>(amp_id).expect("gain");
+        assert!(g.gain_from_cv);
+    }
+
+    #[test]
     fn reverb_and_comp_are_dsp() {
         assert!(dsp_kind(NodeKind::Reverb));
         assert!(dsp_kind(NodeKind::Compressor));
@@ -3566,6 +3693,21 @@ mod tests {
             pitches
         );
         assert_eq!(keys.seq_loop_bars, p.sequences[0].seq_loop_bars);
+    }
+
+    #[test]
+    fn instrument_view_plays_selected_group() {
+        let mut p = crate::graph::Project::new_default();
+        let inst_id = p.instruments[0].id.clone();
+        let gid = p.sequences[0].add_group();
+        p.sequences[0].notes[0].group = gid;
+        p.instruments[0].play_seq = p.sequences[0].id.clone();
+        p.instruments[0].play_group = Some(gid);
+        p.view = crate::graph::EditorView::Instrument(inst_id);
+        let heard = Patch::from_project(&p, true);
+        let keys = heard.nodes.iter().find(|n| n.id == "keys").unwrap();
+        assert_eq!(keys.notes.len(), 1);
+        assert_eq!(keys.notes[0].group, gid);
     }
 
     #[test]

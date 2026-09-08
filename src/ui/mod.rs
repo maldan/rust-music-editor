@@ -1,4 +1,5 @@
 mod adsr;
+mod env;
 mod explorer;
 mod export;
 mod graph;

@@ -96,10 +96,23 @@ pub fn draw(
             }
         }
         EditorView::Instrument(id) => {
+            for s in &mut project.sequences {
+                s.ensure_groups();
+            }
             let seqs: Vec<(String, String)> = project
                 .sequences
                 .iter()
                 .map(|s| (s.id.clone(), s.name.clone()))
+                .collect();
+            let seq_groups: Vec<(String, Vec<(u32, String)>)> = project
+                .sequences
+                .iter()
+                .map(|s| {
+                    (
+                        s.id.clone(),
+                        s.groups.iter().map(|g| (g.id, g.name.clone())).collect(),
+                    )
+                })
                 .collect();
             ui.label("Instrument");
             if let Some(inst) = project.instrument_mut(&id) {
@@ -121,6 +134,38 @@ pub fn draw(
                 } else {
                     seqs[sel - 1].0.clone()
                 };
+                if inst.play_seq.is_empty() {
+                    inst.play_group = None;
+                } else {
+                    let groups: Vec<(u32, String)> = seq_groups
+                        .iter()
+                        .find(|(sid, _)| *sid == inst.play_seq)
+                        .map(|(_, g)| g.clone())
+                        .unwrap_or_default();
+                    if inst
+                        .play_group
+                        .is_some_and(|gid| !groups.iter().any(|(id, _)| *id == gid))
+                    {
+                        inst.play_group = None;
+                    }
+                    ui.label("Play group");
+                    let names: Vec<String> = groups.iter().map(|(_, n)| n.clone()).collect();
+                    let mut glabels: Vec<&str> = vec!["All"];
+                    for n in &names {
+                        glabels.push(n.as_str());
+                    }
+                    let mut gsel = inst
+                        .play_group
+                        .and_then(|gid| groups.iter().position(|(id, _)| *id == gid))
+                        .map(|i| i + 1)
+                        .unwrap_or(0);
+                    ui.select("inst_play_group", &mut gsel, &glabels);
+                    inst.play_group = if gsel == 0 {
+                        None
+                    } else {
+                        Some(groups[gsel - 1].0)
+                    };
+                }
                 if ui.button("Delete instrument").clicked {
                     project.pending_delete_inst = Some(id.clone());
                 }

@@ -295,6 +295,23 @@ impl GraphDoc {
             n.wave_half.hash(&mut h);
             n.wave_pulse.hash(&mut h);
             n.wave_abs.hash(&mut h);
+            n.wave_harms.len().hash(&mut h);
+            for v in &n.wave_harms {
+                v.to_bits().hash(&mut h);
+            }
+            n.env_time.to_bits().hash(&mut h);
+            n.env_lo.to_bits().hash(&mut h);
+            n.env_hi.to_bits().hash(&mut h);
+            n.env_rel.to_bits().hash(&mut h);
+            n.env_pts.len().hash(&mut h);
+            for p in &n.env_pts {
+                p.t.to_bits().hash(&mut h);
+                p.v.to_bits().hash(&mut h);
+                p.tension.to_bits().hash(&mut h);
+                (p.seg as usize).hash(&mut h);
+                p.decay.hash(&mut h);
+                p.sustain.hash(&mut h);
+            }
         }
         self.bpm.to_bits().hash(&mut h);
         h.finish()

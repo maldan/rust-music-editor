@@ -133,6 +133,23 @@ impl Sequence {
             .collect()
     }
 
+    /// `None` = all visible groups. `Some(id)` = that group even if hidden.
+    pub fn notes_for_play(&self, group: Option<u32>) -> Vec<SeqNote> {
+        match group {
+            None => self.visible_notes(),
+            Some(gid) => {
+                if self.group(gid).is_none() {
+                    return self.visible_notes();
+                }
+                self.notes
+                    .iter()
+                    .copied()
+                    .filter(|n| n.group == gid)
+                    .collect()
+            }
+        }
+    }
+
     pub fn add_group(&mut self) -> u32 {
         self.ensure_groups();
         let id = self.next_group.max(1);
@@ -176,6 +193,8 @@ pub struct Instrument {
     pub graph: GraphDoc,
     /// Empty = built-in C3/C4/C5 demo. Otherwise a sequence id to preview through this instrument.
     pub play_seq: String,
+    /// `None` = every visible group in `play_seq`. `Some` = one group id.
+    pub play_group: Option<u32>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -291,6 +310,7 @@ impl Project {
                 name: "Sine".into(),
                 graph: GraphDoc::new_instrument(),
                 play_seq: String::new(),
+                play_group: None,
             }],
             samples: Vec::new(),
             view: EditorView::Graph,
@@ -356,6 +376,7 @@ impl Project {
         for i in &mut self.instruments {
             if i.play_seq == id {
                 i.play_seq.clear();
+                i.play_group = None;
             }
         }
         if matches!(&self.view, EditorView::Sequence(cur) if cur == id) {
@@ -411,6 +432,9 @@ impl Project {
         for i in &mut self.instruments {
             if i.play_seq == from_id {
                 i.play_seq = into_id.to_string();
+                if i.play_group.is_some() {
+                    i.play_group = Some(gid);
+                }
             }
         }
         self.remove_sequence(from_id);
@@ -448,9 +472,18 @@ impl Project {
             name,
             graph: GraphDoc::new_instrument(),
             play_seq: String::new(),
+            play_group: None,
         });
         self.select_instrument(&id);
         id
+    }
+
+    pub fn forget_play_group(&mut self, seq_id: &str, group: u32) {
+        for i in &mut self.instruments {
+            if i.play_seq == seq_id && i.play_group == Some(group) {
+                i.play_group = None;
+            }
+        }
     }
 
     pub fn remove_instrument(&mut self, id: &str) {
@@ -625,6 +658,7 @@ impl Project {
             i.id.hash(&mut h);
             i.name.hash(&mut h);
             i.play_seq.hash(&mut h);
+            i.play_group.hash(&mut h);
             i.graph.fingerprint().hash(&mut h);
         }
         for s in &self.samples {
@@ -773,6 +807,29 @@ mod tests {
         assert!(p.sequences[0].groups.iter().all(|g| g.id != gid));
         p.sequences[0].remove_group(DEFAULT_GROUP_ID);
         assert!(p.sequences[0].groups.iter().any(|g| g.id == DEFAULT_GROUP_ID));
+    }
+
+    #[test]
+    fn notes_for_play_filters_group() {
+        let mut p = Project::new_default();
+        let gid = p.sequences[0].add_group();
+        p.sequences[0].notes[0].group = gid;
+        let all = p.sequences[0].notes_for_play(None);
+        let one = p.sequences[0].notes_for_play(Some(gid));
+        assert_eq!(all.len(), p.sequences[0].notes.len());
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].group, gid);
+    }
+
+    #[test]
+    fn remove_group_clears_instrument_play_group() {
+        let mut p = Project::new_default();
+        let gid = p.sequences[0].add_group();
+        p.instruments[0].play_seq = p.sequences[0].id.clone();
+        p.instruments[0].play_group = Some(gid);
+        p.forget_play_group(&p.sequences[0].id.clone(), gid);
+        p.sequences[0].remove_group(gid);
+        assert_eq!(p.instruments[0].play_group, None);
     }
 
     #[test]

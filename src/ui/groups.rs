@@ -139,6 +139,7 @@ fn draw_list(ui: &mut Ui, project: &mut Project, seq_id: &str) {
         if let Some(seq) = project.sequence_mut(seq_id) {
             seq.remove_group(id);
         }
+        project.forget_play_group(seq_id, id);
         ui.request_repaint();
     }
     if let Some(id) = edit_id {
