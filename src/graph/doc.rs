@@ -251,6 +251,7 @@ impl GraphDoc {
             n.comp_makeup.to_bits().hash(&mut h);
             n.mix_a.to_bits().hash(&mut h);
             n.mix_b.to_bits().hash(&mut h);
+            n.morph.to_bits().hash(&mut h);
             n.mix_strips.len().hash(&mut h);
             for s in &n.mix_strips {
                 s.vol.to_bits().hash(&mut h);
@@ -285,6 +286,15 @@ impl GraphDoc {
                 p.v.to_bits().hash(&mut h);
             }
             n.audio_device.hash(&mut h);
+            n.wave_shape.to_bits().hash(&mut h);
+            n.wave_tension.to_bits().hash(&mut h);
+            n.wave_skew.to_bits().hash(&mut h);
+            n.wave_sine.to_bits().hash(&mut h);
+            n.wave_flip.to_bits().hash(&mut h);
+            n.wave_noise.to_bits().hash(&mut h);
+            n.wave_half.hash(&mut h);
+            n.wave_pulse.hash(&mut h);
+            n.wave_abs.hash(&mut h);
         }
         self.bpm.to_bits().hash(&mut h);
         h.finish()

@@ -5,7 +5,7 @@ use mega_ui::{
     AnimationCurve, CurvePoint, CurvePreset, CursorIcon, NodePortSide, PlotView, Ui, flat_pass_curve,
 };
 
-use crate::compile::WAVEFORMS;
+use crate::compile::{wave_shape_of, WAVEFORMS};
 use crate::fft::{
     freq_ticks, spec_window, t_to_freq, view_freq_ticks, view_note_ticks, SPEC_BINS, SPEC_COLS,
 };
@@ -271,6 +271,8 @@ fn spawn_menu(
             back(ui, page);
             ui.separator();
             leaf(ui, "Oscillator", NodeKind::Osc)
+                .or_else(|| leaf(ui, "Simple Synth", NodeKind::Tone))
+                .or_else(|| leaf(ui, "Shape Synth", NodeKind::Shape))
                 .or_else(|| leaf(ui, "Basic Synth", NodeKind::Voice))
                 .or_else(|| leaf(ui, "Guitar", NodeKind::Guitar))
                 .or_else(|| leaf(ui, "Piano", NodeKind::Piano))
@@ -284,6 +286,7 @@ fn spawn_menu(
                 .or_else(|| leaf(ui, "Gain", NodeKind::Gain))
                 .or_else(|| leaf(ui, "Pan", NodeKind::Pan))
                 .or_else(|| leaf(ui, "Join Audio", NodeKind::Mix))
+                .or_else(|| leaf(ui, "Morph", NodeKind::Morph))
                 .or_else(|| leaf(ui, "Mixer", NodeKind::Mixer))
                 .or_else(|| leaf(ui, "Audio In", NodeKind::AudioIn))
                 .or_else(|| leaf(ui, "Waveform", NodeKind::Scope))
@@ -423,6 +426,37 @@ fn draw_body(
                 });
             });
             super::adsr::draw(ui, node);
+            ui.node_port(NodePortSide::Output, "out", port::AUDIO);
+        }
+        NodeKind::Tone => {
+            ui.node_port(NodePortSide::Input, "notes", port::NOTES);
+            ui.label("Waveform");
+            ui.select("wave", &mut node.waveform, &names);
+            ui.node_port(NodePortSide::Output, "out", port::AUDIO);
+        }
+        NodeKind::Shape => {
+            ui.node_port(NodePortSide::Input, "notes", port::NOTES);
+            let mut preview = [0.0f32; 128];
+            wave_shape_of(node).fill_preview(&mut preview);
+            let view = PlotView::new(0.0, 1.0, -1.0, 1.0);
+            ui.plot_with_view("shape_wave", Vec2::new(220.0, 72.0), &preview, &view);
+            ui.horizontal(|ui| {
+                ui.checkbox("Half", &mut node.wave_half);
+                ui.checkbox("Pulse", &mut node.wave_pulse);
+                ui.checkbox("Abs", &mut node.wave_abs);
+            });
+            ui.group("Wave", |ui| {
+                ui.horizontal(|ui| {
+                    ui.knob("SH", &mut node.wave_shape, 0.0..=1.0);
+                    ui.knob("TN", &mut node.wave_tension, -1.0..=1.0);
+                    ui.knob("SK", &mut node.wave_skew, 0.0..=1.0);
+                });
+                ui.horizontal(|ui| {
+                    ui.knob("SN", &mut node.wave_sine, 0.0..=1.0);
+                    ui.knob("FL", &mut node.wave_flip, 0.0..=1.0);
+                    ui.knob("NS", &mut node.wave_noise, 0.0..=1.0);
+                });
+            });
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
         NodeKind::Guitar => {
@@ -571,6 +605,13 @@ fn draw_body(
             ui.node_port(NodePortSide::Input, "b", port::AUDIO);
             labeled_slider(ui, "Volume A", &mut node.mix_a, 0.0..=1.5);
             labeled_slider(ui, "Volume B", &mut node.mix_b, 0.0..=1.5);
+            ui.node_port(NodePortSide::Output, "out", port::AUDIO);
+        }
+        NodeKind::Morph => {
+            ui.node_port(NodePortSide::Input, "a", port::AUDIO);
+            ui.node_port(NodePortSide::Input, "b", port::AUDIO);
+            labeled_slider(ui, "Morph", &mut node.morph, 0.0..=1.0);
+            node.morph = node.morph.clamp(0.0, 1.0);
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
         NodeKind::Mixer => {

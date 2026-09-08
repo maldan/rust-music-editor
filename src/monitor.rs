@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::fft::{SPEC_BINS, SPEC_COLS};
 
-pub const SCOPE_LEN: usize = 512;
+pub const SCOPE_LEN: usize = 2048;
 
 pub struct ScopeBuf {
     samples: Box<[AtomicU32]>,
@@ -36,8 +36,26 @@ impl ScopeBuf {
             let idx = (w + i) % SCOPE_LEN;
             out[i] = f32::from_bits(self.samples[idx].load(Ordering::Relaxed));
         }
-        out
+        trigger_wave(&out)
     }
+}
+
+/// Start the plot on a rising zero so a periodic wave stays put.
+pub fn trigger_wave(samples: &[f32]) -> Vec<f32> {
+    let n = samples.len();
+    if n < 16 {
+        return samples.to_vec();
+    }
+    let win = n / 2;
+    let search_end = n - win;
+    let mut start = 0;
+    for i in 1..=search_end {
+        if samples[i - 1] <= 0.0 && samples[i] > 0.0 {
+            start = i;
+            break;
+        }
+    }
+    samples[start..start + win].to_vec()
 }
 
 /// Latest log-FFT column plus a time ring for spectrogram.
@@ -262,6 +280,15 @@ mod tests {
     use super::*;
     use crate::fft::SPEC_BINS;
 
+    fn sine(period: usize, phase: usize, n: usize) -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                let t = (i + phase) as f32 / period as f32;
+                (t * std::f32::consts::TAU).sin()
+            })
+            .collect()
+    }
+
     #[test]
     fn spectrogram_pads_left_newest_right() {
         let b = FftBuf::new();
@@ -277,6 +304,24 @@ mod tests {
         assert_eq!(g[last + 3], 1.0);
         assert_eq!(g[prev], 1.0);
         assert_eq!(g[0], 0.0);
+    }
+
+    #[test]
+    fn trigger_locks_phase_across_offsets() {
+        let a = trigger_wave(&sine(64, 3, 512));
+        let b = trigger_wave(&sine(64, 41, 512));
+        assert_eq!(a.len(), 256);
+        assert!(a[0] > 0.0 && a[0] < 0.12);
+        assert!(a[1] > a[0]);
+        let mean: f32 = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).sum::<f32>() / a.len() as f32;
+        assert!(mean < 0.02, "mean abs err {mean}");
+    }
+
+    #[test]
+    fn trigger_falls_back_without_zero_cross() {
+        let v: Vec<f32> = (0..64).map(|i| 0.2 + i as f32 * 0.01).collect();
+        let out = trigger_wave(&v);
+        assert_eq!(out, v[..32].to_vec());
     }
 
     #[test]

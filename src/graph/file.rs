@@ -45,6 +45,8 @@ struct InstrumentFile {
     id: String,
     name: String,
     graph: GraphFile,
+    #[serde(default)]
+    play_seq: String,
 }
 
 fn default_play_from() -> i32 {
@@ -205,6 +207,7 @@ impl Project {
                     id: i.id.clone(),
                     name: i.name.clone(),
                     graph: i.graph.to_file(),
+                    play_seq: i.play_seq.clone(),
                 })
                 .collect(),
             samples: self.samples.clone(),
@@ -243,6 +246,7 @@ impl Project {
                 id: inst.id,
                 name: inst.name,
                 graph: GraphDoc::from_file(inst.graph)?,
+                play_seq: inst.play_seq,
             });
         }
         if p.sequences.is_empty() {

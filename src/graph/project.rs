@@ -174,6 +174,8 @@ pub struct Instrument {
     pub id: String,
     pub name: String,
     pub graph: GraphDoc,
+    /// Empty = built-in C3/C4/C5 demo. Otherwise a sequence id to preview through this instrument.
+    pub play_seq: String,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -288,6 +290,7 @@ impl Project {
                 id: "i1".into(),
                 name: "Sine".into(),
                 graph: GraphDoc::new_instrument(),
+                play_seq: String::new(),
             }],
             samples: Vec::new(),
             view: EditorView::Graph,
@@ -350,6 +353,11 @@ impl Project {
                 n.notes.clear();
             }
         }
+        for i in &mut self.instruments {
+            if i.play_seq == id {
+                i.play_seq.clear();
+            }
+        }
         if matches!(&self.view, EditorView::Sequence(cur) if cur == id) {
             self.select_graph();
         }
@@ -400,6 +408,11 @@ impl Project {
                 n.seq_id = into_id.to_string();
             }
         }
+        for i in &mut self.instruments {
+            if i.play_seq == from_id {
+                i.play_seq = into_id.to_string();
+            }
+        }
         self.remove_sequence(from_id);
         true
     }
@@ -434,6 +447,7 @@ impl Project {
             id: id.clone(),
             name,
             graph: GraphDoc::new_instrument(),
+            play_seq: String::new(),
         });
         self.select_instrument(&id);
         id
@@ -610,6 +624,7 @@ impl Project {
         for i in &self.instruments {
             i.id.hash(&mut h);
             i.name.hash(&mut h);
+            i.play_seq.hash(&mut h);
             i.graph.fingerprint().hash(&mut h);
         }
         for s in &self.samples {
@@ -664,6 +679,15 @@ mod tests {
                 .all(|n| n.seq_id != "s1")
         );
         assert_eq!(p.view, EditorView::Graph);
+        assert_eq!(p.instruments[0].play_seq, "");
+    }
+
+    #[test]
+    fn remove_sequence_clears_instrument_play_seq() {
+        let mut p = Project::new_default();
+        p.instruments[0].play_seq = "s1".into();
+        p.remove_sequence("s1");
+        assert_eq!(p.instruments[0].play_seq, "");
     }
 
     #[test]

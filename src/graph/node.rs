@@ -78,6 +78,9 @@ pub enum NodeKind {
     Instrument,
     Sample,
     Voice,
+    Tone,
+    Shape,
+    Morph,
     Guitar,
     Piano,
     Drums,
@@ -126,6 +129,9 @@ impl NodeKind {
             Self::Instrument => "Instrument",
             Self::Sample => "Sample",
             Self::Voice => "Basic Synth",
+            Self::Tone => "Simple Synth",
+            Self::Shape => "Shape Synth",
+            Self::Morph => "Morph",
             Self::Guitar => "Guitar",
             Self::Piano => "Piano",
             Self::Drums => "Drum Kit",
@@ -271,6 +277,9 @@ pub struct GraphNode {
     pub mix_a: f32,
     #[serde(default = "default_mix")]
     pub mix_b: f32,
+    /// Morph node: `0` = input A, `1` = input B.
+    #[serde(default = "default_morph")]
+    pub morph: f32,
     /// 8 mixer strips (vol + pan). Empty on Join Audio / old files.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mix_strips: Vec<MixStrip>,
@@ -337,6 +346,33 @@ pub struct GraphNode {
     /// Spectrogram intensity gate (`0` = show all, `1` = only peaks).
     #[serde(default)]
     pub spec_floor: f32,
+    /// Shape Synth: sine → triangle → saw → square.
+    #[serde(default)]
+    pub wave_shape: f32,
+    /// Shape Synth: `+` toward square, `-` toward spikes.
+    #[serde(default)]
+    pub wave_tension: f32,
+    /// Shape Synth: 0 = even period, 1 = squeeze cycle into the center.
+    #[serde(default)]
+    pub wave_skew: f32,
+    /// Shape Synth: 2nd Chebyshev / extra sine bends (not a mix-to-sine).
+    #[serde(default)]
+    pub wave_sine: f32,
+    /// Shape Synth: fold/mirror the period (phase), not invert-and-mix.
+    #[serde(default)]
+    pub wave_flip: f32,
+    /// Shape Synth: mix in white noise.
+    #[serde(default)]
+    pub wave_noise: f32,
+    /// Shape Synth: stretch first half of the wave across the period.
+    #[serde(default)]
+    pub wave_half: bool,
+    /// Shape Synth: one cycle in the first half, then silence.
+    #[serde(default)]
+    pub wave_pulse: bool,
+    /// Shape Synth: fold negatives up.
+    #[serde(default)]
+    pub wave_abs: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -478,6 +514,9 @@ fn default_arp_rate() -> f32 {
 fn default_mix() -> f32 {
     1.0
 }
+fn default_morph() -> f32 {
+    0.5
+}
 fn default_bpm() -> f32 {
     120.0
 }
@@ -563,6 +602,7 @@ impl GraphNode {
             comp_makeup: 1.4,
             mix_a: 1.0,
             mix_b: 1.0,
+            morph: 0.5,
             mix_strips: match kind {
                 NodeKind::Mixer => vec![MixStrip {
                     vol: 1.0,
@@ -611,6 +651,15 @@ impl GraphNode {
             spec_pos: 0.0,
             spec_span: 1.0,
             spec_floor: 0.0,
+            wave_shape: 0.0,
+            wave_tension: 0.0,
+            wave_skew: 0.0,
+            wave_sine: 0.0,
+            wave_flip: 0.0,
+            wave_noise: 0.0,
+            wave_half: false,
+            wave_pulse: false,
+            wave_abs: false,
         }
     }
 
@@ -1042,6 +1091,13 @@ mod tests {
         assert!((sm.smooth_ms - 100.0).abs() < 1e-6);
         assert_eq!(NodeKind::NoteGate.title(), "Note Gate");
         assert_eq!(NodeKind::NoteHold.title(), "Note Hold");
+        assert_eq!(NodeKind::Tone.title(), "Simple Synth");
+        assert_eq!(NodeKind::Shape.title(), "Shape Synth");
+        let shp = GraphNode::new("shp".into(), NodeKind::Shape, Vec2::ZERO);
+        assert!(!shp.wave_half && !shp.wave_pulse && !shp.wave_abs);
+        assert_eq!(NodeKind::Morph.title(), "Morph");
+        assert_eq!(GraphNode::new("t".into(), NodeKind::Tone, Vec2::ZERO).waveform, 0);
+        assert!((GraphNode::new("m".into(), NodeKind::Morph, Vec2::ZERO).morph - 0.5).abs() < 1e-6);
         assert_eq!(NodeKind::NoteFreq.title(), "Note Freq");
         assert_eq!(NodeKind::Readout.title(), "Readout");
         let g = GraphNode::new("g".into(), NodeKind::TranceGate, Vec2::ZERO);

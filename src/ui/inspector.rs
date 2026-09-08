@@ -96,10 +96,31 @@ pub fn draw(
             }
         }
         EditorView::Instrument(id) => {
+            let seqs: Vec<(String, String)> = project
+                .sequences
+                .iter()
+                .map(|s| (s.id.clone(), s.name.clone()))
+                .collect();
             ui.label("Instrument");
             if let Some(inst) = project.instrument_mut(&id) {
                 ui.label("Name");
                 ui.text_input("inst_name", &mut inst.name);
+                ui.label("Play sequence");
+                let mut labels: Vec<&str> = vec!["Default 3 notes"];
+                for (_, name) in &seqs {
+                    labels.push(name.as_str());
+                }
+                let mut sel = seqs
+                    .iter()
+                    .position(|(sid, _)| *sid == inst.play_seq)
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                ui.select("inst_play_seq", &mut sel, &labels);
+                inst.play_seq = if sel == 0 {
+                    String::new()
+                } else {
+                    seqs[sel - 1].0.clone()
+                };
                 if ui.button("Delete instrument").clicked {
                     project.pending_delete_inst = Some(id.clone());
                 }
