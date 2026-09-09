@@ -31,11 +31,12 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
 
     let busy = app.export_job.is_some();
     let mut open = true;
-    let mut start = false;
+    let mut start_mp3 = false;
+    let mut start_mp4 = false;
     let mut cancel = false;
     ui.modal(
         {
-            let w = Window::new("Export MP3").size(Vec2::new(380.0, 200.0));
+            let w = Window::new("Export").size(Vec2::new(400.0, 220.0));
             if busy {
                 w
             } else {
@@ -73,8 +74,11 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
                     ui.close_modal();
                 }
                 ui.add_enabled(!app.export_path.trim().is_empty(), |ui| {
-                    if ui.button("Export").clicked {
-                        start = true;
+                    if ui.button("MP3").clicked {
+                        start_mp3 = true;
+                    }
+                    if ui.button("MP4").clicked {
+                        start_mp4 = true;
                     }
                 });
             });
@@ -84,18 +88,21 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
         app.export_open = false;
         return;
     }
-    if start {
-        begin_export(app);
+    if start_mp3 {
+        begin_export(app, false);
+    } else if start_mp4 {
+        begin_export(app, true);
     }
 }
 
 fn pick_path(app: &mut App) {
     let name = if app.export_path.trim().is_empty() {
-        "export.mp3".into()
+        "export.mp4".into()
     } else {
         app.export_path.clone()
     };
     let path = rfd::FileDialog::new()
+        .add_filter("MP4", &["mp4"])
         .add_filter("MP3", &["mp3"])
         .set_file_name(&name)
         .save_file();
@@ -104,7 +111,7 @@ fn pick_path(app: &mut App) {
     }
 }
 
-fn begin_export(app: &mut App) {
+fn begin_export(app: &mut App, video: bool) {
     let path = app.export_path.trim().to_string();
     if path.is_empty() {
         return;
@@ -112,6 +119,7 @@ fn begin_export(app: &mut App) {
     let bars = app.export_bars.clamp(1, MAX_BARS) as u32;
     let mut patch = Patch::from_main(&app.project, true);
     patch.playing = true;
+    let sequences = app.project.sequences.clone();
     let progress = Arc::new(AtomicU32::new(0));
     let done = Arc::new(Mutex::new(None));
     let progress_t = progress.clone();
@@ -119,7 +127,11 @@ fn begin_export(app: &mut App) {
     let path_buf = std::path::PathBuf::from(&path);
     let path_job = path_buf.clone();
     thread::spawn(move || {
-        let result = export::write_mp3(&patch, bars, &path_buf, &progress_t);
+        let result = if video {
+            export::write_mp4(&patch, &sequences, bars, &path_buf, &progress_t)
+        } else {
+            export::write_mp3(&patch, bars, &path_buf, &progress_t)
+        };
         if let Ok(mut g) = done_t.lock() {
             *g = Some(result);
         }

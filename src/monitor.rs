@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use crate::fft::{SPEC_BINS, SPEC_COLS};
 
 pub const SCOPE_LEN: usize = 2048;
-pub const GONIO_LEN: usize = 2048;
+pub const GONIO_LEN: usize = 4096;
 pub const GONIO_BINS: usize = 72;
 pub const SLICE_BINS: usize = 1024;
 
@@ -72,6 +72,20 @@ impl GonioBuf {
         let mut right = vec![0.0; GONIO_LEN];
         for i in 0..GONIO_LEN {
             let idx = (w + i) % GONIO_LEN;
+            left[i] = f32::from_bits(self.lr[idx * 2].load(Ordering::Relaxed));
+            right[i] = f32::from_bits(self.lr[idx * 2 + 1].load(Ordering::Relaxed));
+        }
+        (left, right)
+    }
+
+    pub fn snapshot_recent(&self, n: usize) -> (Vec<f32>, Vec<f32>) {
+        let n = n.clamp(1, GONIO_LEN);
+        let w = self.write.load(Ordering::Relaxed);
+        let mut left = vec![0.0; n];
+        let mut right = vec![0.0; n];
+        let start = w + GONIO_LEN - n;
+        for i in 0..n {
+            let idx = (start + i) % GONIO_LEN;
             left[i] = f32::from_bits(self.lr[idx * 2].load(Ordering::Relaxed));
             right[i] = f32::from_bits(self.lr[idx * 2 + 1].load(Ordering::Relaxed));
         }
@@ -340,7 +354,6 @@ impl MixLevels {
     }
 }
 
-#[derive(Default)]
 pub struct Monitor {
     playheads: Mutex<HashMap<String, Arc<AtomicU32>>>,
     meters: Mutex<HashMap<String, Arc<AtomicU32>>>,
@@ -351,6 +364,28 @@ pub struct Monitor {
     ffts: Mutex<HashMap<String, Arc<FftBuf>>>,
     notes: Mutex<HashMap<String, Arc<PitchSet>>>,
     song_beats: AtomicU64,
+    viz_gonio: Arc<GonioBuf>,
+    viz_waves: Mutex<HashMap<String, Arc<ScopeBuf>>>,
+    horizon: Mutex<Arc<Vec<crate::viz::Note>>>,
+}
+
+impl Default for Monitor {
+    fn default() -> Self {
+        Self {
+            playheads: Mutex::new(HashMap::new()),
+            meters: Mutex::new(HashMap::new()),
+            mixers: Mutex::new(HashMap::new()),
+            scopes: Mutex::new(HashMap::new()),
+            slices: Mutex::new(HashMap::new()),
+            gonios: Mutex::new(HashMap::new()),
+            ffts: Mutex::new(HashMap::new()),
+            notes: Mutex::new(HashMap::new()),
+            song_beats: AtomicU64::new(0),
+            viz_gonio: Arc::new(GonioBuf::new()),
+            viz_waves: Mutex::new(HashMap::new()),
+            horizon: Mutex::new(Arc::new(Vec::new())),
+        }
+    }
 }
 
 impl Monitor {
@@ -496,6 +531,98 @@ impl Monitor {
         };
         slot.map(|s| s.load()).unwrap_or_default()
     }
+
+    pub fn viz_gonio(&self) -> Arc<GonioBuf> {
+        self.viz_gonio.clone()
+    }
+
+    pub fn viz_gonio_pairs(&self) -> Vec<[f32; 2]> {
+        let (l, r) = self.viz_gonio.snapshot_recent(768);
+        l.into_iter().zip(r).map(|(a, b)| [a, b]).collect()
+    }
+
+    pub fn reset_viz_waves(&self) {
+        self.viz_waves
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    pub fn viz_wave_buf(&self, id: &str) -> Arc<ScopeBuf> {
+        let mut m = self.viz_waves.lock().unwrap_or_else(|e| e.into_inner());
+        m.entry(id.to_string())
+            .or_insert_with(|| Arc::new(ScopeBuf::new()))
+            .clone()
+    }
+
+    pub fn viz_waves(&self, notes: &[crate::viz::Note]) -> Vec<crate::viz::Wave> {
+        use crate::viz::{MAX_WAVES, WAVE_BINS};
+        let map = self.viz_waves.lock().unwrap_or_else(|e| e.into_inner());
+        if map.is_empty() {
+            return Vec::new();
+        }
+        let mut color_of: HashMap<String, [f32; 4]> = HashMap::new();
+        for n in notes {
+            if !n.wave.is_empty() {
+                color_of.entry(n.wave.clone()).or_insert(n.color);
+            }
+        }
+        let mut preferred: Vec<String> = notes
+            .iter()
+            .map(|n| n.wave.clone())
+            .filter(|id| !id.is_empty() && map.contains_key(id))
+            .collect();
+        preferred.sort();
+        preferred.dedup();
+        let mut extra: Vec<String> = map
+            .keys()
+            .filter(|k| !preferred.contains(k))
+            .cloned()
+            .collect();
+        extra.sort();
+        preferred.extend(extra);
+        preferred.truncate(MAX_WAVES);
+        preferred
+            .into_iter()
+            .filter_map(|id| {
+                let buf = map.get(&id)?;
+                let color = color_of.get(&id).copied().unwrap_or(wave_palette(&id));
+                Some(crate::viz::Wave {
+                    color,
+                    samples: crate::viz::downsample(&buf.snapshot(), WAVE_BINS),
+                })
+            })
+            .collect()
+    }
+
+    pub fn set_horizon(&self, notes: Vec<crate::viz::Note>) {
+        let mut h = self.horizon.lock().unwrap_or_else(|e| e.into_inner());
+        *h = Arc::new(notes);
+    }
+
+    pub fn horizon(&self) -> Arc<Vec<crate::viz::Note>> {
+        self.horizon
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+}
+
+fn wave_palette(id: &str) -> [f32; 4] {
+    const PAL: [[f32; 4]; 7] = [
+        [0.28, 0.62, 0.92, 1.0],
+        [0.92, 0.62, 0.22, 1.0],
+        [0.72, 0.38, 0.92, 1.0],
+        [0.92, 0.82, 0.22, 1.0],
+        [0.22, 0.78, 0.72, 1.0],
+        [0.92, 0.38, 0.55, 1.0],
+        [0.55, 0.72, 0.28, 1.0],
+    ];
+    let mut h = 0u64;
+    for b in id.as_bytes() {
+        h = h.wrapping_mul(16777619) ^ *b as u64;
+    }
+    PAL[(h as usize) % PAL.len()]
 }
 
 #[cfg(test)]

@@ -23,10 +23,11 @@ use crate::fft::{
 };
 use crate::graph::{
     midi_shift, output_port_type, parse_seq_when, port, seq_window, EditorView, GraphDoc, Instrument,
-    NodeKind, Project, SeqNote, BEATS_PER_BAR, BEATS_PER_STEP, MIX_INS,
+    NodeKind, Project, SeqNote, Sequence, BEATS_PER_BAR, BEATS_PER_STEP, DEFAULT_GROUP_COLOR, MIX_INS,
     NOTE_JOIN_INS,
 };
 use crate::monitor::{FftBuf, GonioBuf, MixLevels, Monitor, ScopeBuf, SliceBuf, SLICE_BINS};
+use crate::viz;
 
 pub const WAVEFORMS: [(&str, Waveform); 5] = [
     ("Sine", Waveform::Sine),
@@ -611,6 +612,28 @@ fn connect_wire(graph: &mut Graph, src: Wire, dst: Wire) {
     }
 }
 
+fn viz_wave_out(
+    graph: &mut Graph,
+    monitor: &Monitor,
+    editor_id: &str,
+    src: NodeId,
+    keep_waves: bool,
+) -> Wire {
+    if !keep_waves {
+        return Wire::stereo(src, 0, 1);
+    }
+    let tap = graph.add_node(Box::new(ScopeTap {
+        buf: monitor.viz_wave_buf(editor_id),
+    }));
+    graph.connect(src, 0, tap, 0);
+    graph.connect(src, 1, tap, 1);
+    Wire::stereo(tap, 0, 1)
+}
+
+fn stereo_thru(graph: &mut Graph) -> NodeId {
+    graph.add_node(Box::new(StereoGain::new(1.0)))
+}
+
 pub struct Build {
     pub graph: Graph,
     pub voices: HashMap<String, NodeId>,
@@ -621,11 +644,19 @@ pub struct Build {
 }
 
 pub fn build_graph(patch: &Patch, sample_rate: f32, monitor: &Monitor) -> Build {
-    build_graph_at(patch, sample_rate, monitor, 1)
+    build_graph_at(patch, sample_rate, monitor, 1, false, true)
 }
 
-fn build_graph_at(patch: &Patch, sample_rate: f32, monitor: &Monitor, block_size: usize) -> Build {
+fn build_graph_at(
+    patch: &Patch,
+    sample_rate: f32,
+    monitor: &Monitor,
+    block_size: usize,
+    offline: bool,
+    keep_waves: bool,
+) -> Build {
     let block_size = block_size.max(1);
+    monitor.reset_viz_waves();
     let mut graph = Graph::new(sample_rate, block_size);
     let mut out_port: HashMap<(String, String), Wire> = HashMap::new();
     let mut in_port: HashMap<(String, String), Wire> = HashMap::new();
@@ -669,7 +700,7 @@ fn build_graph_at(patch: &Patch, sample_rate: f32, monitor: &Monitor, block_size
                 in_port.insert((n.id.clone(), "pitch".into()), Wire::mono(id, 0));
                 in_port.insert((n.id.clone(), "amp".into()), Wire::mono(id, 1));
                 in_port.insert((n.id.clone(), "pwm".into()), Wire::mono(id, 2));
-                out_port.insert((n.id.clone(), "out".into()), Wire::stereo(id, 0, 1));
+                out_port.insert((n.id.clone(), "out".into()), viz_wave_out(&mut graph, monitor, &n.id, id, keep_waves));
             }
             NodeKind::Tone => {
                 let wf = WAVEFORMS.get(n.waveform).map(|w| w.1).unwrap_or(Waveform::Sine);
@@ -683,7 +714,7 @@ fn build_graph_at(patch: &Patch, sample_rate: f32, monitor: &Monitor, block_size
                 )));
                 voices.insert(n.id.clone(), id);
                 dsp.insert(n.id.clone(), id);
-                out_port.insert((n.id.clone(), "out".into()), Wire::stereo(id, 0, 1));
+                out_port.insert((n.id.clone(), "out".into()), viz_wave_out(&mut graph, monitor, &n.id, id, keep_waves));
             }
             NodeKind::Shape => {
                 let mut inst = PolyphonicInstrument::new(
@@ -716,7 +747,7 @@ fn build_graph_at(patch: &Patch, sample_rate: f32, monitor: &Monitor, block_size
                 voices.insert(n.id.clone(), id);
                 dsp.insert(n.id.clone(), id);
                 in_port.insert((n.id.clone(), "freq".into()), Wire::mono(id, 0));
-                out_port.insert((n.id.clone(), "out".into()), Wire::stereo(id, 0, 1));
+                out_port.insert((n.id.clone(), "out".into()), viz_wave_out(&mut graph, monitor, &n.id, id, keep_waves));
             }
             NodeKind::Guitar => {
                 let mut gtr = KarplusStrong::new(sample_rate);
@@ -724,7 +755,7 @@ fn build_graph_at(patch: &Patch, sample_rate: f32, monitor: &Monitor, block_size
                 let id = graph.add_node(Box::new(gtr));
                 voices.insert(n.id.clone(), id);
                 dsp.insert(n.id.clone(), id);
-                out_port.insert((n.id.clone(), "out".into()), Wire::stereo(id, 0, 1));
+                out_port.insert((n.id.clone(), "out".into()), viz_wave_out(&mut graph, monitor, &n.id, id, keep_waves));
             }
             NodeKind::Piano => {
                 let mut pno = AdditivePiano::new(sample_rate);
@@ -732,13 +763,13 @@ fn build_graph_at(patch: &Patch, sample_rate: f32, monitor: &Monitor, block_size
                 let id = graph.add_node(Box::new(pno));
                 voices.insert(n.id.clone(), id);
                 dsp.insert(n.id.clone(), id);
-                out_port.insert((n.id.clone(), "out".into()), Wire::stereo(id, 0, 1));
+                out_port.insert((n.id.clone(), "out".into()), viz_wave_out(&mut graph, monitor, &n.id, id, keep_waves));
             }
             NodeKind::Drums => {
                 let id = graph.add_node(Box::new(AnalogDrums::new(sample_rate)));
                 voices.insert(n.id.clone(), id);
                 dsp.insert(n.id.clone(), id);
-                out_port.insert((n.id.clone(), "out".into()), Wire::stereo(id, 0, 1));
+                out_port.insert((n.id.clone(), "out".into()), viz_wave_out(&mut graph, monitor, &n.id, id, keep_waves));
             }
             NodeKind::AudioIn => {
                 let tap = patch
@@ -761,7 +792,7 @@ fn build_graph_at(patch: &Patch, sample_rate: f32, monitor: &Monitor, block_size
                     }));
                 let id = graph.add_node(Box::new(SamplePlayer::new(clip)));
                 dsp.insert(n.id.clone(), id);
-                out_port.insert((n.id.clone(), "out".into()), Wire::stereo(id, 0, 1));
+                out_port.insert((n.id.clone(), "out".into()), viz_wave_out(&mut graph, monitor, &n.id, id, keep_waves));
             }
             NodeKind::Osc => {
                 let wf = WAVEFORMS.get(n.waveform).map(|w| w.1).unwrap_or(Waveform::Saw);
@@ -866,10 +897,14 @@ fn build_graph_at(patch: &Patch, sample_rate: f32, monitor: &Monitor, block_size
                 let n_strips = MIX_INS.len();
                 let mut mix = StereoMixer::new(n_strips);
                 apply_mixer_strips(&mut mix, n);
-                let id = graph.add_node(Box::new(MeteredMixer {
-                    mix,
-                    levels: monitor.mix_levels(&n.id, n_strips),
-                }));
+                let id = if offline {
+                    graph.add_node(Box::new(mix))
+                } else {
+                    graph.add_node(Box::new(MeteredMixer {
+                        mix,
+                        levels: monitor.mix_levels(&n.id, n_strips),
+                    }))
+                };
                 dsp.insert(n.id.clone(), id);
                 for (i, p) in MIX_INS.iter().enumerate() {
                     in_port.insert(
@@ -884,26 +919,39 @@ fn build_graph_at(patch: &Patch, sample_rate: f32, monitor: &Monitor, block_size
                 out_port.insert((n.id.clone(), "out".into()), Wire::stereo(id, 0, 1));
             }
             NodeKind::Scope => {
-                let tap = ScopeTap {
-                    buf: monitor.scope_buf(&n.id),
+                let id = if offline {
+                    stereo_thru(&mut graph)
+                } else {
+                    graph.add_node(Box::new(ScopeTap {
+                        buf: monitor.scope_buf(&n.id),
+                    }))
                 };
-                let id = graph.add_node(Box::new(tap));
                 dsp.insert(n.id.clone(), id);
                 in_port.insert((n.id.clone(), "in".into()), Wire::stereo(id, 0, 1));
                 out_port.insert((n.id.clone(), "out".into()), Wire::stereo(id, 0, 1));
             }
             NodeKind::WaveSlice => {
-                let tap = WaveSliceTap::new(monitor.slice_buf(&n.id), sample_rate, n.slice_time);
-                let id = graph.add_node(Box::new(tap));
+                let id = if offline {
+                    stereo_thru(&mut graph)
+                } else {
+                    graph.add_node(Box::new(WaveSliceTap::new(
+                        monitor.slice_buf(&n.id),
+                        sample_rate,
+                        n.slice_time,
+                    )))
+                };
                 dsp.insert(n.id.clone(), id);
                 in_port.insert((n.id.clone(), "in".into()), Wire::stereo(id, 0, 1));
                 out_port.insert((n.id.clone(), "out".into()), Wire::stereo(id, 0, 1));
             }
             NodeKind::Gonio => {
-                let tap = GonioTap {
-                    buf: monitor.gonio_buf(&n.id),
+                let id = if offline {
+                    stereo_thru(&mut graph)
+                } else {
+                    graph.add_node(Box::new(GonioTap {
+                        buf: monitor.gonio_buf(&n.id),
+                    }))
                 };
-                let id = graph.add_node(Box::new(tap));
                 dsp.insert(n.id.clone(), id);
                 in_port.insert((n.id.clone(), "in".into()), Wire::stereo(id, 0, 1));
                 out_port.insert((n.id.clone(), "out".into()), Wire::stereo(id, 0, 1));
@@ -917,8 +965,11 @@ fn build_graph_at(patch: &Patch, sample_rate: f32, monitor: &Monitor, block_size
                 out_port.insert((n.id.clone(), "out".into()), Wire::mono(id, 0));
             }
             NodeKind::Spectrum | NodeKind::Spectrogram => {
-                let tap = FftTap::new(monitor.fft_buf(&n.id), sample_rate);
-                let id = graph.add_node(Box::new(tap));
+                let id = if offline {
+                    stereo_thru(&mut graph)
+                } else {
+                    graph.add_node(Box::new(FftTap::new(monitor.fft_buf(&n.id), sample_rate)))
+                };
                 dsp.insert(n.id.clone(), id);
                 in_port.insert((n.id.clone(), "in".into()), Wire::stereo(id, 0, 1));
                 out_port.insert((n.id.clone(), "out".into()), Wire::stereo(id, 0, 1));
@@ -1128,6 +1179,8 @@ pub struct Live {
     bpm: f32,
     seek_gen: u64,
     block_size: usize,
+    offline: bool,
+    keep_waves: bool,
 }
 
 /// Audio callback inner block. Sequencer ticks once per chunk (~1.3 ms at 48 kHz).
@@ -1144,10 +1197,46 @@ impl Live {
         monitor: Arc<Monitor>,
         block_size: usize,
     ) -> (Self, Graph) {
+        Self::new_with(patch, sample_rate, monitor, block_size, false, true)
+    }
+
+    pub fn new_export(
+        patch: &Patch,
+        sample_rate: f32,
+        monitor: Arc<Monitor>,
+        block_size: usize,
+    ) -> (Self, Graph) {
+        Self::new_with(patch, sample_rate, monitor, block_size, true, false)
+    }
+
+    pub fn new_export_viz(
+        patch: &Patch,
+        sample_rate: f32,
+        monitor: Arc<Monitor>,
+        block_size: usize,
+    ) -> (Self, Graph) {
+        Self::new_with(patch, sample_rate, monitor, block_size, true, true)
+    }
+
+    fn new_with(
+        patch: &Patch,
+        sample_rate: f32,
+        monitor: Arc<Monitor>,
+        block_size: usize,
+        offline: bool,
+        keep_waves: bool,
+    ) -> (Self, Graph) {
         let block_size = block_size.max(1);
-        let build = build_graph_at(patch, sample_rate, &monitor, block_size);
+        let build = build_graph_at(patch, sample_rate, &monitor, block_size, offline, keep_waves);
         let mut graph = build.graph;
-        let preview = attach_preview(&mut graph, build.master, sample_rate, block_size);
+        let preview = attach_preview(
+            &mut graph,
+            build.master,
+            sample_rate,
+            block_size,
+            monitor.viz_gonio(),
+            offline,
+        );
         let mut live = Self {
             sample_rate,
             playing: patch.playing,
@@ -1169,6 +1258,8 @@ impl Live {
             bpm: patch.bpm.max(1.0),
             seek_gen: patch.seek_gen,
             block_size,
+            offline,
+            keep_waves,
         };
         live.rebuild_clocks(patch);
         live.rebuild_taps(patch);
@@ -1485,6 +1576,8 @@ impl Live {
                 NodeKind::Mixer => {
                     if let Some(mix) = graph.node_mut::<MeteredMixer>(id) {
                         apply_mixer_strips(&mut mix.mix, n);
+                    } else if let Some(mix) = graph.node_mut::<StereoMixer>(id) {
+                        apply_mixer_strips(mix, n);
                     }
                 }
                 _ => {}
@@ -1515,14 +1608,28 @@ impl Live {
         let topo = patch.topo_hash();
         let keep_held = topo == self.topo;
         if !keep_held {
-            let build = build_graph_at(&patch, self.sample_rate, &self.monitor, self.block_size);
+            let build = build_graph_at(
+                &patch,
+                self.sample_rate,
+                &self.monitor,
+                self.block_size,
+                self.offline,
+                self.keep_waves,
+            );
             *graph = build.graph;
             self.voices = build.voices;
             self.dsp = build.dsp;
             self.lfo_mix = build.lfo_mix;
             self.master = build.master;
             self.gates = build.gates;
-            self.preview = attach_preview(graph, self.master, self.sample_rate, self.block_size);
+            self.preview = attach_preview(
+                graph,
+                self.master,
+                self.sample_rate,
+                self.block_size,
+                self.monitor.viz_gonio(),
+                self.offline,
+            );
             self.topo = topo;
             self.voice_holds.clear();
         }
@@ -2831,7 +2938,14 @@ fn expand_instruments(
     }
 }
 
-fn attach_preview(graph: &mut Graph, master: NodeId, sample_rate: f32, block_size: usize) -> NodeId {
+fn attach_preview(
+    graph: &mut Graph,
+    master: NodeId,
+    sample_rate: f32,
+    block_size: usize,
+    gonio: Arc<GonioBuf>,
+    offline: bool,
+) -> NodeId {
     let voice = graph.add_node(Box::new(PolyphonicInstrument::new(
         8,
         sample_rate,
@@ -2845,6 +2959,10 @@ fn attach_preview(graph: &mut Graph, master: NodeId, sample_rate: f32, block_siz
         },
         0.5,
     )));
+    if offline {
+        graph.set_master_output(master, 0);
+        return voice;
+    }
     let gain = graph.add_node(Box::new(StereoGain::new(MASTER_GAIN)));
     graph.connect(voice, 0, gain, 0);
     graph.connect(voice, 1, gain, 1);
@@ -2853,7 +2971,10 @@ fn attach_preview(graph: &mut Graph, master: NodeId, sample_rate: f32, block_siz
     graph.connect(master, 1, mix, 1);
     graph.connect(gain, 0, mix, 2);
     graph.connect(gain, 1, mix, 3);
-    graph.set_master_output(mix, 0);
+    let tap = graph.add_node(Box::new(GonioTap { buf: gonio }));
+    graph.connect(mix, 0, tap, 0);
+    graph.connect(mix, 1, tap, 1);
+    graph.set_master_output(tap, 0);
     voice
 }
 
@@ -2933,11 +3054,95 @@ fn audio_reaches_master(patch: &Patch, start: &str) -> bool {
     false
 }
 
+#[derive(Clone, Copy, PartialEq)]
+struct PlayRoute {
+    pitch: i32,
+    delay: f64,
+    gate: f64,
+}
+
+fn group_color(sequences: &[Sequence], seq_id: &str, group: u32) -> [f32; 4] {
+    sequences
+        .iter()
+        .find(|s| s.id == seq_id)
+        .and_then(|s| s.group(group))
+        .map(|g| g.color)
+        .unwrap_or(DEFAULT_GROUP_COLOR)
+}
+
+/// Notes that sequencers will actually fire into voices that reach Output.
+pub fn viz_notes(patch: &Patch, sequences: &[Sequence]) -> Vec<viz::Note> {
+    let mut out = Vec::new();
+    let mut lanes: HashMap<(String, u32), u32> = HashMap::new();
+    let mut next_lane = 0u32;
+    for n in &patch.nodes {
+        if n.kind != NodeKind::Sequencer || n.bypass {
+            continue;
+        }
+        if seq_clock_id(patch, &n.id).is_none() {
+            continue;
+        }
+        let (hits, _) = walk_seq_notes(patch, &n.id);
+        if hits.is_empty() {
+            continue;
+        }
+        let loop_len = n.loop_beats();
+        let when = parse_seq_when(&n.seq_when);
+        let color_of = |g: u32| group_color(sequences, &n.seq_id, g);
+        for note in &n.notes {
+            let lane = *lanes.entry((n.id.clone(), note.group)).or_insert_with(|| {
+                let i = next_lane;
+                next_lane += 1;
+                i
+            });
+            let note_dur = note.len.max(1) as f64 * BEATS_PER_STEP as f64;
+            for (vid, r) in &hits {
+                let dur = if r.gate > 1e-9 { r.gate } else { note_dur };
+                if dur >= loop_len - 1e-9 {
+                    continue;
+                }
+                let start = (note.step as f64 * BEATS_PER_STEP as f64 + r.delay).rem_euclid(loop_len);
+                out.push(viz::Note {
+                    pitch: midi_shift(note.pitch, r.pitch),
+                    start,
+                    dur,
+                    loop_len,
+                    color: color_of(note.group),
+                    when: when.clone(),
+                    lane,
+                    wave: vid.clone(),
+                });
+            }
+        }
+    }
+    out
+}
+
 fn seq_routes(
     patch: &Patch,
     seq_id: &str,
     voices: &HashMap<String, NodeId>,
 ) -> (Vec<SeqTarget>, Vec<TapTarget>) {
+    let (hits, taps) = walk_seq_notes(patch, seq_id);
+    let mut out = Vec::new();
+    for (id, r) in hits {
+        let Some(&voice) = voices.get(&id) else {
+            continue;
+        };
+        let t = SeqTarget {
+            voice,
+            pitch: r.pitch,
+            delay: r.delay,
+            gate: r.gate,
+        };
+        if !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    (out, taps)
+}
+
+fn walk_seq_notes(patch: &Patch, seq_id: &str) -> (Vec<(String, PlayRoute)>, Vec<TapTarget>) {
     let node = |id: &str| patch.nodes.iter().find(|n| n.id == id);
     let kind_of = |id: &str| node(id).map(|n| n.kind);
     let mut out = Vec::new();
@@ -2971,14 +3176,14 @@ fn seq_routes(
                     if !audio_reaches_master(patch, to) {
                         continue;
                     }
-                    if let Some(&id) = voices.get(to) {
-                        out.push(SeqTarget {
-                            voice: id,
+                    out.push((
+                        to.clone(),
+                        PlayRoute {
                             pitch,
                             delay,
                             gate,
-                        });
-                    }
+                        },
+                    ));
                 }
                 (Some(NodeKind::NoteJoin), p) if NOTE_JOIN_INS.contains(&p) => {
                     stack.push((to.clone(), "out".into(), pitch, delay, gate));
@@ -3223,6 +3428,45 @@ mod tests {
             clips: HashMap::new(),
             preview_seq: None,
         }
+    }
+
+    #[test]
+    fn viz_notes_from_default_project() {
+        let p = crate::graph::Project::new_default();
+        let patch = Patch::from_main(&p, false);
+        let notes = viz_notes(&patch, &p.sequences);
+        assert_eq!(notes.len(), 8);
+        assert!(notes.iter().any(|n| n.pitch == 60));
+        assert!(notes.iter().any(|n| n.pitch == 71));
+        assert!(notes.iter().all(|n| !n.wave.is_empty()));
+    }
+
+    #[test]
+    fn viz_notes_follows_transpose() {
+        let clock = crate::graph::GraphNode::new("clk".into(), NodeKind::Clock, glam::Vec2::ZERO);
+        let mut seq = crate::graph::GraphNode::new("seq".into(), NodeKind::Sequencer, glam::Vec2::ZERO);
+        seq.notes = vec![SeqNote {
+            step: 0,
+            pitch: 60,
+            len: 2,
+            group: 0,
+        }];
+        let mut tr = crate::graph::GraphNode::new("tr".into(), NodeKind::Transpose, glam::Vec2::ZERO);
+        tr.transpose_notes = 12;
+        let voice = crate::graph::GraphNode::new("voice".into(), NodeKind::Voice, glam::Vec2::ZERO);
+        let out = crate::graph::GraphNode::new("out".into(), NodeKind::Output, glam::Vec2::ZERO);
+        let patch = patch_with(
+            vec![clock, seq, tr, voice, out],
+            vec![
+                ("clk", "clock", "seq", "clock"),
+                ("seq", "notes", "tr", "in"),
+                ("tr", "out", "voice", "notes"),
+                ("voice", "out", "out", "in"),
+            ],
+        );
+        let notes = viz_notes(&patch, &[]);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].pitch, 72);
     }
 
     #[test]

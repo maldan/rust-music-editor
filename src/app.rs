@@ -92,6 +92,8 @@ pub struct App {
     pub export_bars: i32,
     pub export_job: Option<ExportJob>,
     pub devices: DeviceLists,
+    /// Pixel size of the Visual dock tab when it is the active pane.
+    pub viz_px: Option<(u32, u32)>,
     current_path: Option<PathBuf>,
     last_fp: u64,
     last_playing: bool,
@@ -145,6 +147,8 @@ impl App {
     pub fn start() -> Result<Self, Box<dyn std::error::Error>> {
         let project = Project::new_default();
         let monitor = Arc::new(Monitor::default());
+        let first = Patch::from_project(&project, false);
+        monitor.set_horizon(crate::compile::viz_notes(&first, &project.sequences));
         let (engine, tx, preview_tx) = boot(&project, false, monitor.clone(), None)?;
 
         Ok(Self {
@@ -162,6 +166,7 @@ impl App {
             export_bars: 8,
             export_job: None,
             devices: DeviceLists::fetch(),
+            viz_px: None,
             current_path: None,
             engine_out: String::new(),
             captures: CaptureBank::new(),
@@ -202,6 +207,8 @@ impl App {
         self.last_seek_gen = self.project.main.seek_gen;
         let mut patch = Patch::from_project(&self.project, self.playing);
         patch.captures = self.captures.bind(&patch.nodes, &mut self.status);
+        self.monitor
+            .set_horizon(crate::compile::viz_notes(&patch, &self.project.sequences));
         let _ = self.tx.send(patch);
     }
 

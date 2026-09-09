@@ -8,6 +8,7 @@ mod framework;
 mod graph;
 mod monitor;
 mod ui;
+mod viz;
 
 use app::App;
 use framework::Host;

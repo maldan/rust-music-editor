@@ -38,6 +38,7 @@ struct Gpu {
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     renderer: UiRenderer,
+    viz: crate::viz::Renderer,
 }
 
 #[derive(Default)]
@@ -166,6 +167,14 @@ pub trait Scene {
         stats: DrawStats,
         keys: &KeyEvents,
     ) -> bool;
+    /// Offscreen wgpu visualizer for the Visual dock tab. `None` = tab hidden.
+    fn viz_frame(&self) -> Option<crate::viz::Frame> {
+        None
+    }
+    /// `true` = Escape consumed (don't quit).
+    fn handle_escape(&mut self) -> bool {
+        false
+    }
 }
 
 pub struct Host<S: Scene> {
@@ -182,6 +191,7 @@ pub struct Host<S: Scene> {
     draw_stats: DrawStats,
     clipboard: Option<arboard::Clipboard>,
     key_events: KeyEvents,
+    viz_was_on: bool,
 }
 
 impl<S: Scene> Host<S> {
@@ -202,6 +212,7 @@ impl<S: Scene> Host<S> {
             draw_stats: DrawStats::default(),
             clipboard: arboard::Clipboard::new().ok(),
             key_events: KeyEvents::default(),
+            viz_was_on: false,
         }
     }
 
@@ -267,6 +278,7 @@ impl<S: Scene> Host<S> {
 
         let renderer = UiRenderer::new(&device, &queue, format, &self.ui);
         renderer.set_viewport(&queue, width as f32, height as f32);
+        let viz = crate::viz::Renderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
 
         self.gpu = Some(Gpu {
             device,
@@ -274,6 +286,7 @@ impl<S: Scene> Host<S> {
             surface,
             config,
             renderer,
+            viz,
         });
         self.window = Some(window);
     }
@@ -362,6 +375,29 @@ impl<S: Scene> Host<S> {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("ui frame"),
             });
+
+        if let Some(mut viz_frame) = S::viz_frame(&self.state) {
+            if !self.viz_was_on {
+                viz_frame.reset = true;
+            }
+            let w = viz_frame.width;
+            let h = viz_frame.height;
+            gpu.viz.render(
+                &gpu.device,
+                &gpu.queue,
+                &mut encoder,
+                w,
+                h,
+                &viz_frame,
+            );
+            if let Some(color) = gpu.viz.color_view() {
+                gpu.renderer
+                    .bind_texture_view(&gpu.device, crate::viz::TEX_SLOT, color);
+            }
+            self.viz_was_on = true;
+        } else {
+            self.viz_was_on = false;
+        }
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -609,7 +645,9 @@ impl<S: Scene> ApplicationHandler for Host<S> {
                     }
                 }
                 if let PhysicalKey::Code(KeyCode::Escape) = event.physical_key {
-                    event_loop.exit();
+                    if event.state == ElementState::Pressed && !self.state.handle_escape() {
+                        event_loop.exit();
+                    }
                 }
                 if let Some(window) = &self.window {
                     window.request_redraw();

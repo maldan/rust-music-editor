@@ -19,6 +19,7 @@ use mega_ui::{DockNode, DockState, Ui};
 use crate::app::App;
 use crate::framework::{DrawStats, KeyEvents, Scene};
 use crate::graph::EditorView;
+use crate::viz;
 
 pub fn default_dock() -> DockState {
     DockState::new(DockNode::split_h(
@@ -26,7 +27,7 @@ pub fn default_dock() -> DockState {
         DockNode::leaf(&["Project"]),
         DockNode::split_h(
             0.80,
-            DockNode::leaf(&["Graph"]),
+            DockNode::leaf(&["Graph", "Visual"]),
             DockNode::split_v(
                 0.62,
                 DockNode::leaf(&["Inspector"]),
@@ -74,7 +75,7 @@ impl Scene for App {
                 if ui.menu_item("Save As...").clicked() {
                     state.save_dialog();
                 }
-                if ui.menu_item("Export MP3...").clicked() {
+                if ui.menu_item("Export...").clicked() {
                     state.export_open = true;
                 }
             });
@@ -130,15 +131,25 @@ impl Scene for App {
             status,
             preview_tx,
             devices,
+            viz_px,
             ..
         } = state;
 
         let dock_size = ui.available_size();
         let dock_size = Vec2::new(dock_size.x.max(1.0), dock_size.y.max(120.0));
 
+        *viz_px = None;
         ui.dock_space("main", dock_size, dock, |ui, tab| match tab {
             "Project" => explorer::draw(ui, project),
             "Graph" => draw_editor(ui, project, monitor, preview_tx, &seqs, &seq_groups, &insts, devices),
+            "Visual" => {
+                let size = ui.available_size();
+                let w = size.x.max(1.0).floor() as u32;
+                let h = size.y.max(1.0).floor() as u32;
+                ui.texture(viz::TEX_SLOT, Vec2::new(w as f32, h as f32));
+                ui.request_repaint();
+                *viz_px = Some((w.max(1), h.max(1)));
+            }
             "Inspector" => {
                 inspector::draw(ui, project, playing, monitor, status, preview_tx);
             }
@@ -155,6 +166,22 @@ impl Scene for App {
         export::draw(ui, state);
         state.sync_audio();
         true
+    }
+
+    fn viz_frame(&self) -> Option<viz::Frame> {
+        let (w, h) = self.viz_px?;
+        let notes = self.monitor.horizon();
+        let waves = self.monitor.viz_waves(&notes);
+        Some(viz::Frame {
+            now_beats: self.monitor.song_beats(),
+            window_beats: viz::WINDOW_BEATS,
+            notes,
+            gonio: Vec::new(),
+            waves,
+            reset: false,
+            width: w,
+            height: h,
+        })
     }
 }
 
