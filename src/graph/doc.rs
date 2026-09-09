@@ -4,7 +4,7 @@ use std::hash::{Hash, Hasher};
 use glam::Vec2;
 use mega_ui::{NodeLink, NodeSpace};
 
-use super::node::{output_port_type, port, tick_to_beats, GraphNode, NodeKind};
+use super::node::{output_port_type, port, tick_to_beats, EnvEdit, GraphNode, NodeKind};
 
 pub struct GraphDoc {
     pub nodes: Vec<GraphNode>,
@@ -231,6 +231,7 @@ impl GraphDoc {
             n.map_in_max.to_bits().hash(&mut h);
             n.map_out_min.to_bits().hash(&mut h);
             n.map_out_max.to_bits().hash(&mut h);
+            n.slice_time.to_bits().hash(&mut h);
             n.delay_time.to_bits().hash(&mut h);
             n.delay_feedback.to_bits().hash(&mut h);
             n.delay_mix.to_bits().hash(&mut h);
@@ -316,8 +317,26 @@ impl GraphDoc {
                 p.decay.hash(&mut h);
                 p.sustain.hash(&mut h);
             }
+            hash_env_edit(&mut h, &n.vol_env);
+            hash_env_edit(&mut h, &n.pitch_env);
         }
         self.bpm.to_bits().hash(&mut h);
         h.finish()
+    }
+}
+
+fn hash_env_edit(h: &mut DefaultHasher, e: &EnvEdit) {
+    e.time.to_bits().hash(h);
+    e.lo.to_bits().hash(h);
+    e.hi.to_bits().hash(h);
+    e.enabled.hash(h);
+    e.pts.len().hash(h);
+    for p in &e.pts {
+        p.t.to_bits().hash(h);
+        p.v.to_bits().hash(h);
+        p.tension.to_bits().hash(h);
+        (p.seg as usize).hash(h);
+        p.decay.hash(h);
+        p.sustain.hash(h);
     }
 }

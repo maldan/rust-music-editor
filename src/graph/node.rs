@@ -71,6 +71,7 @@ pub enum NodeKind {
     NoteFreq,
     Envelope,
     Scope,
+    WaveSlice,
     Gonio,
     Spectrum,
     Spectrogram,
@@ -124,6 +125,7 @@ impl NodeKind {
             Self::NoteFreq => "Note Freq",
             Self::Envelope => "Envelope",
             Self::Scope => "Waveform",
+            Self::WaveSlice => "Wave Slice",
             Self::Gonio => "Goniometer",
             Self::Spectrum => "Spectrum",
             Self::Spectrogram => "Spectrogram",
@@ -360,6 +362,9 @@ pub struct GraphNode {
     /// Spectrogram intensity gate (`0` = show all, `1` = only peaks).
     #[serde(default)]
     pub spec_floor: f32,
+    /// Wave Slice: capture window length in seconds.
+    #[serde(default = "default_slice_time")]
+    pub slice_time: f32,
     /// Shape Synth: sine → triangle → saw → square.
     #[serde(default)]
     pub wave_shape: f32,
@@ -412,6 +417,12 @@ pub struct GraphNode {
     pub env_ten0: f32,
     #[serde(skip)]
     pub env_drag_v0: f32,
+    /// Shape Synth: volume curve (same editor as Envelope node).
+    #[serde(default)]
+    pub vol_env: EnvEdit,
+    /// Shape Synth: pitch curve. Out min/max are semitones.
+    #[serde(default = "default_pitch_env")]
+    pub pitch_env: EnvEdit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -468,6 +479,85 @@ pub struct EnvPt {
     pub decay: bool,
     #[serde(default)]
     pub sustain: bool,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct EnvEdit {
+    #[serde(default = "default_env_pts")]
+    pub pts: Vec<EnvPt>,
+    #[serde(default = "default_env_time")]
+    pub time: f32,
+    #[serde(default = "default_env_lo")]
+    pub lo: f32,
+    #[serde(default = "default_env_hi")]
+    pub hi: f32,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(skip)]
+    pub sel: Option<usize>,
+    #[serde(skip)]
+    pub drag_ten: bool,
+    #[serde(skip)]
+    pub ten0: f32,
+    #[serde(skip)]
+    pub drag_v0: f32,
+}
+
+impl Default for EnvEdit {
+    fn default() -> Self {
+        Self {
+            pts: default_env_pts(),
+            time: default_env_time(),
+            lo: default_env_lo(),
+            hi: default_env_hi(),
+            enabled: false,
+            sel: None,
+            drag_ten: false,
+            ten0: 0.0,
+            drag_v0: 0.0,
+        }
+    }
+}
+
+impl EnvEdit {
+    pub fn knots(&self) -> Vec<mega_audio::dsp::EnvKnot> {
+        env_pts_to_knots(&self.pts)
+    }
+}
+
+fn default_pitch_env() -> EnvEdit {
+    EnvEdit {
+        hi: 0.0,
+        ..EnvEdit::default()
+    }
+}
+
+fn env_pts_to_knots(pts: &[EnvPt]) -> Vec<mega_audio::dsp::EnvKnot> {
+    let mut knots: Vec<mega_audio::dsp::EnvKnot> = pts
+        .iter()
+        .map(|p| mega_audio::dsp::EnvKnot {
+            t: p.t.clamp(0.0, 1.0),
+            v: p.v.clamp(0.0, 1.0),
+            tension: p.tension.clamp(-1.0, 1.0),
+            kind: p.seg.to_dsp(),
+            sustain: p.sustain,
+        })
+        .collect();
+    knots.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
+    if knots.len() < 2 {
+        default_env_pts()
+            .iter()
+            .map(|p| mega_audio::dsp::EnvKnot {
+                t: p.t,
+                v: p.v,
+                tension: p.tension,
+                kind: p.seg.to_dsp(),
+                sustain: p.sustain,
+            })
+            .collect()
+    } else {
+        knots
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -689,6 +779,9 @@ fn default_env_hi() -> f32 {
 fn default_spec_span() -> f32 {
     1.0
 }
+fn default_slice_time() -> f32 {
+    0.5
+}
 
 impl GraphNode {
     pub fn new(id: String, kind: NodeKind, pos: Vec2) -> Self {
@@ -800,6 +893,7 @@ impl GraphNode {
             spec_pos: 0.0,
             spec_span: 1.0,
             spec_floor: 0.0,
+            slice_time: 0.5,
             wave_shape: 0.0,
             wave_tension: 0.0,
             wave_skew: 0.0,
@@ -819,6 +913,8 @@ impl GraphNode {
             env_drag_ten: false,
             env_ten0: 0.0,
             env_drag_v0: 0.0,
+            vol_env: EnvEdit::default(),
+            pitch_env: default_pitch_env(),
         }
     }
 
@@ -829,6 +925,10 @@ impl GraphNode {
             self.adsr_sustain.clamp(0.0, 1.0),
             self.adsr_release.clamp(0.001, 6.0),
         )
+    }
+
+    pub fn env_knots(&self) -> Vec<mega_audio::dsp::EnvKnot> {
+        env_pts_to_knots(&self.env_pts)
     }
 
     pub fn wave_harms_array(&self) -> [f32; mega_audio::dsp::WAVE_HARMS] {
@@ -854,35 +954,6 @@ impl GraphNode {
             h[i] = *v;
         }
         self.wave_harms = h;
-    }
-
-    pub fn env_knots(&self) -> Vec<mega_audio::dsp::EnvKnot> {
-        let mut pts: Vec<mega_audio::dsp::EnvKnot> = self
-            .env_pts
-            .iter()
-            .map(|p| mega_audio::dsp::EnvKnot {
-                t: p.t.clamp(0.0, 1.0),
-                v: p.v.clamp(0.0, 1.0),
-                tension: p.tension.clamp(-1.0, 1.0),
-                kind: p.seg.to_dsp(),
-                sustain: p.sustain,
-            })
-            .collect();
-        pts.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
-        if pts.len() < 2 {
-            default_env_pts()
-                .iter()
-                .map(|p| mega_audio::dsp::EnvKnot {
-                    t: p.t,
-                    v: p.v,
-                    tension: p.tension,
-                    kind: p.seg.to_dsp(),
-                    sustain: p.sustain,
-                })
-                .collect()
-        } else {
-            pts
-        }
     }
 
     pub fn pitch_shift(&self) -> i32 {
@@ -1282,6 +1353,9 @@ mod tests {
         assert_eq!(n.adsr_params(), (0.01, 0.1, 0.7, 0.2));
         let p = GraphNode::new("p".into(), NodeKind::Piano, Vec2::ZERO);
         assert_eq!(p.adsr_params(), (0.003, 0.08, 1.0, 0.28));
+        let shp = GraphNode::new("shp".into(), NodeKind::Shape, Vec2::ZERO);
+        assert_eq!(shp.vol_env.pts.len(), default_env_pts().len());
+        assert!(!shp.vol_env.enabled && !shp.pitch_env.enabled);
         n.adsr_attack = 0.0;
         n.adsr_sustain = 2.0;
         n.adsr_release = 99.0;
@@ -1319,6 +1393,8 @@ mod tests {
         assert_eq!(NodeKind::Envelope.title(), "Envelope");
         assert_eq!(NodeKind::Readout.title(), "Readout");
         assert_eq!(NodeKind::Gonio.title(), "Goniometer");
+        assert_eq!(NodeKind::WaveSlice.title(), "Wave Slice");
+        assert!((GraphNode::new("sl".into(), NodeKind::WaveSlice, Vec2::ZERO).slice_time - 0.5).abs() < 1e-6);
         let g = GraphNode::new("g".into(), NodeKind::TranceGate, Vec2::ZERO);
         assert_eq!(g.gate_pattern, 0x5555);
         assert!((g.gate_mix - 1.0).abs() < 1e-6);

@@ -112,64 +112,91 @@ fn from_screen(inner: Rect, p: Vec2) -> Vec2 {
 
 pub fn draw(ui: &mut Ui, node: &mut GraphNode) {
     ui.group("Volume", |ui| {
-        draw_body(ui, node);
+        draw_fields(
+            ui,
+            &node.id,
+            "vol",
+            &mut node.adsr_attack,
+            &mut node.adsr_decay,
+            &mut node.adsr_sustain,
+            &mut node.adsr_release,
+        );
     });
-    node.adsr_attack = clamp_range(node.adsr_attack, ATTACK);
-    node.adsr_decay = clamp_range(node.adsr_decay, DECAY);
-    node.adsr_sustain = clamp_range(node.adsr_sustain, SUSTAIN);
-    node.adsr_release = clamp_range(node.adsr_release, RELEASE);
 }
 
-fn draw_body(ui: &mut Ui, node: &mut GraphNode) {
+pub fn draw_fields(
+    ui: &mut Ui,
+    node_id: &str,
+    key: &str,
+    attack: &mut f32,
+    decay: &mut f32,
+    sustain: &mut f32,
+    release: &mut f32,
+) {
+    *attack = clamp_range(*attack, ATTACK);
+    *decay = clamp_range(*decay, DECAY);
+    *sustain = clamp_range(*sustain, SUSTAIN);
+    *release = clamp_range(*release, RELEASE);
+    draw_body(ui, node_id, key, attack, decay, sustain, release);
+    *attack = clamp_range(*attack, ATTACK);
+    *decay = clamp_range(*decay, DECAY);
+    *sustain = clamp_range(*sustain, SUSTAIN);
+    *release = clamp_range(*release, RELEASE);
+}
+
+fn draw_body(
+    ui: &mut Ui,
+    node_id: &str,
+    key: &str,
+    attack: &mut f32,
+    decay: &mut f32,
+    sustain: &mut f32,
+    release: &mut f32,
+) {
     let z = ui.scale();
     let graph_h = 96.0 * z;
     let graph_w = 252.0 * z;
     let pad = 8.0 * z;
     let hit_r = 14.0 * z;
 
-    let area = ui.area("adsr_plot", Vec2::new(graph_w, graph_h));
+    let area = ui.area(&format!("{key}_plot"), Vec2::new(graph_w, graph_h));
     let rect = area.rect;
     ui.fill_round(rect, 4.0 * z, BG);
     let plot_r = inner(rect, pad);
 
-    let p = plot(
-        node.adsr_attack,
-        node.adsr_decay,
-        node.adsr_sustain,
-        node.adsr_release,
-    );
+    let p = plot(*attack, *decay, *sustain, *release);
     let start = to_screen(plot_r, Vec2::new(0.0, 0.0));
-    let peak = to_screen(plot_r, p.peak);
-    let decay = to_screen(plot_r, p.decay);
-    let off = to_screen(plot_r, p.off);
-    let end = to_screen(plot_r, p.end);
+    let peak_pt = to_screen(plot_r, p.peak);
+    let decay_pt = to_screen(plot_r, p.decay);
+    let off_pt = to_screen(plot_r, p.off);
+    let end_pt = to_screen(plot_r, p.end);
 
     fill_zone(ui, plot_r, 0.0, p.peak.x, ZONE_A);
     fill_zone(ui, plot_r, p.peak.x, p.decay.x, ZONE_D);
     fill_zone(ui, plot_r, p.decay.x, p.off.x, ZONE_S);
     fill_zone(ui, plot_r, p.off.x, 1.0, ZONE_R);
-    fill_under(ui, plot_r, &[start, peak, decay, off, end]);
+    fill_under(ui, plot_r, &[start, peak_pt, decay_pt, off_pt, end_pt]);
 
     let thick = 2.0 * z;
-    ui.line(start, peak, thick, COL_A);
-    ui.line(peak, decay, thick, COL_D);
-    ui.line(decay, off, thick, COL_S);
-    ui.line(off, end, thick, COL_R);
-    ui.line(start, peak, thick * 0.35, LINE);
-    ui.line(peak, decay, thick * 0.35, LINE);
-    ui.line(decay, off, thick * 0.35, LINE);
-    ui.line(off, end, thick * 0.35, LINE);
+    ui.line(start, peak_pt, thick, COL_A);
+    ui.line(peak_pt, decay_pt, thick, COL_D);
+    ui.line(decay_pt, off_pt, thick, COL_S);
+    ui.line(off_pt, end_pt, thick, COL_R);
+    ui.line(start, peak_pt, thick * 0.35, LINE);
+    ui.line(peak_pt, decay_pt, thick * 0.35, LINE);
+    ui.line(decay_pt, off_pt, thick * 0.35, LINE);
+    ui.line(off_pt, end_pt, thick * 0.35, LINE);
 
-    draw_handle(ui, peak, COL_A, z);
-    draw_handle(ui, decay, COL_D, z);
-    draw_handle(ui, off, COL_S, z);
-    draw_handle(ui, end, COL_R, z);
+    draw_handle(ui, peak_pt, COL_A, z);
+    draw_handle(ui, decay_pt, COL_D, z);
+    draw_handle(ui, off_pt, COL_S, z);
+    draw_handle(ui, end_pt, COL_R, z);
 
     let ptr = ui.pointer();
     let handles = [
-        (Handle::Attack, peak),
-        (Handle::Decay, decay),
-        (Handle::Off, off),
+        (Handle::Attack, peak_pt),
+        (Handle::Decay, decay_pt),
+        (Handle::Off, off_pt),
     ];
     let mut over = None;
     let mut best = hit_r * hit_r;
@@ -191,7 +218,7 @@ fn draw_body(ui: &mut Ui, node: &mut GraphNode) {
         ui.set_mouse_cursor(CursorIcon::Move);
     }
 
-    let id = node.id.clone();
+    let id = format!("{node_id}/{key}");
     if ptr.pressed && area.hovered {
         if let Some(h) = over {
             DRAG.with(|d| *d.borrow_mut() = Some((id.clone(), h)));
@@ -210,31 +237,16 @@ fn draw_body(ui: &mut Ui, node: &mut GraphNode) {
         if area.active && ptr.down {
             let n = from_screen(plot_r, ptr.pos);
             match h {
-                Handle::Attack => set_attack(
-                    &mut node.adsr_attack,
-                    node.adsr_decay,
-                    node.adsr_release,
-                    n.x,
-                ),
+                Handle::Attack => set_attack(attack, *decay, *release, n.x),
                 Handle::Decay => {
-                    set_decay(
-                        node.adsr_attack,
-                        &mut node.adsr_decay,
-                        node.adsr_release,
-                        n.x,
-                    );
-                    node.adsr_sustain = clamp_range(n.y, SUSTAIN);
+                    set_decay(*attack, decay, *release, n.x);
+                    *sustain = clamp_range(n.y, SUSTAIN);
                 }
                 Handle::Off => {
-                    node.adsr_sustain = clamp_range(n.y, SUSTAIN);
-                    set_release(
-                        node.adsr_attack,
-                        node.adsr_decay,
-                        &mut node.adsr_release,
-                        n.x,
-                    );
+                    *sustain = clamp_range(n.y, SUSTAIN);
+                    set_release(*attack, *decay, release, n.x);
                 }
-                Handle::SustainY => node.adsr_sustain = clamp_range(n.y, SUSTAIN),
+                Handle::SustainY => *sustain = clamp_range(n.y, SUSTAIN),
             }
             ui.request_repaint();
         } else if !ptr.down {
@@ -249,14 +261,14 @@ fn draw_body(ui: &mut Ui, node: &mut GraphNode) {
         },
         |ui| {
             let cell = rect.width() / 4.0;
-            let cap_a = fmt_ms(node.adsr_attack);
-            let cap_d = fmt_ms(node.adsr_decay);
-            let cap_s = fmt_pct(node.adsr_sustain);
-            let cap_r = fmt_ms(node.adsr_release);
-            knob_cell(ui, cell, "A", &mut node.adsr_attack, ATTACK, COL_A, &cap_a);
-            knob_cell(ui, cell, "D", &mut node.adsr_decay, DECAY, COL_D, &cap_d);
-            knob_cell(ui, cell, "S", &mut node.adsr_sustain, SUSTAIN, COL_S, &cap_s);
-            knob_cell(ui, cell, "R", &mut node.adsr_release, RELEASE, COL_R, &cap_r);
+            let cap_a = fmt_ms(*attack);
+            let cap_d = fmt_ms(*decay);
+            let cap_s = fmt_pct(*sustain);
+            let cap_r = fmt_ms(*release);
+            knob_cell(ui, cell, "A", attack, ATTACK, COL_A, &cap_a);
+            knob_cell(ui, cell, "D", decay, DECAY, COL_D, &cap_d);
+            knob_cell(ui, cell, "S", sustain, SUSTAIN, COL_S, &cap_s);
+            knob_cell(ui, cell, "R", release, RELEASE, COL_R, &cap_r);
         },
     );
 }

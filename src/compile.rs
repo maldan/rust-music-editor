@@ -9,7 +9,7 @@ use std::sync::Arc;
 use mega_audio::dsp::{
     AdsrParams, BiquadFilter, Chorus, Clamp, Compressor, Delay, Distortion, FilterKind, Flanger,
     GainCv, Mul, Oscillator, Remap, Reverb, ReverbKind, Slew, StereoGain, StereoJoin, StereoMixer, StereoPan,
-    TranceGate, WaveShape, Waveform, Const, CurveEnv,
+    TranceGate, WaveShape, Waveform, Const, CurveEnv, pan_gains,
 };
 use mega_audio::graph::{Bypass, Graph, Node, NodeId, ProcessContext};
 use mega_audio::instrument::{AdditivePiano, AnalogDrums, KarplusStrong, PolyphonicInstrument};
@@ -26,7 +26,7 @@ use crate::graph::{
     NodeKind, Project, SeqNote, BEATS_PER_BAR, BEATS_PER_STEP, MIX_INS,
     NOTE_JOIN_INS,
 };
-use crate::monitor::{FftBuf, GonioBuf, Monitor, ScopeBuf};
+use crate::monitor::{FftBuf, GonioBuf, MixLevels, Monitor, ScopeBuf, SliceBuf, SLICE_BINS};
 
 pub const WAVEFORMS: [(&str, Waveform); 5] = [
     ("Sine", Waveform::Sine),
@@ -519,6 +519,7 @@ fn dsp_bypass(kind: NodeKind) -> Bypass {
         | NodeKind::Smooth
         | NodeKind::Readout
         | NodeKind::Scope
+        | NodeKind::WaveSlice
         | NodeKind::Gonio
         | NodeKind::Spectrum
         | NodeKind::Spectrogram => Bypass::Thru,
@@ -556,6 +557,7 @@ fn dsp_kind(kind: NodeKind) -> bool {
             | NodeKind::NoteFreq
             | NodeKind::Envelope
             | NodeKind::Scope
+            | NodeKind::WaveSlice
             | NodeKind::Gonio
             | NodeKind::Spectrum
             | NodeKind::Spectrogram
@@ -697,6 +699,19 @@ fn build_graph_at(patch: &Patch, sample_rate: f32, monitor: &Monitor, block_size
                 inst.set_detune(n.detune);
                 inst.set_unison_pan(n.unison_pan);
                 inst.set_pitch(n.pitch);
+                inst.set_use_amp_curve(n.vol_env.enabled);
+                inst.set_use_pitch_curve(n.pitch_env.enabled);
+                inst.set_amp_curve(&n.vol_env.knots(), n.vol_env.time, n.vol_env.lo, n.vol_env.hi);
+                inst.set_pitch_curve(
+                    &n.pitch_env.knots(),
+                    n.pitch_env.time,
+                    n.pitch_env.lo,
+                    n.pitch_env.hi,
+                );
+                inst.set_env_playheads(
+                    monitor.playhead_slot(&format!("{}/vol", n.id)),
+                    monitor.playhead_slot(&format!("{}/pit", n.id)),
+                );
                 let id = graph.add_node(Box::new(inst));
                 voices.insert(n.id.clone(), id);
                 dsp.insert(n.id.clone(), id);
@@ -851,7 +866,10 @@ fn build_graph_at(patch: &Patch, sample_rate: f32, monitor: &Monitor, block_size
                 let n_strips = MIX_INS.len();
                 let mut mix = StereoMixer::new(n_strips);
                 apply_mixer_strips(&mut mix, n);
-                let id = graph.add_node(Box::new(mix));
+                let id = graph.add_node(Box::new(MeteredMixer {
+                    mix,
+                    levels: monitor.mix_levels(&n.id, n_strips),
+                }));
                 dsp.insert(n.id.clone(), id);
                 for (i, p) in MIX_INS.iter().enumerate() {
                     in_port.insert(
@@ -869,6 +887,13 @@ fn build_graph_at(patch: &Patch, sample_rate: f32, monitor: &Monitor, block_size
                 let tap = ScopeTap {
                     buf: monitor.scope_buf(&n.id),
                 };
+                let id = graph.add_node(Box::new(tap));
+                dsp.insert(n.id.clone(), id);
+                in_port.insert((n.id.clone(), "in".into()), Wire::stereo(id, 0, 1));
+                out_port.insert((n.id.clone(), "out".into()), Wire::stereo(id, 0, 1));
+            }
+            NodeKind::WaveSlice => {
+                let tap = WaveSliceTap::new(monitor.slice_buf(&n.id), sample_rate, n.slice_time);
                 let id = graph.add_node(Box::new(tap));
                 dsp.insert(n.id.clone(), id);
                 in_port.insert((n.id.clone(), "in".into()), Wire::stereo(id, 0, 1));
@@ -1283,11 +1308,25 @@ impl Live {
                 }
                 NodeKind::Shape => {
                     if let Some(inst) = graph.node_mut::<PolyphonicInstrument>(id) {
+                        inst.set_use_amp_curve(n.vol_env.enabled);
+                        inst.set_use_pitch_curve(n.pitch_env.enabled);
                         inst.set_wave_shape(wave_shape_of(n));
                         inst.set_unison(n.unison.round().clamp(1.0, 16.0) as usize);
                         inst.set_detune(n.detune);
                         inst.set_unison_pan(n.unison_pan);
                         inst.set_pitch(n.pitch);
+                        inst.set_amp_curve(
+                            &n.vol_env.knots(),
+                            n.vol_env.time,
+                            n.vol_env.lo,
+                            n.vol_env.hi,
+                        );
+                        inst.set_pitch_curve(
+                            &n.pitch_env.knots(),
+                            n.pitch_env.time,
+                            n.pitch_env.lo,
+                            n.pitch_env.hi,
+                        );
                     }
                 }
                 NodeKind::Guitar => {
@@ -1365,6 +1404,11 @@ impl Live {
                         d.mix = n.delay_mix.clamp(0.0, 1.0);
                     }
                 }
+                NodeKind::WaveSlice => {
+                    if let Some(t) = graph.node_mut::<WaveSliceTap>(id) {
+                        t.set_window(n.slice_time);
+                    }
+                }
                 NodeKind::Filter => {
                     if let Some(f) = graph.node_mut::<BiquadFilter>(id) {
                         f.kind = biquad_kind(n.filter_kind);
@@ -1439,8 +1483,8 @@ impl Live {
                     }
                 }
                 NodeKind::Mixer => {
-                    if let Some(mix) = graph.node_mut::<StereoMixer>(id) {
-                        apply_mixer_strips(mix, n);
+                    if let Some(mix) = graph.node_mut::<MeteredMixer>(id) {
+                        apply_mixer_strips(&mut mix.mix, n);
                     }
                 }
                 _ => {}
@@ -2205,6 +2249,51 @@ struct MeterTap {
     slot: Arc<AtomicU32>,
 }
 
+struct MeteredMixer {
+    mix: StereoMixer,
+    levels: Arc<MixLevels>,
+}
+
+impl Node for MeteredMixer {
+    fn num_inputs(&self) -> usize {
+        self.mix.num_inputs()
+    }
+
+    fn num_outputs(&self) -> usize {
+        self.mix.num_outputs()
+    }
+
+    fn process(&mut self, ctx: &ProcessContext, inputs: &[&[f32]], outputs: &mut [&mut [f32]]) {
+        self.mix.process(ctx, inputs, outputs);
+        let n = ctx.block_size;
+        let strips = self.mix.gains.len();
+        for i in 0..strips {
+            let g = self.mix.gains.get(i).copied().unwrap_or(1.0);
+            let p = self.mix.pans.get(i).copied().unwrap_or(0.0);
+            let (lg, rg) = pan_gains(p);
+            let left = inputs.get(i).copied().unwrap_or(&[]);
+            let right = inputs.get(strips + i).copied().unwrap_or(left);
+            let mut pl = 0.0f32;
+            let mut pr = 0.0f32;
+            for s in 0..n {
+                let x_l = left.get(s).copied().unwrap_or(0.0);
+                let x_r = right.get(s).copied().unwrap_or(x_l);
+                pl = pl.max((x_l * g * lg).abs());
+                pr = pr.max((x_r * g * rg).abs());
+            }
+            self.levels.set(i, pl, pr);
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "MeteredMixer"
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
 impl Node for MeterTap {
     fn num_inputs(&self) -> usize {
         1
@@ -2245,6 +2334,77 @@ struct ScopeTap {
     buf: Arc<ScopeBuf>,
 }
 
+struct WaveSliceTap {
+    buf: Arc<SliceBuf>,
+    sample_rate: f32,
+    window_secs: f32,
+    filled: usize,
+    window_len: usize,
+    live_bin: Option<usize>,
+    dirty: bool,
+    scratch: Vec<f32>,
+}
+
+impl WaveSliceTap {
+    fn new(buf: Arc<SliceBuf>, sample_rate: f32, window_secs: f32) -> Self {
+        let mut tap = Self {
+            buf,
+            sample_rate: sample_rate.max(1.0),
+            window_secs: 0.5,
+            filled: 0,
+            window_len: 1,
+            live_bin: None,
+            dirty: false,
+            scratch: vec![0.0; SLICE_BINS * 2],
+        };
+        tap.set_window(window_secs);
+        tap
+    }
+
+    fn set_window(&mut self, secs: f32) {
+        let secs = secs.clamp(0.05, 8.0);
+        if (secs - self.window_secs).abs() < 1e-6 && self.window_len > 1 {
+            return;
+        }
+        self.window_secs = secs;
+        self.window_len = (self.window_secs * self.sample_rate).round().max(1.0) as usize;
+        self.filled = 0;
+        self.live_bin = None;
+        self.dirty = false;
+        self.scratch.fill(0.0);
+        self.buf.publish(&self.scratch);
+        self.buf.set_fill(0.0);
+    }
+
+    fn push(&mut self, x: f32) {
+        let w = self.window_len.max(1);
+        let bin = ((self.filled as u64 * SLICE_BINS as u64) / w as u64).min(SLICE_BINS as u64 - 1) as usize;
+        let lo = bin * 2;
+        if self.live_bin != Some(bin) {
+            self.scratch[lo] = x;
+            self.scratch[lo + 1] = x;
+            self.live_bin = Some(bin);
+        } else {
+            self.scratch[lo] = self.scratch[lo].min(x);
+            self.scratch[lo + 1] = self.scratch[lo + 1].max(x);
+        }
+        self.filled += 1;
+        self.dirty = true;
+        if self.filled >= w {
+            self.filled = 0;
+            self.live_bin = None;
+        }
+        self.buf.set_fill(self.filled as f32 / w as f32);
+    }
+
+    fn flush(&mut self) {
+        if self.dirty {
+            self.buf.publish(&self.scratch);
+            self.dirty = false;
+        }
+    }
+}
+
 struct GonioTap {
     buf: Arc<GonioBuf>,
 }
@@ -2280,6 +2440,45 @@ impl Node for ScopeTap {
 
     fn name(&self) -> &'static str {
         "Scope"
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+impl Node for WaveSliceTap {
+    fn num_inputs(&self) -> usize {
+        2
+    }
+
+    fn num_outputs(&self) -> usize {
+        2
+    }
+
+    fn process(&mut self, ctx: &ProcessContext, inputs: &[&[f32]], outputs: &mut [&mut [f32]]) {
+        let n = ctx.block_size;
+        let left = inputs.first().copied().unwrap_or(&[]);
+        let right = inputs.get(1).copied().unwrap_or(left);
+        if let Some(out) = outputs.get_mut(0) {
+            let k = n.min(left.len()).min(out.len());
+            out[..k].copy_from_slice(&left[..k]);
+        }
+        if let Some(out) = outputs.get_mut(1) {
+            let src = if right.len() >= n { right } else { left };
+            let k = n.min(src.len()).min(out.len());
+            out[..k].copy_from_slice(&src[..k]);
+        }
+        for i in 0..n {
+            let l = left.get(i).copied().unwrap_or(0.0);
+            let r = right.get(i).copied().unwrap_or(l);
+            self.push((l + r) * 0.5);
+        }
+        self.flush();
+    }
+
+    fn name(&self) -> &'static str {
+        "WaveSlice"
     }
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
@@ -3449,6 +3648,57 @@ mod tests {
     }
 
     #[test]
+    fn wave_slice_is_thru_dsp() {
+        assert!(dsp_kind(NodeKind::WaveSlice));
+        assert_eq!(dsp_bypass(NodeKind::WaveSlice), Bypass::Thru);
+        let n = crate::graph::GraphNode::new("sl".into(), NodeKind::WaveSlice, glam::Vec2::ZERO);
+        let patch = patch_with(vec![n], vec![]);
+        let mon = Monitor::default();
+        let build = build_graph(&patch, 48_000.0, &mon);
+        assert!(build.dsp.contains_key("sl"));
+    }
+
+    #[test]
+    fn wave_slice_paints_then_overwrites() {
+        let mon = Monitor::default();
+        let buf = mon.slice_buf("sl");
+        let sr = SLICE_BINS as f32;
+        let mut tap = WaveSliceTap::new(buf, sr, 1.0);
+        let ctx = ProcessContext {
+            sample_rate: sr,
+            block_size: 64,
+        };
+        let high = vec![0.5f32; 64];
+        let mut out_l = vec![0.0f32; 64];
+        let mut out_r = vec![0.0f32; 64];
+        for _ in 0..8 {
+            let l = high.as_slice();
+            tap.process(&ctx, &[l, l], &mut [&mut out_l[..], &mut out_r[..]]);
+        }
+        let mid = mon.slice_peaks("sl");
+        assert!((mid[0] - 0.5).abs() < 1e-5);
+        let last = (SLICE_BINS - 1) * 2;
+        assert_eq!(mid[last], 0.0);
+        assert!(mon.slice_fill("sl") > 0.4);
+        for _ in 0..8 {
+            let l = high.as_slice();
+            tap.process(&ctx, &[l, l], &mut [&mut out_l[..], &mut out_r[..]]);
+        }
+        let full = mon.slice_peaks("sl");
+        assert!((full[last] - 0.5).abs() < 1e-5);
+        let low = vec![-0.25f32; 64];
+        for _ in 0..8 {
+            let l = low.as_slice();
+            tap.process(&ctx, &[l, l], &mut [&mut out_l[..], &mut out_r[..]]);
+        }
+        let over = mon.slice_peaks("sl");
+        assert!((over[0] + 0.25).abs() < 1e-5);
+        assert!((over[last] - 0.5).abs() < 1e-5);
+        assert!(mon.slice_fill("sl") > 0.4);
+        assert!((out_l[0] + 0.25).abs() < 1e-5);
+    }
+
+    #[test]
     fn audio_in_is_capture_dsp() {
         assert!(dsp_kind(NodeKind::AudioIn));
         assert_eq!(dsp_bypass(NodeKind::AudioIn), Bypass::Mute);
@@ -3652,9 +3902,36 @@ mod tests {
         let mon = Monitor::default();
         let mut build = build_graph(&patch, 48_000.0, &mon);
         let id = *build.dsp.get("mix").unwrap();
-        let mix = build.graph.node_mut::<StereoMixer>(id).unwrap();
-        assert!(!mix.vol_from_cv[0]);
-        assert!(!mix.pan_from_cv[0]);
+        let mix = build.graph.node_mut::<MeteredMixer>(id).unwrap();
+        assert!(!mix.mix.vol_from_cv[0]);
+        assert!(!mix.mix.pan_from_cv[0]);
+    }
+
+    #[test]
+    fn mixer_strip_meters_follow_pan() {
+        let osc = crate::graph::GraphNode::new("osc".into(), NodeKind::Osc, glam::Vec2::ZERO);
+        let mut mix = crate::graph::GraphNode::new("mix".into(), NodeKind::Mixer, glam::Vec2::ZERO);
+        let out = crate::graph::GraphNode::new("out".into(), NodeKind::Output, glam::Vec2::ZERO);
+        mix.ensure_mix_strips();
+        mix.mix_strips[0].pan = -1.0;
+        let mut patch = patch_with(
+            vec![osc, mix, out],
+            vec![
+                ("osc", "out", "mix", "1"),
+                ("mix", "out", "out", "in"),
+            ],
+        );
+        patch.playing = true;
+        let mon = Monitor::default();
+        let mut build = build_graph(&patch, 48_000.0, &mon);
+        for _ in 0..64 {
+            let _ = build.graph.process();
+        }
+        let (l, r) = mon.mix_strip("mix", 0);
+        assert!(l > 0.01, "left meter silent {l}");
+        assert!(r < l * 0.05, "right meter leaked {r} vs {l}");
+        let idle = mon.mix_strip("mix", 1);
+        assert!(idle.0 < 1e-4 && idle.1 < 1e-4);
     }
 
     #[test]

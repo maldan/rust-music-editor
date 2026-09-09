@@ -5,6 +5,7 @@ mod export;
 mod graph;
 mod groups;
 mod inspector;
+mod meter;
 mod piano;
 mod sample;
 

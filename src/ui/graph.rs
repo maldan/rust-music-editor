@@ -15,7 +15,7 @@ use crate::graph::{
 };
 use crate::monitor::{Monitor, GONIO_BINS};
 
-use super::piano;
+use super::{meter, piano};
 
 pub struct DeviceLists {
     pub outputs: Vec<String>,
@@ -325,6 +325,7 @@ fn spawn_menu(
                 .or_else(|| leaf(ui, "Mixer", NodeKind::Mixer))
                 .or_else(|| leaf(ui, "Audio In", NodeKind::AudioIn))
                 .or_else(|| leaf(ui, "Waveform", NodeKind::Scope))
+                .or_else(|| leaf(ui, "Wave Slice", NodeKind::WaveSlice))
                 .or_else(|| leaf(ui, "Goniometer", NodeKind::Gonio))
                 .or_else(|| leaf(ui, "Spectrum", NodeKind::Spectrum))
                 .or_else(|| leaf(ui, "Spectrogram", NodeKind::Spectrogram))
@@ -511,42 +512,61 @@ fn draw_body(
             let mut preview = [0.0f32; 128];
             wave_shape_of(node).fill_preview(&mut preview);
             let view = PlotView::new(0.0, 1.0, -1.0, 1.0);
-            ui.plot_with_view("shape_wave", Vec2::new(220.0, 72.0), &preview, &view);
-            ui.label("OSC  (1 = note, 2 = octave, …)");
             node.ensure_wave_harms();
             let osc_ticks = [(0.0, "1"), (7.0 / 15.0, "8"), (1.0, "16")];
-            ui.plot_bars_edit(
-                "shape_osc",
-                Vec2::new(220.0, 64.0),
-                &mut node.wave_harms,
-                &osc_ticks,
-            );
+            ui.horizontal(|ui| {
+                ui.plot_with_view("shape_wave", Vec2::new(176.0, 80.0), &preview, &view);
+                ui.plot_bars_edit(
+                    "shape_osc",
+                    Vec2::new(176.0, 80.0),
+                    &mut node.wave_harms,
+                    &osc_ticks,
+                );
+            });
             ui.horizontal(|ui| {
                 ui.checkbox("Half", &mut node.wave_half);
                 ui.checkbox("Pulse", &mut node.wave_pulse);
                 ui.checkbox("Abs", &mut node.wave_abs);
+                ui.label("Pitch");
+                ui.drag_float("pitch", &mut node.pitch, 0.01);
+                node.pitch = node.pitch.max(0.01);
             });
-            ui.group("Wave", |ui| {
-                ui.horizontal(|ui| {
-                    ui.knob("SH", &mut node.wave_shape, 0.0..=1.0);
-                    ui.knob("TN", &mut node.wave_tension, -1.0..=1.0);
-                    ui.knob("SK", &mut node.wave_skew, 0.0..=1.0);
+            ui.horizontal(|ui| {
+                let ks = 52.0 / 1.5;
+                ui.group("Wave", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.knob_sized("SH", &mut node.wave_shape, 0.0..=1.0, ks);
+                        ui.knob_sized("TN", &mut node.wave_tension, -1.0..=1.0, ks);
+                        ui.knob_sized("SK", &mut node.wave_skew, 0.0..=1.0, ks);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.knob_sized("SN", &mut node.wave_sine, 0.0..=1.0, ks);
+                        ui.knob_sized("FL", &mut node.wave_flip, 0.0..=1.0, ks);
+                        ui.knob_sized("NS", &mut node.wave_noise, 0.0..=1.0, ks);
+                    });
                 });
-                ui.horizontal(|ui| {
-                    ui.knob("SN", &mut node.wave_sine, 0.0..=1.0);
-                    ui.knob("FL", &mut node.wave_flip, 0.0..=1.0);
-                    ui.knob("NS", &mut node.wave_noise, 0.0..=1.0);
+                ui.group("Unison", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.knob_sized("Amount", &mut node.unison, 1.0..=16.0, ks);
+                        ui.knob_sized("Detune", &mut node.detune, 0.0..=100.0, ks);
+                        ui.knob_sized("Pan", &mut node.unison_pan, 0.0..=1.0, ks);
+                    });
                 });
             });
-            ui.label("Pitch");
-            ui.drag_float("pitch", &mut node.pitch, 0.01);
-            node.pitch = node.pitch.max(0.01);
-            ui.group("Unison", |ui| {
-                ui.horizontal(|ui| {
-                    ui.knob("Amount", &mut node.unison, 1.0..=16.0);
-                    ui.knob("Detune", &mut node.detune, 0.0..=100.0);
-                    ui.knob("Pan", &mut node.unison_pan, 0.0..=1.0);
-                });
+            let nid = node.id.clone();
+            ui.tabs("shape_env", &["Volume", "Pitch"], |ui, tab| match tab {
+                0 => super::env::draw_edit(
+                    ui,
+                    "vol",
+                    &mut node.vol_env,
+                    monitor.playhead(&format!("{nid}/vol")),
+                ),
+                _ => super::env::draw_edit(
+                    ui,
+                    "pit",
+                    &mut node.pitch_env,
+                    monitor.playhead(&format!("{nid}/pit")),
+                ),
             });
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
@@ -730,6 +750,8 @@ fn draw_body(
                                 ui.knob("Vol", &mut node.mix_strips[i].vol, 0.0..=1.5);
                                 ui.knob("Pan", &mut node.mix_strips[i].pan, -1.0..=1.0);
                             });
+                            let (l, r) = monitor.mix_strip(&node.id, i);
+                            meter::stereo(ui, &format!("{}vu{i}", node.id), l, r);
                         });
                     }
                 });
@@ -741,6 +763,30 @@ fn draw_body(
             let samples = monitor.scope_samples(&node.id);
             let view = PlotView::new(0.0, 1.0, -1.0, 1.0);
             ui.plot_with_view("wave", Vec2::new(0.0, 72.0), &samples, &view);
+            ui.node_port(NodePortSide::Output, "out", port::AUDIO);
+        }
+        NodeKind::WaveSlice => {
+            ui.node_port(NodePortSide::Input, "in", port::AUDIO);
+            labeled_slider(ui, "Window, sec", &mut node.slice_time, 0.05..=8.0);
+            node.slice_time = node.slice_time.clamp(0.05, 8.0);
+            let z = ui.scale().max(0.05);
+            let w = ui.available_size().x.max(80.0 * z);
+            let area = ui.area("slice_wave", Vec2::new(w, 72.0 * z));
+            ui.fill_rect(area.rect, [0.08, 0.08, 0.10, 1.0]);
+            let peaks = monitor.slice_peaks(&node.id);
+            let dur = node.slice_time.max(0.05);
+            super::sample::draw_peaks(ui, area.rect, &peaks, 0.0, dur, dur);
+            let fill = monitor.slice_fill(&node.id).clamp(0.0, 1.0);
+            if fill > 1e-4 {
+                let x = area.rect.min.x + fill * area.rect.width();
+                ui.line(
+                    Vec2::new(x, area.rect.min.y),
+                    Vec2::new(x, area.rect.max.y),
+                    1.0,
+                    [1.0, 0.42, 0.18, 0.7],
+                );
+            }
+            ui.request_repaint();
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
         NodeKind::Gonio => {

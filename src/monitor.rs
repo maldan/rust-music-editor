@@ -9,6 +9,7 @@ use crate::fft::{SPEC_BINS, SPEC_COLS};
 pub const SCOPE_LEN: usize = 2048;
 pub const GONIO_LEN: usize = 2048;
 pub const GONIO_BINS: usize = 72;
+pub const SLICE_BINS: usize = 1024;
 
 pub struct ScopeBuf {
     samples: Box<[AtomicU32]>,
@@ -109,6 +110,62 @@ pub fn gonio_field(left: &[f32], right: &[f32]) -> (Vec<f32>, f32) {
     let denom = (acc_l2.sqrt() * acc_r2.sqrt()).max(1e-8);
     let corr = (acc_lr / denom).clamp(-1.0, 1.0);
     (cells, corr)
+}
+
+/// Frozen min/max peaks for one capture window (sample-style waveform).
+pub struct SliceBuf {
+    pages: [Box<[AtomicU32]>; 2],
+    page: AtomicUsize,
+    fill: AtomicU32,
+}
+
+impl SliceBuf {
+    fn new() -> Self {
+        Self {
+            pages: [
+                (0..SLICE_BINS * 2)
+                    .map(|_| AtomicU32::new(0))
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+                (0..SLICE_BINS * 2)
+                    .map(|_| AtomicU32::new(0))
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            ],
+            page: AtomicUsize::new(0),
+            fill: AtomicU32::new(0),
+        }
+    }
+
+    pub fn publish(&self, peaks: &[f32]) {
+        let cur = self.page.load(Ordering::Relaxed);
+        let next = 1 - (cur % 2);
+        let dst = &self.pages[next];
+        let n = peaks.len().min(dst.len());
+        for i in 0..n {
+            dst[i].store(peaks[i].to_bits(), Ordering::Relaxed);
+        }
+        for i in n..dst.len() {
+            dst[i].store(0, Ordering::Relaxed);
+        }
+        self.page.store(next, Ordering::Release);
+    }
+
+    pub fn set_fill(&self, t: f32) {
+        self.fill.store(t.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> Vec<f32> {
+        let p = self.page.load(Ordering::Acquire) % 2;
+        self.pages[p]
+            .iter()
+            .map(|a| f32::from_bits(a.load(Ordering::Relaxed)))
+            .collect()
+    }
+
+    pub fn fill(&self) -> f32 {
+        f32::from_bits(self.fill.load(Ordering::Relaxed))
+    }
 }
 
 /// Start the plot on a rising zero so a periodic wave stays put.
@@ -247,11 +304,49 @@ impl PitchSet {
     }
 }
 
+/// Peak L/R per mixer strip (linear amplitude, audio writes / UI reads).
+pub struct MixLevels {
+    peaks: Box<[AtomicU32]>,
+}
+
+impl MixLevels {
+    pub fn new(strips: usize) -> Self {
+        Self {
+            peaks: (0..strips * 2)
+                .map(|_| AtomicU32::new(0))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        }
+    }
+
+    pub fn set(&self, strip: usize, left: f32, right: f32) {
+        let i = strip * 2;
+        if i + 1 >= self.peaks.len() {
+            return;
+        }
+        self.peaks[i].store(left.to_bits(), Ordering::Relaxed);
+        self.peaks[i + 1].store(right.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn get(&self, strip: usize) -> (f32, f32) {
+        let i = strip * 2;
+        if i + 1 >= self.peaks.len() {
+            return (0.0, 0.0);
+        }
+        (
+            f32::from_bits(self.peaks[i].load(Ordering::Relaxed)),
+            f32::from_bits(self.peaks[i + 1].load(Ordering::Relaxed)),
+        )
+    }
+}
+
 #[derive(Default)]
 pub struct Monitor {
     playheads: Mutex<HashMap<String, Arc<AtomicU32>>>,
     meters: Mutex<HashMap<String, Arc<AtomicU32>>>,
+    mixers: Mutex<HashMap<String, Arc<MixLevels>>>,
     scopes: Mutex<HashMap<String, Arc<ScopeBuf>>>,
+    slices: Mutex<HashMap<String, Arc<SliceBuf>>>,
     gonios: Mutex<HashMap<String, Arc<GonioBuf>>>,
     ffts: Mutex<HashMap<String, Arc<FftBuf>>>,
     notes: Mutex<HashMap<String, Arc<PitchSet>>>,
@@ -293,6 +388,18 @@ impl Monitor {
             .unwrap_or(0.0)
     }
 
+    pub fn mix_levels(&self, id: &str, strips: usize) -> Arc<MixLevels> {
+        let mut m = self.mixers.lock().unwrap_or_else(|e| e.into_inner());
+        m.entry(id.to_string())
+            .or_insert_with(|| Arc::new(MixLevels::new(strips)))
+            .clone()
+    }
+
+    pub fn mix_strip(&self, id: &str, strip: usize) -> (f32, f32) {
+        let m = self.mixers.lock().unwrap_or_else(|e| e.into_inner());
+        m.get(id).map(|s| s.get(strip)).unwrap_or((0.0, 0.0))
+    }
+
     pub fn scope_buf(&self, id: &str) -> Arc<ScopeBuf> {
         let mut m = self.scopes.lock().unwrap_or_else(|e| e.into_inner());
         m.entry(id.to_string())
@@ -306,6 +413,29 @@ impl Monitor {
             m.get(id).cloned()
         };
         buf.map(|b| b.snapshot()).unwrap_or_default()
+    }
+
+    pub fn slice_buf(&self, id: &str) -> Arc<SliceBuf> {
+        let mut m = self.slices.lock().unwrap_or_else(|e| e.into_inner());
+        m.entry(id.to_string())
+            .or_insert_with(|| Arc::new(SliceBuf::new()))
+            .clone()
+    }
+
+    pub fn slice_peaks(&self, id: &str) -> Vec<f32> {
+        let buf = {
+            let m = self.slices.lock().unwrap_or_else(|e| e.into_inner());
+            m.get(id).cloned()
+        };
+        buf.map(|b| b.snapshot()).unwrap_or_default()
+    }
+
+    pub fn slice_fill(&self, id: &str) -> f32 {
+        let buf = {
+            let m = self.slices.lock().unwrap_or_else(|e| e.into_inner());
+            m.get(id).cloned()
+        };
+        buf.map(|b| b.fill()).unwrap_or(0.0)
     }
 
     pub fn gonio_buf(&self, id: &str) -> Arc<GonioBuf> {
@@ -469,5 +599,40 @@ mod tests {
         slot.store(1.25f32.to_bits(), Ordering::Relaxed);
         assert!((m.meter_value("n1") - 1.25).abs() < 1e-6);
         assert_eq!(m.meter_value("missing"), 0.0);
+    }
+
+    #[test]
+    fn mix_levels_store_lr() {
+        let m = Monitor::default();
+        let slot = m.mix_levels("mix", 8);
+        slot.set(0, 0.5, 0.1);
+        slot.set(3, 0.0, 0.8);
+        assert_eq!(m.mix_strip("mix", 0), (0.5, 0.1));
+        assert_eq!(m.mix_strip("mix", 3), (0.0, 0.8));
+        assert_eq!(m.mix_strip("mix", 1), (0.0, 0.0));
+        assert_eq!(m.mix_strip("missing", 0), (0.0, 0.0));
+    }
+
+    #[test]
+    fn slice_publishes_only_when_told() {
+        let b = SliceBuf::new();
+        assert!(b.snapshot().iter().all(|v| *v == 0.0));
+        let mut peaks = vec![0.0; SLICE_BINS * 2];
+        peaks[0] = -0.4;
+        peaks[1] = 0.7;
+        b.publish(&peaks);
+        b.set_fill(0.3);
+        let snap = b.snapshot();
+        assert!((snap[0] + 0.4).abs() < 1e-6);
+        assert!((snap[1] - 0.7).abs() < 1e-6);
+        assert!((b.fill() - 0.3).abs() < 1e-6);
+        let mut next = vec![0.0; SLICE_BINS * 2];
+        next[2] = -1.0;
+        next[3] = 1.0;
+        b.publish(&next);
+        let snap = b.snapshot();
+        assert_eq!(snap[0], 0.0);
+        assert!((snap[2] + 1.0).abs() < 1e-6);
+        assert!((b.fill() - 0.3).abs() < 1e-6);
     }
 }
