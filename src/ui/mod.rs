@@ -103,6 +103,17 @@ impl Scene for App {
             .iter()
             .map(|s| (s.id.clone(), s.name.clone()))
             .collect();
+        let seq_groups: Vec<(String, Vec<(u32, String)>)> = state
+            .project
+            .sequences
+            .iter()
+            .map(|s| {
+                (
+                    s.id.clone(),
+                    s.groups.iter().map(|g| (g.id, g.name.clone())).collect(),
+                )
+            })
+            .collect();
         let insts: Vec<(String, String)> = state
             .project
             .instruments
@@ -126,7 +137,7 @@ impl Scene for App {
 
         ui.dock_space("main", dock_size, dock, |ui, tab| match tab {
             "Project" => explorer::draw(ui, project),
-            "Graph" => draw_editor(ui, project, monitor, preview_tx, &seqs, &insts, devices),
+            "Graph" => draw_editor(ui, project, monitor, preview_tx, &seqs, &seq_groups, &insts, devices),
             "Inspector" => {
                 inspector::draw(ui, project, playing, monitor, status, preview_tx);
             }
@@ -152,6 +163,7 @@ fn draw_editor(
     monitor: &std::sync::Arc<crate::monitor::Monitor>,
     preview_tx: &mut EventSender<NoteEvent>,
     seqs: &[(String, String)],
+    seq_groups: &[(String, Vec<(u32, String)>)],
     insts: &[(String, String)],
     devices: &mut DeviceLists,
 ) {
@@ -162,6 +174,7 @@ fn draw_editor(
             &mut project.main,
             monitor,
             seqs,
+            seq_groups,
             insts,
             &project.samples,
             devices,
@@ -175,6 +188,7 @@ fn draw_editor(
                     &mut inst.graph,
                     monitor,
                     seqs,
+                    seq_groups,
                     insts,
                     &[],
                     devices,

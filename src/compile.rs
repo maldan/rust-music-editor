@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use mega_audio::dsp::{
     AdsrParams, BiquadFilter, Chorus, Clamp, Compressor, Delay, Distortion, FilterKind, Flanger,
-    GainCv, Mul, Oscillator, Remap, Reverb, Slew, StereoGain, StereoJoin, StereoMixer, StereoPan,
+    GainCv, Mul, Oscillator, Remap, Reverb, ReverbKind, Slew, StereoGain, StereoJoin, StereoMixer, StereoPan,
     TranceGate, WaveShape, Waveform, Const, CurveEnv,
 };
 use mega_audio::graph::{Bypass, Graph, Node, NodeId, ProcessContext};
@@ -26,7 +26,7 @@ use crate::graph::{
     NodeKind, Project, SeqNote, BEATS_PER_BAR, BEATS_PER_STEP, MIX_INS,
     NOTE_JOIN_INS,
 };
-use crate::monitor::{FftBuf, Monitor, ScopeBuf};
+use crate::monitor::{FftBuf, GonioBuf, Monitor, ScopeBuf};
 
 pub const WAVEFORMS: [(&str, Waveform); 5] = [
     ("Sine", Waveform::Sine),
@@ -45,6 +45,23 @@ fn biquad_kind(i: usize) -> FilterKind {
         3 => FilterKind::Notch,
         _ => FilterKind::LowPass,
     }
+}
+
+fn reverb_kind(i: usize) -> ReverbKind {
+    match i {
+        1 => ReverbKind::Plate,
+        2 => ReverbKind::Hall,
+        _ => ReverbKind::Room,
+    }
+}
+
+fn apply_reverb(rv: &mut Reverb, n: &crate::graph::GraphNode) {
+    rv.kind = reverb_kind(n.rev_kind);
+    rv.room = n.rev_room.clamp(0.0, 1.0);
+    rv.damp = n.rev_damp.clamp(0.0, 1.0);
+    rv.mix = n.rev_mix.clamp(0.0, 1.0);
+    rv.predelay = (n.rev_predelay * 0.001).clamp(0.0, 0.08);
+    rv.modulate = n.rev_mod.clamp(0.0, 1.0);
 }
 
 fn audio_in_wired(patch: &Patch, node: &str, port: &str) -> bool {
@@ -227,51 +244,73 @@ impl Patch {
     }
 }
 
-fn sequence_patch(project: &Project, seq: &crate::graph::Sequence, playing: bool) -> Patch {
+fn sequence_group_inst(seq: &crate::graph::Sequence, g: &crate::graph::NoteGroup) -> String {
+    if !g.play_inst.is_empty() {
+        return g.play_inst.clone();
+    }
+    seq.play_inst.clone()
+}
+
+fn sequence_lanes(seq: &crate::graph::Sequence) -> Vec<(String, Vec<SeqNote>, String)> {
     let groups = if seq.groups.is_empty() {
         vec![crate::graph::default_note_group(seq.play_inst.clone())]
     } else {
         seq.groups.clone()
     };
-    let clock = crate::graph::GraphNode::new("clk".into(), NodeKind::Clock, glam::Vec2::ZERO);
-    let out = crate::graph::GraphNode::new("out".into(), NodeKind::Output, glam::Vec2::ZERO);
-    let mut nodes = vec![clock];
-    let mut links: Vec<(String, String, String, String)> = Vec::new();
-    let mut plays: Vec<String> = Vec::new();
-    let mut any_inst = false;
-
-    let def = groups.iter().find(|g| g.id == crate::graph::DEFAULT_GROUP_ID);
-    let def_visible = def.map(|g| g.visible).unwrap_or(true);
-    let def_inst = def
-        .map(|g| g.play_inst.as_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or(seq.play_inst.as_str());
-    let mut lanes: Vec<(String, Vec<SeqNote>, String)> = vec![(
-        String::new(),
-        if def_visible {
-            seq.notes
-                .iter()
-                .copied()
-                .filter(|n| n.group == crate::graph::DEFAULT_GROUP_ID)
-                .collect()
-        } else {
-            Vec::new()
-        },
-        def_inst.to_string(),
-    )];
+    let mut lanes = Vec::new();
     for g in &groups {
-        if g.id == crate::graph::DEFAULT_GROUP_ID || !g.visible {
+        if !g.visible {
             continue;
         }
-        let notes: Vec<SeqNote> = seq.notes.iter().copied().filter(|n| n.group == g.id).collect();
+        let notes: Vec<SeqNote> = seq
+            .notes
+            .iter()
+            .copied()
+            .filter(|n| n.group == g.id)
+            .collect();
         if notes.is_empty() {
             continue;
         }
         if lanes.len() >= MIX_INS.len() {
             break;
         }
-        lanes.push((g.id.to_string(), notes, g.play_inst.clone()));
+        let suffix = if g.id == crate::graph::DEFAULT_GROUP_ID {
+            String::new()
+        } else {
+            g.id.to_string()
+        };
+        lanes.push((suffix, notes, sequence_group_inst(seq, g)));
     }
+    if lanes.is_empty() {
+        let g = groups
+            .iter()
+            .find(|g| g.visible)
+            .or_else(|| groups.first());
+        let (suffix, inst) = match g {
+            Some(g) if g.id != crate::graph::DEFAULT_GROUP_ID => {
+                (g.id.to_string(), sequence_group_inst(seq, g))
+            }
+            Some(g) => (String::new(), sequence_group_inst(seq, g)),
+            None => (String::new(), seq.play_inst.clone()),
+        };
+        lanes.push((suffix, Vec::new(), inst));
+    }
+    lanes
+}
+
+fn sequence_patch(project: &Project, seq: &crate::graph::Sequence, playing: bool) -> Patch {
+    let clock = crate::graph::GraphNode::new("clk".into(), NodeKind::Clock, glam::Vec2::ZERO);
+    let out = crate::graph::GraphNode::new("out".into(), NodeKind::Output, glam::Vec2::ZERO);
+    let mut nodes = vec![clock];
+    let mut links: Vec<(String, String, String, String)> = Vec::new();
+    let mut plays: Vec<String> = Vec::new();
+    let mut any_inst = false;
+    let lanes = sequence_lanes(seq);
+    let preview_seq = if lanes[0].0.is_empty() {
+        "seq".to_string()
+    } else {
+        format!("seq{}", lanes[0].0)
+    };
 
     for (suffix, notes, inst) in lanes {
         let seq_id = if suffix.is_empty() {
@@ -338,7 +377,7 @@ fn sequence_patch(project: &Project, seq: &crate::graph::Sequence, playing: bool
         links,
         captures: HashMap::new(),
         clips: HashMap::new(),
-        preview_seq: Some("seq".into()),
+        preview_seq: Some(preview_seq),
     }
 }
 
@@ -397,7 +436,7 @@ fn instrument_patch(project: &Project, inst: &Instrument, playing: bool) -> Patc
         playing: true,
         bpm: project.main.bpm.max(1.0),
         seek_gen: project.main.seek_gen,
-        seek_beats: 0.0,
+        seek_beats: project.main.seek_beats.max(0.0),
         output_id: "out".into(),
         nodes,
         links,
@@ -480,6 +519,7 @@ fn dsp_bypass(kind: NodeKind) -> Bypass {
         | NodeKind::Smooth
         | NodeKind::Readout
         | NodeKind::Scope
+        | NodeKind::Gonio
         | NodeKind::Spectrum
         | NodeKind::Spectrogram => Bypass::Thru,
         _ => Bypass::Off,
@@ -516,6 +556,7 @@ fn dsp_kind(kind: NodeKind) -> bool {
             | NodeKind::NoteFreq
             | NodeKind::Envelope
             | NodeKind::Scope
+            | NodeKind::Gonio
             | NodeKind::Spectrum
             | NodeKind::Spectrogram
             | NodeKind::Voice
@@ -833,6 +874,15 @@ fn build_graph_at(patch: &Patch, sample_rate: f32, monitor: &Monitor, block_size
                 in_port.insert((n.id.clone(), "in".into()), Wire::stereo(id, 0, 1));
                 out_port.insert((n.id.clone(), "out".into()), Wire::stereo(id, 0, 1));
             }
+            NodeKind::Gonio => {
+                let tap = GonioTap {
+                    buf: monitor.gonio_buf(&n.id),
+                };
+                let id = graph.add_node(Box::new(tap));
+                dsp.insert(n.id.clone(), id);
+                in_port.insert((n.id.clone(), "in".into()), Wire::stereo(id, 0, 1));
+                out_port.insert((n.id.clone(), "out".into()), Wire::stereo(id, 0, 1));
+            }
             NodeKind::Readout => {
                 let id = graph.add_node(Box::new(MeterTap {
                     slot: monitor.meter_slot(&n.id),
@@ -887,9 +937,7 @@ fn build_graph_at(patch: &Patch, sample_rate: f32, monitor: &Monitor, block_size
             }
             NodeKind::Reverb => {
                 let mut rv = Reverb::new(sample_rate);
-                rv.room = n.rev_room.clamp(0.0, 1.0);
-                rv.damp = n.rev_damp.clamp(0.0, 1.0);
-                rv.mix = n.rev_mix.clamp(0.0, 1.0);
+                apply_reverb(&mut rv, n);
                 let id = graph.add_node(Box::new(rv));
                 dsp.insert(n.id.clone(), id);
                 in_port.insert((n.id.clone(), "in".into()), Wire::stereo(id, 0, 1));
@@ -1362,9 +1410,7 @@ impl Live {
                 }
                 NodeKind::Reverb => {
                     if let Some(r) = graph.node_mut::<Reverb>(id) {
-                        r.room = n.rev_room.clamp(0.0, 1.0);
-                        r.damp = n.rev_damp.clamp(0.0, 1.0);
-                        r.mix = n.rev_mix.clamp(0.0, 1.0);
+                        apply_reverb(r, n);
                     }
                 }
                 NodeKind::Compressor => {
@@ -2196,6 +2242,10 @@ struct ScopeTap {
     buf: Arc<ScopeBuf>,
 }
 
+struct GonioTap {
+    buf: Arc<GonioBuf>,
+}
+
 impl Node for ScopeTap {
     fn num_inputs(&self) -> usize {
         2
@@ -2227,6 +2277,44 @@ impl Node for ScopeTap {
 
     fn name(&self) -> &'static str {
         "Scope"
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+impl Node for GonioTap {
+    fn num_inputs(&self) -> usize {
+        2
+    }
+
+    fn num_outputs(&self) -> usize {
+        2
+    }
+
+    fn process(&mut self, ctx: &ProcessContext, inputs: &[&[f32]], outputs: &mut [&mut [f32]]) {
+        let n = ctx.block_size;
+        let left = inputs.first().copied().unwrap_or(&[]);
+        let right = inputs.get(1).copied().unwrap_or(left);
+        if let Some(out) = outputs.get_mut(0) {
+            let k = n.min(left.len()).min(out.len());
+            out[..k].copy_from_slice(&left[..k]);
+        }
+        if let Some(out) = outputs.get_mut(1) {
+            let src = if right.len() >= n { right } else { left };
+            let k = n.min(src.len()).min(out.len());
+            out[..k].copy_from_slice(&src[..k]);
+        }
+        for i in 0..n {
+            let l = left.get(i).copied().unwrap_or(0.0);
+            let r = right.get(i).copied().unwrap_or(l);
+            self.buf.push(l, r);
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "Gonio"
     }
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
@@ -2617,6 +2705,32 @@ struct TapTarget {
     gate: f64,
 }
 
+fn audio_reaches_master(patch: &Patch, start: &str) -> bool {
+    let Some(master) = patch.nodes.iter().find(|n| n.kind == NodeKind::Output) else {
+        return true;
+    };
+    let mut stack = vec![start.to_string()];
+    let mut seen = HashSet::new();
+    while let Some(cur) = stack.pop() {
+        if cur == master.id {
+            return true;
+        }
+        if !seen.insert(cur.clone()) {
+            continue;
+        }
+        for (from, from_p, to, _) in &patch.links {
+            if from != &cur {
+                continue;
+            }
+            if from_p == "notes" || from_p == "clock" {
+                continue;
+            }
+            stack.push(to.clone());
+        }
+    }
+    false
+}
+
 fn seq_routes(
     patch: &Patch,
     seq_id: &str,
@@ -2652,6 +2766,9 @@ fn seq_routes(
                     ),
                     "notes",
                 ) => {
+                    if !audio_reaches_master(patch, to) {
+                        continue;
+                    }
                     if let Some(&id) = voices.get(to) {
                         out.push(SeqTarget {
                             voice: id,
@@ -2949,6 +3066,27 @@ mod tests {
         assert!(build.graph.node_mut::<AdditivePiano>(id).is_some());
         let (targets, _) = seq_routes(&patch, "seq", &build.voices);
         assert_eq!(targets.len(), 1);
+    }
+
+    #[test]
+    fn unused_synth_does_not_get_notes() {
+        let seq = crate::graph::GraphNode::new("seq".into(), NodeKind::Sequencer, glam::Vec2::ZERO);
+        let gtr = crate::graph::GraphNode::new("gtr".into(), NodeKind::Guitar, glam::Vec2::ZERO);
+        let voice = crate::graph::GraphNode::new("voice".into(), NodeKind::Voice, glam::Vec2::ZERO);
+        let out = crate::graph::GraphNode::new("out".into(), NodeKind::Output, glam::Vec2::ZERO);
+        let patch = patch_with(
+            vec![seq, gtr, voice, out],
+            vec![
+                ("seq", "notes", "gtr", "notes"),
+                ("seq", "notes", "voice", "notes"),
+                ("voice", "out", "out", "in"),
+            ],
+        );
+        let mon = Monitor::default();
+        let build = build_graph(&patch, 48_000.0, &mon);
+        let (targets, _) = seq_routes(&patch, "seq", &build.voices);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].voice, *build.voices.get("voice").unwrap());
     }
 
     #[test]
@@ -3290,17 +3428,21 @@ mod tests {
     fn spectrum_nodes_are_thru_dsp() {
         assert!(dsp_kind(NodeKind::Spectrum));
         assert!(dsp_kind(NodeKind::Spectrogram));
+        assert!(dsp_kind(NodeKind::Gonio));
         assert!(dsp_kind(NodeKind::Readout));
         assert_eq!(dsp_bypass(NodeKind::Spectrum), Bypass::Thru);
         assert_eq!(dsp_bypass(NodeKind::Spectrogram), Bypass::Thru);
+        assert_eq!(dsp_bypass(NodeKind::Gonio), Bypass::Thru);
         assert_eq!(dsp_bypass(NodeKind::Readout), Bypass::Thru);
         let spec = crate::graph::GraphNode::new("s".into(), NodeKind::Spectrum, glam::Vec2::ZERO);
         let gram = crate::graph::GraphNode::new("g".into(), NodeKind::Spectrogram, glam::Vec2::ZERO);
-        let patch = patch_with(vec![spec, gram], vec![]);
+        let gonio = crate::graph::GraphNode::new("w".into(), NodeKind::Gonio, glam::Vec2::ZERO);
+        let patch = patch_with(vec![spec, gram, gonio], vec![]);
         let mon = Monitor::default();
         let build = build_graph(&patch, 48_000.0, &mon);
         assert!(build.dsp.contains_key("s"));
         assert!(build.dsp.contains_key("g"));
+        assert!(build.dsp.contains_key("w"));
     }
 
     #[test]
@@ -3342,6 +3484,27 @@ mod tests {
         let gram = mon.spectrogram("spec");
         assert_eq!(gram.len(), crate::fft::SPEC_COLS * crate::fft::SPEC_BINS);
         assert!(gram.iter().any(|v| *v > 0.15));
+    }
+
+    #[test]
+    fn gonio_tap_keeps_stereo_and_reads_wide() {
+        let mon = Monitor::default();
+        let mut tap = GonioTap {
+            buf: mon.gonio_buf("w"),
+        };
+        let ctx = ProcessContext {
+            sample_rate: 48_000.0,
+            block_size: 4,
+        };
+        let left = [0.2, 0.4, 0.6, 0.8];
+        let right = [-0.2, -0.4, -0.6, -0.8];
+        let mut out_l = [0.0f32; 4];
+        let mut out_r = [0.0f32; 4];
+        tap.process(&ctx, &[&left, &right], &mut [&mut out_l[..], &mut out_r[..]]);
+        assert_eq!(out_l, left);
+        assert_eq!(out_r, right);
+        let (_, corr) = mon.gonio_view("w");
+        assert!(corr < -0.5, "corr {corr}");
     }
 
     #[test]
@@ -3549,9 +3712,28 @@ mod tests {
         let cp = crate::graph::GraphNode::new("cp".into(), NodeKind::Compressor, glam::Vec2::ZERO);
         let patch = patch_with(vec![rv, cp], vec![]);
         let mon = Monitor::default();
-        let build = build_graph(&patch, 48_000.0, &mon);
+        let mut build = build_graph(&patch, 48_000.0, &mon);
         assert!(build.dsp.contains_key("rv"));
         assert!(build.dsp.contains_key("cp"));
+        let id = *build.dsp.get("rv").unwrap();
+        let r = build.graph.node_mut::<Reverb>(id).unwrap();
+        assert_eq!(r.kind, ReverbKind::Room);
+    }
+
+    #[test]
+    fn reverb_kind_reaches_dsp() {
+        let mut rv = crate::graph::GraphNode::new("rv".into(), NodeKind::Reverb, glam::Vec2::ZERO);
+        rv.rev_kind = 1;
+        rv.rev_predelay = 30.0;
+        rv.rev_mod = 0.8;
+        let patch = patch_with(vec![rv], vec![]);
+        let mon = Monitor::default();
+        let mut build = build_graph(&patch, 48_000.0, &mon);
+        let id = *build.dsp.get("rv").unwrap();
+        let r = build.graph.node_mut::<Reverb>(id).unwrap();
+        assert_eq!(r.kind, ReverbKind::Plate);
+        assert!((r.predelay - 0.03).abs() < 1e-5);
+        assert!((r.modulate - 0.8).abs() < 1e-5);
     }
 
     #[test]
@@ -3628,15 +3810,41 @@ mod tests {
         p.sequences[0].groups[0].visible = false;
         p.view = crate::graph::EditorView::Sequence("s1".into());
         let patch = Patch::from_project(&p, true);
-        let seq = patch.nodes.iter().find(|n| n.id == "seq").unwrap();
-        assert!(seq.notes.is_empty());
+        assert!(patch.nodes.iter().all(|n| n.id != "seq"));
         let extra = patch
             .nodes
             .iter()
             .find(|n| n.id == format!("seq{gid}"))
             .unwrap();
         assert_eq!(extra.notes.len(), 1);
-        assert!(patch.nodes.iter().any(|n| n.kind == NodeKind::Mixer));
+        assert!(!patch.nodes.iter().any(|n| n.kind == NodeKind::Mixer));
+        assert_eq!(
+            patch.preview_seq.as_deref(),
+            Some(format!("seq{gid}").as_str())
+        );
+    }
+
+    #[test]
+    fn sequence_view_skips_empty_visible_default_lane() {
+        let mut p = crate::graph::Project::new_default();
+        p.add_instrument();
+        let gid = p.sequences[0].add_group();
+        for n in &mut p.sequences[0].notes {
+            n.group = gid;
+        }
+        p.sequences[0].set_group_play_inst(gid, p.instruments[1].id.clone());
+        p.view = crate::graph::EditorView::Sequence("s1".into());
+        let patch = Patch::from_project(&p, true);
+        assert!(patch.nodes.iter().all(|n| n.id != "seq" && n.id != "play"));
+        assert_eq!(
+            patch
+                .nodes
+                .iter()
+                .filter(|n| n.kind == NodeKind::Sequencer)
+                .count(),
+            1
+        );
+        assert!(!patch.nodes.iter().any(|n| n.kind == NodeKind::Mixer));
     }
 
     #[test]
@@ -3693,6 +3901,21 @@ mod tests {
             pitches
         );
         assert_eq!(keys.seq_loop_bars, p.sequences[0].seq_loop_bars);
+    }
+
+    #[test]
+    fn instrument_view_play_starts_at_from_tick() {
+        let mut p = crate::graph::Project::new_default();
+        let inst_id = p.instruments[0].id.clone();
+        p.view = crate::graph::EditorView::Instrument(inst_id);
+        p.main.play_from = 40;
+        p.main.cue_play();
+        let patch = Patch::from_project(&p, true);
+        let from = 39.0 * BEATS_PER_BAR as f64;
+        assert!((patch.seek_beats - from).abs() < 1e-9);
+        let mon = Monitor::default();
+        let (live, _) = Live::new(&patch, 48_000.0, std::sync::Arc::new(mon));
+        assert!((live.song_beats - from).abs() < 1e-9);
     }
 
     #[test]

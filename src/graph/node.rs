@@ -71,6 +71,7 @@ pub enum NodeKind {
     NoteFreq,
     Envelope,
     Scope,
+    Gonio,
     Spectrum,
     Spectrogram,
     NoteScope,
@@ -123,6 +124,7 @@ impl NodeKind {
             Self::NoteFreq => "Note Freq",
             Self::Envelope => "Envelope",
             Self::Scope => "Waveform",
+            Self::Gonio => "Goniometer",
             Self::Spectrum => "Spectrum",
             Self::Spectrogram => "Spectrogram",
             Self::NoteScope => "Notes",
@@ -265,6 +267,13 @@ pub struct GraphNode {
     pub rev_room: f32,
     #[serde(default = "default_rev_damp")]
     pub rev_damp: f32,
+    /// Index into [`REV_NAMES`] (room / plate / hall).
+    #[serde(default)]
+    pub rev_kind: usize,
+    #[serde(default = "default_rev_predelay")]
+    pub rev_predelay: f32,
+    #[serde(default = "default_rev_mod")]
+    pub rev_mod: f32,
     #[serde(default = "default_comp_thresh")]
     pub comp_thresh: f32,
     #[serde(default = "default_comp_ratio")]
@@ -304,6 +313,9 @@ pub struct GraphNode {
     /// Sequence entity id for [`NodeKind::Sequencer`].
     #[serde(default)]
     pub seq_id: String,
+    /// `None` = every visible group. `Some` = that group id (even if hidden).
+    #[serde(default)]
+    pub seq_group: Option<u32>,
     /// Instrument entity id for [`NodeKind::Instrument`].
     #[serde(default)]
     pub inst_id: String,
@@ -570,6 +582,12 @@ fn default_rev_room() -> f32 {
 fn default_rev_damp() -> f32 {
     0.4
 }
+fn default_rev_predelay() -> f32 {
+    20.0
+}
+fn default_rev_mod() -> f32 {
+    0.35
+}
 fn default_comp_thresh() -> f32 {
     0.35
 }
@@ -722,6 +740,9 @@ impl GraphNode {
             rev_mix: 0.35,
             rev_room: 0.7,
             rev_damp: 0.4,
+            rev_kind: 0,
+            rev_predelay: 20.0,
+            rev_mod: 0.35,
             comp_thresh: 0.35,
             comp_ratio: 4.0,
             comp_attack: 0.012,
@@ -748,6 +769,7 @@ impl GraphNode {
                 _ => 4,
             },
             seq_id: String::new(),
+            seq_group: None,
             inst_id: String::new(),
             sample_id: String::new(),
             notes: Vec::new(),
@@ -1048,6 +1070,8 @@ pub const ARP_NAMES: [&str; 3] = ["Up", "Down", "UpDown"];
 
 pub const FILTER_NAMES: [&str; 4] = ["Low pass", "High pass", "Band pass", "Notch"];
 
+pub const REV_NAMES: [&str; 3] = ["Room", "Plate", "Hall"];
+
 /// Musical length of one Trance Gate step, synced to BPM.
 pub const GATE_DIV_NAMES: [&str; 6] = ["1/1", "1/2", "1/4", "1/8", "1/16", "1/32"];
 pub const GATE_DIV_BEATS: [f64; 6] = [4.0, 2.0, 1.0, 0.5, 0.25, 0.125];
@@ -1294,6 +1318,7 @@ mod tests {
         assert_eq!(NodeKind::NoteFreq.title(), "Note Freq");
         assert_eq!(NodeKind::Envelope.title(), "Envelope");
         assert_eq!(NodeKind::Readout.title(), "Readout");
+        assert_eq!(NodeKind::Gonio.title(), "Goniometer");
         let g = GraphNode::new("g".into(), NodeKind::TranceGate, Vec2::ZERO);
         assert_eq!(g.gate_pattern, 0x5555);
         assert!((g.gate_mix - 1.0).abs() < 1e-6);
@@ -1346,6 +1371,14 @@ mod tests {
         let n = GraphNode::new("f".into(), NodeKind::Filter, Vec2::ZERO);
         assert_eq!(n.filter_kind, 0);
         assert_eq!(FILTER_NAMES[1], "High pass");
+    }
+
+    #[test]
+    fn reverb_defaults_room() {
+        let n = GraphNode::new("rv".into(), NodeKind::Reverb, Vec2::ZERO);
+        assert_eq!(n.rev_kind, 0);
+        assert_eq!(REV_NAMES[1], "Plate");
+        assert!((n.rev_predelay - 20.0).abs() < 1e-6);
     }
 
     #[test]

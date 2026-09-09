@@ -427,6 +427,9 @@ impl Project {
         for n in &mut self.main.nodes {
             if n.kind == NodeKind::Sequencer && n.seq_id == from_id {
                 n.seq_id = into_id.to_string();
+                if n.seq_group.is_some() {
+                    n.seq_group = Some(gid);
+                }
             }
         }
         for i in &mut self.instruments {
@@ -482,6 +485,16 @@ impl Project {
         for i in &mut self.instruments {
             if i.play_seq == seq_id && i.play_group == Some(group) {
                 i.play_group = None;
+            }
+            for n in &mut i.graph.nodes {
+                if n.kind == NodeKind::Sequencer && n.seq_id == seq_id && n.seq_group == Some(group) {
+                    n.seq_group = None;
+                }
+            }
+        }
+        for n in &mut self.main.nodes {
+            if n.kind == NodeKind::Sequencer && n.seq_id == seq_id && n.seq_group == Some(group) {
+                n.seq_group = None;
             }
         }
     }
@@ -606,7 +619,7 @@ impl Project {
                 continue;
             }
             if let Some(seq) = sequences.iter().find(|s| s.id == n.seq_id) {
-                n.notes = seq.visible_notes();
+                n.notes = seq.notes_for_play(n.seq_group);
                 n.seq_loop_bars = seq.seq_loop_bars;
                 n.seq_octave = seq.seq_octave;
             }
@@ -795,6 +808,31 @@ mod tests {
         let n = p.main.nodes.iter().find(|n| n.id == node).unwrap();
         assert!(n.notes.iter().all(|note| note.group != gid));
         assert!(!n.notes.is_empty());
+    }
+
+    #[test]
+    fn sequencer_node_can_play_one_hidden_group() {
+        let mut p = Project::new_default();
+        p.sequences[0].add_group();
+        let gid = p.sequences[0].groups[1].id;
+        p.sequences[0].notes[0].group = gid;
+        p.sequences[0].groups[1].visible = false;
+        let seq_id = p.sequences[0].id.clone();
+        let node = p
+            .main
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Sequencer)
+            .map(|n| n.id.clone())
+            .expect("seq node");
+        if let Some(n) = p.main.nodes.iter_mut().find(|n| n.id == node) {
+            n.seq_id = seq_id;
+            n.seq_group = Some(gid);
+        }
+        Project::apply_seq_notes(&mut p.main.nodes, &p.sequences);
+        let n = p.main.nodes.iter().find(|n| n.id == node).unwrap();
+        assert_eq!(n.notes.len(), 1);
+        assert_eq!(n.notes[0].group, gid);
     }
 
     #[test]

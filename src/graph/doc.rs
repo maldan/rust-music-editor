@@ -244,6 +244,9 @@ impl GraphDoc {
             n.rev_mix.to_bits().hash(&mut h);
             n.rev_room.to_bits().hash(&mut h);
             n.rev_damp.to_bits().hash(&mut h);
+            n.rev_kind.hash(&mut h);
+            n.rev_predelay.to_bits().hash(&mut h);
+            n.rev_mod.to_bits().hash(&mut h);
             n.comp_thresh.to_bits().hash(&mut h);
             n.comp_ratio.to_bits().hash(&mut h);
             n.comp_attack.to_bits().hash(&mut h);
@@ -261,6 +264,7 @@ impl GraphDoc {
             n.seq_when.hash(&mut h);
             n.seq_loop_bars.hash(&mut h);
             n.seq_id.hash(&mut h);
+            n.seq_group.hash(&mut h);
             n.inst_id.hash(&mut h);
             n.sample_id.hash(&mut h);
             n.notes.len().hash(&mut h);

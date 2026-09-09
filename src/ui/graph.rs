@@ -10,10 +10,10 @@ use crate::fft::{
     freq_ticks, spec_window, t_to_freq, view_freq_ticks, view_note_ticks, SPEC_BINS, SPEC_COLS,
 };
 use crate::graph::{
-    port, ARP_NAMES, CHORD_NAMES, FILTER_NAMES, GATE_DIV_NAMES, EqPt, GraphDoc, GraphNode, NodeKind, MIX_INS,
+    port, ARP_NAMES, CHORD_NAMES, FILTER_NAMES, GATE_DIV_NAMES, REV_NAMES, EqPt, GraphDoc, GraphNode, NodeKind, MIX_INS,
     NOTE_JOIN_INS, SEQ_OCTAVE_MIN,
 };
-use crate::monitor::Monitor;
+use crate::monitor::{Monitor, GONIO_BINS};
 
 use super::piano;
 
@@ -47,6 +47,7 @@ pub fn draw(
     doc: &mut GraphDoc,
     monitor: &Arc<Monitor>,
     sequences: &[(String, String)],
+    seq_groups: &[(String, Vec<(u32, String)>)],
     instruments: &[(String, String)],
     samples: &[crate::graph::Sample],
     devices: &mut DeviceLists,
@@ -127,6 +128,7 @@ pub fn draw(
                         &mut nodes[idx],
                         monitor,
                         sequences,
+                        seq_groups,
                         instruments,
                         samples,
                         devices,
@@ -323,6 +325,7 @@ fn spawn_menu(
                 .or_else(|| leaf(ui, "Mixer", NodeKind::Mixer))
                 .or_else(|| leaf(ui, "Audio In", NodeKind::AudioIn))
                 .or_else(|| leaf(ui, "Waveform", NodeKind::Scope))
+                .or_else(|| leaf(ui, "Goniometer", NodeKind::Gonio))
                 .or_else(|| leaf(ui, "Spectrum", NodeKind::Spectrum))
                 .or_else(|| leaf(ui, "Spectrogram", NodeKind::Spectrogram))
         }
@@ -369,6 +372,7 @@ fn draw_body(
     node: &mut GraphNode,
     monitor: &Monitor,
     sequences: &[(String, String)],
+    seq_groups: &[(String, Vec<(u32, String)>)],
     instruments: &[(String, String)],
     samples: &[crate::graph::Sample],
     devices: &mut DeviceLists,
@@ -406,6 +410,36 @@ fn draw_body(
             } else {
                 sequences[sel - 1].0.clone()
             };
+            if node.seq_id.is_empty() {
+                node.seq_group = None;
+            } else {
+                let groups: &[(u32, String)] = seq_groups
+                    .iter()
+                    .find(|(id, _)| *id == node.seq_id)
+                    .map(|(_, g)| g.as_slice())
+                    .unwrap_or(&[]);
+                if node
+                    .seq_group
+                    .is_some_and(|gid| !groups.iter().any(|(id, _)| *id == gid))
+                {
+                    node.seq_group = None;
+                }
+                ui.label("Group");
+                let names: Vec<&str> = groups.iter().map(|(_, n)| n.as_str()).collect();
+                let mut glabels: Vec<&str> = vec!["All"];
+                glabels.extend(names.iter().copied());
+                let mut gsel = node
+                    .seq_group
+                    .and_then(|gid| groups.iter().position(|(id, _)| *id == gid))
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                ui.select(&format!("{}_grp", node.id), &mut gsel, &glabels);
+                node.seq_group = if gsel == 0 {
+                    None
+                } else {
+                    Some(groups[gsel - 1].0)
+                };
+            }
             ui.label("When");
             ui.text_input("when", &mut node.seq_when);
             ui.node_port(NodePortSide::Output, "notes", port::NOTES);
@@ -709,6 +743,21 @@ fn draw_body(
             ui.plot_with_view("wave", Vec2::new(0.0, 72.0), &samples, &view);
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
+        NodeKind::Gonio => {
+            ui.node_port(NodePortSide::Input, "in", port::AUDIO);
+            let (cells, corr) = monitor.gonio_view(&node.id);
+            ui.label(&format!("Corr {corr:+.2}"));
+            ui.plot_heatmap(
+                "gonio",
+                Vec2::new(248.0, 220.0),
+                GONIO_BINS,
+                GONIO_BINS,
+                &cells,
+                &[(0.0, "−"), (0.5, "M"), (1.0, "+")],
+                &[],
+            );
+            ui.node_port(NodePortSide::Output, "out", port::AUDIO);
+        }
         NodeKind::Spectrum => {
             ui.node_port(NodePortSide::Input, "in", port::AUDIO);
             let bins = monitor.spectrum(&node.id);
@@ -805,9 +854,14 @@ fn draw_body(
         }
         NodeKind::Reverb => {
             ui.node_port(NodePortSide::Input, "in", port::AUDIO);
+            ui.select("rev_kind", &mut node.rev_kind, &REV_NAMES);
             labeled_slider(ui, "Room", &mut node.rev_room, 0.0..=1.0);
             labeled_slider(ui, "Damp", &mut node.rev_damp, 0.0..=1.0);
             labeled_slider(ui, "Dry / Wet", &mut node.rev_mix, 0.0..=1.0);
+            if node.rev_kind != 0 {
+                labeled_slider(ui, "Predelay, ms", &mut node.rev_predelay, 0.0..=80.0);
+                labeled_slider(ui, "Mod", &mut node.rev_mod, 0.0..=1.0);
+            }
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
         NodeKind::Compressor => {
