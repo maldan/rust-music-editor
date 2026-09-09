@@ -1105,9 +1105,12 @@ pub struct Live {
     block_size: usize,
 }
 
+/// Audio callback inner block. Sequencer ticks once per chunk (~1.3 ms at 48 kHz).
+pub const LIVE_BLOCK: usize = 64;
+
 impl Live {
     pub fn new(patch: &Patch, sample_rate: f32, monitor: Arc<Monitor>) -> (Self, Graph) {
-        Self::new_at(patch, sample_rate, monitor, 1)
+        Self::new_at(patch, sample_rate, monitor, LIVE_BLOCK)
     }
 
     pub fn new_at(

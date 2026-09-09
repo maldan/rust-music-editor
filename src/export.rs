@@ -2,8 +2,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use mega_audio::graph::Graph;
-
 use crate::compile::{Live, Patch};
 use crate::graph::BEATS_PER_BAR;
 use crate::monitor::Monitor;
@@ -59,7 +57,7 @@ fn render_mp3(patch: &Patch, frames: usize, progress: &AtomicU32) -> Result<Vec<
     while i < frames {
         let take = (frames - i).min(graph.block_size());
         live.tick_block(&mut graph, take);
-        let _ = graph.process();
+        let _ = graph.process_frames(take);
         let (l, r) = graph.master_stereo();
         let n = take.min(l.len()).min(r.len());
         for s in 0..n {
@@ -142,7 +140,7 @@ pub fn render_peak(patch: &Patch, frames: usize) -> f32 {
     while i < frames {
         let take = (frames - i).min(graph.block_size());
         live.tick_block(&mut graph, take);
-        let _ = Graph::process(&mut graph);
+        let _ = graph.process_frames(take);
         let (l, r) = graph.master_stereo();
         let n = take.min(l.len()).min(r.len());
         for s in 0..n {

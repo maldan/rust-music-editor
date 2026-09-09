@@ -124,7 +124,7 @@ fn boot(
     let mon_audio = monitor;
     let (engine, _notes) = AudioEngine::start_on(output, move |sample_rate| {
         let (mut live, g) = Live::new(&first, sample_rate, mon_audio);
-        GraphSetup::new(g).with_on_sample(move |graph| {
+        GraphSetup::new(g).with_on_sample(move |graph, n| {
             let mut last = None;
             while let Some(p) = rx.try_recv() {
                 last = Some(p);
@@ -135,7 +135,7 @@ fn boot(
             while let Some(ev) = preview_rx.try_recv() {
                 live.preview_event(graph, ev);
             }
-            live.tick(graph);
+            live.tick_block(graph, n);
         })
     })?;
     Ok((engine, tx, preview_tx))
