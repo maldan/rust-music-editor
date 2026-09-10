@@ -2,7 +2,8 @@ use std::cell::RefCell;
 
 use mega_audio::events::EventSender;
 use mega_audio::note::NoteEvent;
-use mega_ui::Ui;
+use glam::Vec2;
+use mega_ui::{ScrollAxes, Ui};
 
 use crate::graph::{beats_to_tick, EditorView, GraphDoc, Project};
 use crate::monitor::Monitor;
@@ -26,9 +27,6 @@ pub fn draw(
         ui.label("From");
         ui.drag_int("from", &mut project.main.play_from, 1);
         project.main.play_from = project.main.play_from.max(1);
-        ui.label("BPM");
-        ui.drag_float("bpm", &mut project.main.bpm, 1.0);
-        project.main.bpm = project.main.bpm.clamp(40.0, 300.0);
     });
     ui.horizontal(|ui| {
         let play = if *playing { "Stop" } else { "Play" };
@@ -56,6 +54,25 @@ pub fn draw(
 
     ui.separator();
 
+    let size = ui.available_size();
+    ui.scroll_area(
+        "inspector",
+        Vec2::new(size.x.max(1.0), size.y.max(1.0)),
+        ScrollAxes::Vertical,
+        |ui| {
+            draw_body(ui, project, preview_tx, status);
+        },
+    );
+
+    false
+}
+
+fn draw_body(
+    ui: &mut Ui,
+    project: &mut Project,
+    preview_tx: &mut EventSender<NoteEvent>,
+    status: &str,
+) {
     match project.view.clone() {
         EditorView::Sequence(id) => {
             let others: Vec<(String, String)> = project
@@ -65,18 +82,13 @@ pub fn draw(
                 .map(|s| (s.id.clone(), s.name.clone()))
                 .collect();
             ui.label("Sequence");
-            if let Some(seq) = project.sequence_mut(&id) {
-                ui.label("Name");
-                ui.text_input("seq_name", &mut seq.name);
-                ui.horizontal(|ui| {
-                    ui.label("Bars");
-                    let mut bars = seq.seq_loop_bars as i32;
-                    ui.drag_int("seq_bars", &mut bars, 1);
-                    seq.seq_loop_bars = bars.max(1) as u32;
-                });
-                if ui.button("Delete sequence").clicked {
-                    project.pending_delete_seq = Some(id.clone());
-                }
+            let mut compact = piano::editor_compact(&id);
+            if ui.checkbox("Compact octaves", &mut compact).changed {
+                piano::set_editor_compact(&id, compact);
+            }
+            let mut follow = piano::editor_follow(&id);
+            if ui.checkbox("Follow playhead", &mut follow).changed {
+                piano::set_editor_follow(&id, follow);
             }
             if !others.is_empty() {
                 ui.separator();
@@ -116,8 +128,6 @@ pub fn draw(
                 .collect();
             ui.label("Instrument");
             if let Some(inst) = project.instrument_mut(&id) {
-                ui.label("Name");
-                ui.text_input("inst_name", &mut inst.name);
                 ui.label("Play sequence");
                 let mut labels: Vec<&str> = vec!["Default 3 notes"];
                 for (_, name) in &seqs {
@@ -166,15 +176,11 @@ pub fn draw(
                         Some(groups[gsel - 1].0)
                     };
                 }
-                if ui.button("Delete instrument").clicked {
-                    project.pending_delete_inst = Some(id.clone());
-                }
             }
             ui.separator();
-            let Some(doc) = project.active_graph() else {
-                return false;
-            };
-            draw_graph_sel(ui, doc);
+            if let Some(doc) = project.active_graph() {
+                draw_graph_sel(ui, doc);
+            }
         }
         EditorView::Sample(id) => {
             ui.label("Sample");
@@ -191,10 +197,9 @@ pub fn draw(
             }
         }
         EditorView::Graph => {
-            let Some(doc) = project.active_graph() else {
-                return false;
-            };
-            draw_graph_sel(ui, doc);
+            if let Some(doc) = project.active_graph() {
+                draw_graph_sel(ui, doc);
+            }
         }
     }
 
@@ -209,8 +214,6 @@ pub fn draw(
         ui.separator();
         ui.label(status);
     }
-
-    false
 }
 
 fn draw_graph_sel(ui: &mut Ui, doc: &mut GraphDoc) {

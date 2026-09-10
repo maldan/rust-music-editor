@@ -80,6 +80,12 @@ impl CaptureBank {
     }
 }
 
+pub struct MidiImport {
+    pub bytes: Vec<u8>,
+    pub name: String,
+    pub mode: usize,
+}
+
 pub struct App {
     pub project: Project,
     pub dock: DockState,
@@ -89,11 +95,15 @@ pub struct App {
     pub preview_tx: EventSender<NoteEvent>,
     pub export_open: bool,
     pub export_path: String,
+    pub export_video_open: bool,
+    pub export_video_path: String,
     pub export_bars: i32,
     pub export_job: Option<ExportJob>,
+    pub track_settings_open: bool,
     pub devices: DeviceLists,
     /// Pixel size of the Visual dock tab when it is the active pane.
     pub viz_px: Option<(u32, u32)>,
+    pub midi_import: Option<MidiImport>,
     current_path: Option<PathBuf>,
     last_fp: u64,
     last_playing: bool,
@@ -163,10 +173,14 @@ impl App {
             preview_tx,
             export_open: false,
             export_path: String::new(),
+            export_video_open: false,
+            export_video_path: String::new(),
             export_bars: 8,
             export_job: None,
+            track_settings_open: false,
             devices: DeviceLists::fetch(),
             viz_px: None,
+            midi_import: None,
             current_path: None,
             engine_out: String::new(),
             captures: CaptureBank::new(),
@@ -277,7 +291,10 @@ impl App {
         self.last_playing = false;
         self.last_seek_gen = 0;
         self.export_open = false;
+        self.export_video_open = false;
         self.export_job = None;
+        self.track_settings_open = false;
+        self.midi_import = None;
         self.captures = CaptureBank::new();
         self.status = status;
     }
@@ -290,16 +307,18 @@ impl App {
             return;
         };
         match std::fs::read(&path) {
-            Ok(bytes) => match self.project.import_midi(&bytes) {
-                Ok(n) => {
-                    self.status = format!(
-                        "Imported {n} sequence{} from {}",
-                        if n == 1 { "" } else { "s" },
-                        path.display()
-                    );
-                }
-                Err(e) => self.status = format!("MIDI import failed: {e}"),
-            },
+            Ok(bytes) => {
+                let name = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("MIDI")
+                    .to_string();
+                self.midi_import = Some(MidiImport {
+                    bytes,
+                    name,
+                    mode: 0,
+                });
+            }
             Err(e) => self.status = format!("MIDI import failed: {e}"),
         }
     }

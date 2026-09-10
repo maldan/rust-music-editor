@@ -1,9 +1,9 @@
 use std::cell::RefCell;
 
 use glam::Vec2;
-use mega_ui::{CursorIcon, LayoutOpts, Rect, Ui, Window};
+use mega_ui::{CursorIcon, LayoutOpts, Rect, ScrollAxes, Ui, Window};
 
-use crate::graph::{EditorView, Project, DEFAULT_GROUP_ID};
+use crate::graph::{EditorView, NoteGroup, Project, DEFAULT_GROUP_ID};
 use crate::ui::piano;
 
 #[derive(Clone)]
@@ -57,13 +57,32 @@ fn draw_list(ui: &mut Ui, project: &mut Project, seq_id: &str) {
         .map(|s| s.groups.clone())
         .unwrap_or_default();
 
+    let size = ui.available_size();
+    ui.scroll_area(
+        "groups",
+        Vec2::new(size.x.max(1.0), size.y.max(1.0)),
+        ScrollAxes::Vertical,
+        |ui| {
+            draw_rows(ui, seq_id, project, &groups, &sel);
+        },
+    );
+}
+
+fn draw_rows(
+    ui: &mut Ui,
+    seq_id: &str,
+    project: &mut Project,
+    groups: &[NoteGroup],
+    sel: &[usize],
+) {
+
     let mut toggle = None;
     let mut edit_id = None;
     let mut delete_id = None;
     let mut assign_id = None;
     let mut pick_id = None;
 
-    for g in &groups {
+    for g in groups {
         ui.selectable(&format!("row{}", g.id), false, |ui| {
             ui.row_with(
                 LayoutOpts {
@@ -126,12 +145,12 @@ fn draw_list(ui: &mut Ui, project: &mut Project, seq_id: &str) {
     }
     if let Some(id) = assign_id {
         if let Some(seq) = project.sequence_mut(seq_id) {
-            for i in &sel {
+            for i in sel {
                 if let Some(n) = seq.notes.get_mut(*i) {
                     n.group = id;
                 }
             }
-            piano::set_editor_selection(seq_id, sel.clone(), id);
+            piano::set_editor_selection(seq_id, sel.to_vec(), id);
         }
         ui.request_repaint();
     }

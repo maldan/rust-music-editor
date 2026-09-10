@@ -18,6 +18,8 @@ pub struct Frame {
     pub reset: bool,
     pub width: u32,
     pub height: u32,
+    pub title: String,
+    pub credit: String,
 }
 
 impl Default for Frame {
@@ -31,6 +33,8 @@ impl Default for Frame {
             reset: false,
             width: 1,
             height: 1,
+            title: String::new(),
+            credit: String::new(),
         }
     }
 }
@@ -81,9 +85,9 @@ pub fn in_when(song: f64, when: &[(f64, f64)]) -> bool {
     when.iter().any(|(a, b)| song >= *a && song < *b)
 }
 
-pub const WINDOW_BEATS: f64 = 8.0;
+pub const WINDOW_BEATS: f64 = 8.0 / 1.3;
 /// Keep notes until they have fully left the left edge.
-pub const BEHIND_BEATS: f64 = 8.0;
+pub const BEHIND_BEATS: f64 = 8.0 / 1.3;
 /// Hit line from the left of the frame (0.5 = center).
 pub const HIT_X: f32 = 0.35;
 pub const HIT_W: f32 = 0.002;
@@ -94,6 +98,8 @@ pub const FADE_PAST: f64 = 2.4;
 /// Fraction of the frame from the right edge used to fade incoming notes in.
 pub const FADE_IN_X: f32 = 0.14;
 /// Note piano-roll height; remainder is waveform strips.
-pub const NOTES_H: f32 = 0.80;
+pub const NOTES_H: f32 = 0.86;
+/// Gap above the highest notes so they are not flush with the frame edge.
+pub const NOTE_TOP: f32 = 0.048;
 pub const MAX_WAVES: usize = 8;
 pub const WAVE_BINS: usize = 256;

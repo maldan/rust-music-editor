@@ -33,6 +33,14 @@ struct ProjectFile {
     version: u32,
     graph: GraphFile,
     #[serde(default)]
+    title: String,
+    #[serde(default)]
+    author: String,
+    #[serde(default)]
+    original_author: String,
+    #[serde(default)]
+    remix: bool,
+    #[serde(default)]
     sequences: Vec<Sequence>,
     #[serde(default)]
     instruments: Vec<InstrumentFile>,
@@ -201,6 +209,10 @@ impl Project {
         let file = ProjectFile {
             version: 2,
             graph: self.main.to_file(),
+            title: self.title.clone(),
+            author: self.author.clone(),
+            original_author: self.original_author.clone(),
+            remix: self.remix,
             sequences: self.sequences.clone(),
             instruments: self
                 .instruments
@@ -231,6 +243,10 @@ impl Project {
     fn from_v2(file: ProjectFile) -> Result<Self, String> {
         let mut p = Self {
             main: GraphDoc::from_file(file.graph)?,
+            title: file.title,
+            author: file.author,
+            original_author: file.original_author,
+            remix: file.remix,
             sequences: file.sequences,
             instruments: Vec::new(),
             samples: file.samples,
@@ -281,6 +297,10 @@ fn migrate_v1(mut graph: GraphDoc) -> Project {
     extract_sequences(&mut graph, &mut sequences);
     let mut p = Project {
         main: graph,
+        title: String::new(),
+        author: String::new(),
+        original_author: String::new(),
+        remix: false,
         sequences,
         instruments: Vec::new(),
         samples: Vec::new(),
@@ -361,6 +381,22 @@ mod tests {
         assert_eq!(a.instruments.len(), b.instruments.len());
         assert_eq!(a.samples.len(), b.samples.len());
         assert_eq!(a.fingerprint(), b.fingerprint());
+    }
+
+    #[test]
+    fn track_meta_roundtrip() {
+        let mut a = Project::new_default();
+        a.title = "Night Drive".into();
+        a.author = "Ada".into();
+        a.original_author = "Bob".into();
+        a.remix = true;
+        a.main.bpm = 140.0;
+        let b = Project::from_json(&a.to_json().unwrap()).unwrap();
+        assert_eq!(b.title, "Night Drive");
+        assert_eq!(b.author, "Ada");
+        assert_eq!(b.original_author, "Bob");
+        assert!(b.remix);
+        assert_eq!(b.main.bpm, 140.0);
     }
 
     #[test]

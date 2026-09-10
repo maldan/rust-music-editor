@@ -49,6 +49,8 @@ struct Roll {
     header: Rect,
     view: Rect,
     active_group: u32,
+    compact: bool,
+    follow: bool,
 }
 
 impl Default for Roll {
@@ -70,6 +72,8 @@ impl Default for Roll {
                 max: Vec2::ZERO,
             },
             active_group: 0,
+            compact: false,
+            follow: false,
         }
     }
 }
@@ -115,12 +119,58 @@ fn pitch_of_row(base: u8, row: u32, rows: u32) -> u8 {
         .min(127)
 }
 
-fn row_of_pitch(base: u8, pitch: u8, rows: u32) -> Option<u32> {
-    let max = base.saturating_add(rows.saturating_sub(1) as u8).min(127);
-    if pitch < base || pitch > max {
-        return None;
+fn pitches_range(base: u8, rows: u32) -> Vec<u8> {
+    (0..rows).map(|r| pitch_of_row(base, r, rows)).collect()
+}
+
+fn pitches_editor(notes: &[SeqNote], compact: bool) -> Vec<u8> {
+    if !compact || notes.is_empty() {
+        return pitches_range(EDITOR_BASE, EDITOR_ROWS);
     }
-    Some((max - pitch) as u32)
+    let mut octs: Vec<u8> = notes.iter().map(|n| n.pitch / 12).collect();
+    octs.sort_unstable();
+    octs.dedup();
+    let mut out = Vec::new();
+    for oct in octs.into_iter().rev() {
+        let lo = oct.saturating_mul(12);
+        let hi = lo.saturating_add(11).min(127);
+        for p in (lo..=hi).rev() {
+            out.push(p);
+        }
+    }
+    if out.is_empty() {
+        pitches_range(EDITOR_BASE, EDITOR_ROWS)
+    } else {
+        out
+    }
+}
+
+fn row_of_pitch(pitches: &[u8], pitch: u8) -> Option<u32> {
+    pitches.iter().position(|&p| p == pitch).map(|i| i as u32)
+}
+
+fn pitch_at(pitches: &[u8], row: u32) -> Option<u8> {
+    pitches.get(row as usize).copied()
+}
+
+pub fn editor_compact(id: &str) -> bool {
+    ROLLS.with(|m| m.borrow().get(id).map(|r| r.compact).unwrap_or(false))
+}
+
+pub fn set_editor_compact(id: &str, compact: bool) {
+    ROLLS.with(|m| {
+        m.borrow_mut().entry(id.to_string()).or_default().compact = compact;
+    });
+}
+
+pub fn editor_follow(id: &str) -> bool {
+    ROLLS.with(|m| m.borrow().get(id).map(|r| r.follow).unwrap_or(false))
+}
+
+pub fn set_editor_follow(id: &str, follow: bool) {
+    ROLLS.with(|m| {
+        m.borrow_mut().entry(id.to_string()).or_default().follow = follow;
+    });
 }
 
 fn group_visible(groups: &[NoteGroup], id: u32) -> bool {
@@ -197,6 +247,10 @@ fn zoom_anchor_x(old_stride: f32, new_stride: f32, offset: f32, local: f32) -> f
     let content = (offset + local).max(0.0);
     let ratio = new_stride / old_stride.max(1e-6);
     (content * ratio - local).max(0.0)
+}
+
+fn playhead_x(beats_in_loop: f64, stride_x: f32) -> f32 {
+    (beats_in_loop as f32 / BEATS_PER_STEP) * stride_x
 }
 
 fn header_step(rect: Rect, stride_x: f32, off_x: f32, pos: Vec2, steps: u32) -> u32 {
@@ -294,8 +348,7 @@ fn notes_in_box(
     stride: Vec2,
     a: Vec2,
     b: Vec2,
-    base: u8,
-    rows: u32,
+    pitches: &[u8],
 ) -> Vec<usize> {
     let min = Vec2::new(a.x.min(b.x), a.y.min(b.y));
     let max = Vec2::new(a.x.max(b.x), a.y.max(b.y));
@@ -305,7 +358,7 @@ fn notes_in_box(
         if !group_visible(groups, n.group) {
             continue;
         }
-        let Some(r) = note_rect(grid, stride, n, base, rows) else {
+        let Some(r) = note_rect(grid, stride, n, pitches) else {
             continue;
         };
         if r.intersect(boxr).is_some() {
@@ -435,20 +488,21 @@ pub(crate) fn draw_test_keyboard(
     }
 }
 
-fn cell_at(grid: Rect, stride: Vec2, pos: Vec2, steps: u32, rows: u32, base: u8) -> Option<(u32, u8)> {
+fn cell_at(grid: Rect, stride: Vec2, pos: Vec2, steps: u32, pitches: &[u8]) -> Option<(u32, u8)> {
     if pos.x < grid.min.x || pos.y < grid.min.y || pos.x >= grid.max.x || pos.y >= grid.max.y {
         return None;
     }
     let col = ((pos.x - grid.min.x) / stride.x).floor() as i32;
     let row = ((pos.y - grid.min.y) / stride.y).floor() as i32;
+    let rows = pitches.len() as u32;
     if col < 0 || row < 0 || col as u32 >= steps || row as u32 >= rows {
         return None;
     }
-    Some((col as u32, pitch_of_row(base, row as u32, rows)))
+    Some((col as u32, pitch_at(pitches, row as u32)?))
 }
 
-fn note_rect(grid: Rect, stride: Vec2, note: SeqNote, base: u8, rows: u32) -> Option<Rect> {
-    let row = row_of_pitch(base, note.pitch, rows)?;
+fn note_rect(grid: Rect, stride: Vec2, note: SeqNote, pitches: &[u8]) -> Option<Rect> {
+    let row = row_of_pitch(pitches, note.pitch)?;
     let x = grid.min.x + note.step as f32 * stride.x;
     let y = grid.min.y + row as f32 * stride.y;
     let w = (note.len.max(1) as f32 * stride.x - GAP).max(2.0);
@@ -477,14 +531,13 @@ fn hit_note(
     grid: Rect,
     stride: Vec2,
     pos: Vec2,
-    base: u8,
-    rows: u32,
+    pitches: &[u8],
 ) -> Option<(usize, Edge)> {
     for (i, n) in notes.iter().enumerate().rev() {
         if !group_visible(groups, n.group) {
             continue;
         }
-        let Some(r) = note_rect(grid, stride, *n, base, rows) else {
+        let Some(r) = note_rect(grid, stride, *n, pitches) else {
             continue;
         };
         if r.contains(pos) {
@@ -526,10 +579,9 @@ fn erase_at(
     grid: Rect,
     stride: Vec2,
     pos: Vec2,
-    base: u8,
-    rows: u32,
+    pitches: &[u8],
 ) -> bool {
-    if let Some((i, _)) = hit_note(notes, groups, grid, stride, pos, base, rows) {
+    if let Some((i, _)) = hit_note(notes, groups, grid, stride, pos, pitches) {
         notes.remove(i);
         true
     } else {
@@ -596,7 +648,7 @@ fn geom_ex(
     }
 }
 
-fn draw_grid(ui: &mut Ui, rect: Rect, g: &RollGeom, base: u8, with_keys: bool, head: bool) -> Rect {
+fn draw_grid(ui: &mut Ui, rect: Rect, g: &RollGeom, pitches: &[u8], with_keys: bool, head: bool) -> Rect {
     let label_w = if with_keys { g.label_w } else { 0.0 };
     let head_h = if head { g.head_h } else { 0.0 };
     let grid = Rect {
@@ -611,7 +663,9 @@ fn draw_grid(ui: &mut Ui, rect: Rect, g: &RollGeom, base: u8, with_keys: bool, h
         }, g, 0.0);
     }
     for row in 0..g.rows {
-        let pitch = pitch_of_row(base, row, g.rows);
+        let Some(pitch) = pitch_at(pitches, row) else {
+            continue;
+        };
         let sharp = matches!(pitch % 12, 1 | 3 | 6 | 8 | 10);
         let y = grid.min.y + row as f32 * g.stride.y;
         let row_h = (g.stride.y - g.gap).max(1.0);
@@ -731,7 +785,7 @@ fn draw_key(ui: &mut Ui, x: f32, y: f32, g: &RollGeom, pitch: u8, row_h: f32, li
     );
 }
 
-fn draw_keys(ui: &mut Ui, rect: Rect, g: &RollGeom, base: u8, offset_y: f32, lit: Option<u8>, head_h: f32) {
+fn draw_keys(ui: &mut Ui, rect: Rect, g: &RollGeom, pitches: &[u8], offset_y: f32, lit: Option<u8>, head_h: f32) {
     ui.fill_rect(rect, [0.07, 0.07, 0.08, 1.0]);
     let y0 = rect.min.y + head_h - offset_y;
     let row_h = (g.stride.y - g.gap).max(1.0);
@@ -740,7 +794,9 @@ fn draw_keys(ui: &mut Ui, rect: Rect, g: &RollGeom, base: u8, offset_y: f32, lit
         if y + row_h < rect.min.y || y > rect.max.y {
             continue;
         }
-        let pitch = pitch_of_row(base, row, g.rows);
+        let Some(pitch) = pitch_at(pitches, row) else {
+            continue;
+        };
         draw_key(ui, rect.min.x, y, g, pitch, row_h, lit == Some(pitch));
         if pitch % 12 == 0 {
             let y1 = y + row_h;
@@ -757,8 +813,8 @@ fn draw_keys(ui: &mut Ui, rect: Rect, g: &RollGeom, base: u8, offset_y: f32, lit
 #[allow(dead_code)]
 pub fn draw_in_node(ui: &mut Ui, node_id: &str, node: &mut GraphNode, playhead: Option<f32>) {
     let steps = node.loop_steps();
-    let base = node.view_base_pitch();
-    let g = geom(ui.scale(), steps, node.view_pitch_count());
+    let pitches = pitches_range(node.view_base_pitch(), node.view_pitch_count());
+    let g = geom(ui.scale(), steps, pitches.len() as u32);
     let loop_beats = steps as f32 * BEATS_PER_STEP;
     let play_step = playhead.map(|p| {
         let t = (p / loop_beats.max(0.001)).clamp(0.0, 0.999);
@@ -776,7 +832,7 @@ pub fn draw_in_node(ui: &mut Ui, node_id: &str, node: &mut GraphNode, playhead: 
     let mut roll = ROLLS.with(|m| m.borrow().get(node_id).cloned().unwrap_or_default());
 
     if area.hovered || area.active {
-        match hit_note(&node.notes, &[], grid, g.stride, ptr.pos, base, g.rows) {
+        match hit_note(&node.notes, &[], grid, g.stride, ptr.pos, &pitches) {
             Some((_, Edge::Left | Edge::Right)) if !matches!(roll.drag, Some(Drag::Move { .. })) => {
                 ui.set_mouse_cursor(CursorIcon::ResizeEw);
             }
@@ -787,14 +843,14 @@ pub fn draw_in_node(ui: &mut Ui, node_id: &str, node: &mut GraphNode, playhead: 
     }
 
     if ptr.right_pressed && (area.hovered || area.active) {
-        erase_at(&mut node.notes, &[], grid, g.stride, ptr.pos, base, g.rows);
+        erase_at(&mut node.notes, &[], grid, g.stride, ptr.pos, &pitches);
         roll.drag = Some(Drag::Erase);
         ui.request_repaint();
     } else if matches!(roll.drag, Some(Drag::Erase)) && ptr.right_down && area.active {
-        erase_at(&mut node.notes, &[], grid, g.stride, ptr.pos, base, g.rows);
+        erase_at(&mut node.notes, &[], grid, g.stride, ptr.pos, &pitches);
         ui.request_repaint();
     } else if ptr.pressed && area.hovered {
-        match hit_note(&node.notes, &[], grid, g.stride, ptr.pos, base, g.rows) {
+        match hit_note(&node.notes, &[], grid, g.stride, ptr.pos, &pitches) {
             Some((idx, edge)) if edge != Edge::Body => {
                 roll.last_len = node.notes[idx].len.max(1);
                 roll.drag = Some(Drag::Resize {
@@ -805,7 +861,7 @@ pub fn draw_in_node(ui: &mut Ui, node_id: &str, node: &mut GraphNode, playhead: 
             Some((idx, _)) => {
                 let n = node.notes[idx];
                 roll.last_len = n.len.max(1);
-                if let Some((step, pitch)) = cell_at(grid, g.stride, ptr.pos, steps, g.rows, base) {
+                if let Some((step, pitch)) = cell_at(grid, g.stride, ptr.pos, steps, &pitches) {
                     roll.drag = Some(Drag::Move {
                         press_step: step,
                         press_pitch: pitch,
@@ -814,7 +870,7 @@ pub fn draw_in_node(ui: &mut Ui, node_id: &str, node: &mut GraphNode, playhead: 
                 }
             }
             None => {
-                if let Some((step, pitch)) = cell_at(grid, g.stride, ptr.pos, steps, g.rows, base) {
+                if let Some((step, pitch)) = cell_at(grid, g.stride, ptr.pos, steps, &pitches) {
                     let len = roll.last_len.max(1).min(steps - step);
                     node.notes.push(SeqNote {
                         step,
@@ -838,7 +894,7 @@ pub fn draw_in_node(ui: &mut Ui, node_id: &str, node: &mut GraphNode, playhead: 
                 press_pitch,
                 orig,
             }) => {
-                if let Some((step, pitch)) = cell_at(grid, g.stride, ptr.pos, steps, g.rows, base) {
+                if let Some((step, pitch)) = cell_at(grid, g.stride, ptr.pos, steps, &pitches) {
                     shift_sel(
                         &mut node.notes,
                         &orig,
@@ -851,7 +907,7 @@ pub fn draw_in_node(ui: &mut Ui, node_id: &str, node: &mut GraphNode, playhead: 
             }
             Some(Drag::Resize { idx, left }) => {
                 if let Some(n) = node.notes.get_mut(idx) {
-                    if let Some((step, _)) = cell_at(grid, g.stride, ptr.pos, steps, g.rows, base) {
+                    if let Some((step, _)) = cell_at(grid, g.stride, ptr.pos, steps, &pitches) {
                         resize_note(n, step, left, steps);
                         roll.last_len = n.len.max(1);
                     }
@@ -871,7 +927,7 @@ pub fn draw_in_node(ui: &mut Ui, node_id: &str, node: &mut GraphNode, playhead: 
         m.borrow_mut().insert(node_id.to_string(), roll);
     });
 
-    let grid = draw_grid(ui, rect, &g, base, true, true);
+    let grid = draw_grid(ui, rect, &g, &pitches, true, true);
 
     let active = match &drag {
         Some(Drag::Move { orig, .. }) => orig.iter().map(|o| o.0).collect::<Vec<_>>(),
@@ -879,7 +935,7 @@ pub fn draw_in_node(ui: &mut Ui, node_id: &str, node: &mut GraphNode, playhead: 
         _ => Vec::new(),
     };
     for (i, note) in node.notes.iter().copied().enumerate() {
-        let Some(r) = note_rect(grid, g.stride, note, base, g.rows) else {
+        let Some(r) = note_rect(grid, g.stride, note, &pitches) else {
             continue;
         };
         let mut color = [0.95, 0.72, 0.22, 1.0];
@@ -916,17 +972,18 @@ pub fn draw_editor(
     groups: &[NoteGroup],
     loop_bars: u32,
     song_beats: f64,
+    playing: bool,
     preview: &mut EventSender<NoteEvent>,
 ) -> Option<f64> {
     let steps = SEQ_STEPS * loop_bars.max(1);
-    let base = EDITOR_BASE;
     let mut roll = ROLLS.with(|m| m.borrow().get(id).cloned().unwrap_or_default());
+    let pitches = pitches_editor(notes, roll.compact);
+    let rows = pitches.len() as u32;
     let loop_beats = steps as f32 * BEATS_PER_STEP;
-    let play_step = {
-        let t = (song_beats.rem_euclid(loop_beats as f64) / loop_beats.max(0.001) as f64)
-            .clamp(0.0, 0.999);
-        Some((t * steps as f64) as u32)
-    };
+    let play_beat = song_beats
+        .rem_euclid(loop_beats.max(0.001) as f64)
+        .clamp(0.0, loop_beats.max(0.001) as f64 - 1e-9);
+    let play_step = Some((play_beat / BEATS_PER_STEP as f64) as u32);
     let mut jump_c4 = false;
     if !roll.scrolled {
         jump_c4 = true;
@@ -934,8 +991,8 @@ pub fn draw_editor(
     }
     let mut seek_to = None;
     let scale = ui.scale().max(1.0);
-    let mut g = geom_editor(scale, steps, EDITOR_ROWS, roll.zoom);
-    apply_zoom_at_cursor(ui, &mut roll, &mut g, scale, steps);
+    let mut g = geom_editor(scale, steps, rows, roll.zoom);
+    apply_zoom_at_cursor(ui, &mut roll, &mut g, scale, steps, rows);
     let grid_h = (g.size.y - g.head_h).max(1.0);
     let grid_size = Vec2::new((g.size.x - g.label_w).max(1.0), grid_h);
     let mut header_rect = roll.header;
@@ -987,7 +1044,7 @@ pub fn draw_editor(
                         };
 
                         if area.hovered || area.active {
-                            match hit_note(notes, groups, grid, g.stride, ptr.pos, base, g.rows) {
+                            match hit_note(notes, groups, grid, g.stride, ptr.pos, &pitches) {
                                 Some((_, Edge::Left | Edge::Right))
                                     if !matches!(roll.drag, Some(Drag::Move { .. })) =>
                                 {
@@ -1010,16 +1067,15 @@ pub fn draw_editor(
                             g.stride,
                             ptr,
                             steps,
-                            base,
-                            g.rows,
+                            &pitches,
                         );
 
-                        let grid = draw_grid(ui, rect, &g, base, false, false);
+                        let grid = draw_grid(ui, rect, &g, &pitches, false, false);
                         for (i, note) in notes.iter().copied().enumerate() {
                             if !group_visible(groups, note.group) {
                                 continue;
                             }
-                            let Some(r) = note_rect(grid, g.stride, note, base, g.rows) else {
+                            let Some(r) = note_rect(grid, g.stride, note, &pitches) else {
                                 continue;
                             };
                             let playing = play_step.map(|s| {
@@ -1042,27 +1098,36 @@ pub fn draw_editor(
                                 [0.82, 0.28, 0.32, 0.18],
                             );
                         }
-                        if let Some(step) = play_step {
-                            let x = grid.min.x + step as f32 * g.stride.x;
-                            ui.line(
-                                Vec2::new(x, grid.min.y),
-                                Vec2::new(x, grid.max.y),
-                                1.5,
-                                [1.0, 0.42, 0.18, 0.9],
-                            );
-                        }
-                        if roll.drag.is_some() {
+                        let x = grid.min.x + playhead_x(play_beat, g.stride.x);
+                        ui.line(
+                            Vec2::new(x, grid.min.y),
+                            Vec2::new(x, grid.max.y),
+                            1.5,
+                            [1.0, 0.42, 0.18, 0.9],
+                        );
+                        if roll.drag.is_some() || playing {
                             ui.request_repaint();
                         }
                     });
                 });
 
                 if jump_c4 {
-                    if let Some(row) = row_of_pitch(base, 60, EDITOR_ROWS) {
+                    let jump = if pitches.iter().any(|&p| p == 60) {
+                        60
+                    } else {
+                        pitches.get(pitches.len() / 2).copied().unwrap_or(60)
+                    };
+                    if let Some(row) = row_of_pitch(&pitches, jump) {
                         let y = (row as f32 * g.stride.y - keys_h * 0.4).max(0.0);
                         ui.set_scroll_target("seq_roll", Vec2::new(0.0, y));
                     }
                     ui.request_repaint();
+                }
+                if roll.follow && playing {
+                    let view_w = header_rect.width().max(1.0);
+                    let mut off = ui.scroll_offset("seq_roll");
+                    off.x = (playhead_x(play_beat, g.stride.x) - view_w * 0.35).max(0.0);
+                    ui.set_scroll_target("seq_roll", off);
                 }
 
                 let mut off = ui.scroll_offset("seq_roll");
@@ -1086,12 +1151,12 @@ pub fn draw_editor(
                     }
                 }
                 if ptr.pressed && keys.hovered {
-                    if let Some(pitch) = key_at(&g, keys.rect, ptr.pos, base, off.y, 0.0) {
+                    if let Some(pitch) = key_at(&g, keys.rect, ptr.pos, &pitches, off.y, 0.0) {
                         set_preview(preview, &mut roll.key, Some(pitch));
                     }
                     ui.request_repaint();
                 } else if roll.key.is_some() && ptr.down {
-                    if let Some(pitch) = key_at(&g, keys.rect, ptr.pos, base, off.y, 0.0) {
+                    if let Some(pitch) = key_at(&g, keys.rect, ptr.pos, &pitches, off.y, 0.0) {
                         set_preview(preview, &mut roll.key, Some(pitch));
                     }
                     ui.request_repaint();
@@ -1099,7 +1164,7 @@ pub fn draw_editor(
                 if ptr.released {
                     set_preview(preview, &mut roll.key, None);
                 }
-                draw_keys(ui, keys.rect, &g, base, off.y, roll.key, 0.0);
+                draw_keys(ui, keys.rect, &g, &pitches, off.y, roll.key, 0.0);
                 if roll.key.is_some() {
                     ui.request_repaint();
                 }
@@ -1124,6 +1189,7 @@ fn apply_zoom_at_cursor(
     g: &mut RollGeom,
     scale: f32,
     steps: u32,
+    rows: u32,
 ) {
     let ptr = ui.pointer();
     if !ptr.ctrl {
@@ -1150,13 +1216,13 @@ fn apply_zoom_at_cursor(
     let local_x = ptr.pos.x - min_x;
     let old = *g;
     roll.zoom = next;
-    *g = geom_editor(scale, steps, EDITOR_ROWS, roll.zoom);
-    apply_h_zoom(ui, &old, scale, steps, roll.zoom, local_x);
+    *g = geom_editor(scale, steps, rows, roll.zoom);
+    apply_h_zoom(ui, &old, scale, steps, rows, roll.zoom, local_x);
     ui.request_repaint();
 }
 
-fn apply_h_zoom(ui: &mut Ui, old: &RollGeom, scale: f32, steps: u32, zoom: f32, local_x: f32) {
-    let next = geom_editor(scale, steps, EDITOR_ROWS, zoom);
+fn apply_h_zoom(ui: &mut Ui, old: &RollGeom, scale: f32, steps: u32, rows: u32, zoom: f32, local_x: f32) {
+    let next = geom_editor(scale, steps, rows, zoom);
     let mut off = ui.scroll_offset("seq_roll");
     off.x = zoom_anchor_x(old.stride.x, next.stride.x, off.x, local_x);
     ui.set_scroll_target("seq_roll", off);
@@ -1173,8 +1239,7 @@ fn editor_interact(
     stride: Vec2,
     ptr: mega_ui::Pointer,
     steps: u32,
-    base: u8,
-    rows: u32,
+    pitches: &[u8],
 ) {
     let hot = area.hovered || area.active;
     if ptr.select_all && hot {
@@ -1205,7 +1270,7 @@ fn editor_interact(
     if ptr.paste && hot {
         let clip = CLIP.with(|c| c.borrow().clone());
         if !clip.is_empty() {
-            if let Some((step, pitch)) = cell_at(grid, stride, ptr.pos, steps, rows, base) {
+            if let Some((step, pitch)) = cell_at(grid, stride, ptr.pos, steps, pitches) {
                 roll.sel = paste_at(notes, &clip, step, pitch, steps);
                 ui.request_repaint();
             }
@@ -1218,7 +1283,7 @@ fn editor_interact(
     }
 
     if ptr.right_pressed && hot {
-        if let Some((idx, _)) = hit_note(notes, groups, grid, stride, ptr.pos, base, rows) {
+        if let Some((idx, _)) = hit_note(notes, groups, grid, stride, ptr.pos, pitches) {
             if sel_has(&roll.sel, idx) {
                 remove_sel(notes, &mut roll.sel);
             } else {
@@ -1230,10 +1295,10 @@ fn editor_interact(
         set_preview(preview, &mut roll.preview, None);
         ui.request_repaint();
     } else if matches!(roll.drag, Some(Drag::Erase)) && ptr.right_down && area.active {
-        erase_at(notes, groups, grid, stride, ptr.pos, base, rows);
+        erase_at(notes, groups, grid, stride, ptr.pos, pitches);
         ui.request_repaint();
     } else if ptr.pressed && area.hovered {
-        match hit_note(notes, groups, grid, stride, ptr.pos, base, rows) {
+        match hit_note(notes, groups, grid, stride, ptr.pos, pitches) {
             Some((idx, edge)) if edge != Edge::Body && !ptr.ctrl => {
                 roll.last_len = notes[idx].len.max(1);
                 roll.active_group = notes[idx].group;
@@ -1256,7 +1321,7 @@ fn editor_interact(
                 if !sel_has(&roll.sel, idx) {
                     roll.sel = vec![idx];
                 }
-                if let Some((step, pitch)) = cell_at(grid, stride, ptr.pos, steps, rows, base) {
+                if let Some((step, pitch)) = cell_at(grid, stride, ptr.pos, steps, pitches) {
                     let orig = roll
                         .sel
                         .iter()
@@ -1278,7 +1343,7 @@ fn editor_interact(
             }
             None => {
                 roll.sel.clear();
-                if let Some((step, pitch)) = cell_at(grid, stride, ptr.pos, steps, rows, base)
+                if let Some((step, pitch)) = cell_at(grid, stride, ptr.pos, steps, pitches)
                 {
                     let len = roll.last_len.max(1).min(steps - step);
                     let group = place_group(roll.active_group, groups);
@@ -1307,7 +1372,7 @@ fn editor_interact(
                 press_pitch,
                 orig,
             }) => {
-                if let Some((step, pitch)) = cell_at(grid, stride, ptr.pos, steps, rows, base)
+                if let Some((step, pitch)) = cell_at(grid, stride, ptr.pos, steps, pitches)
                 {
                     shift_sel(
                         notes,
@@ -1325,7 +1390,7 @@ fn editor_interact(
             }
             Some(Drag::Resize { idx, left }) => {
                 if let Some(n) = notes.get_mut(idx) {
-                    if let Some((step, _)) = cell_at(grid, stride, ptr.pos, steps, rows, base) {
+                    if let Some((step, _)) = cell_at(grid, stride, ptr.pos, steps, pitches) {
                         resize_note(n, step, left, steps);
                         roll.last_len = n.len.max(1);
                     }
@@ -1342,7 +1407,7 @@ fn editor_interact(
 
     if ptr.released {
         if let Some(Drag::Box { a, b }) = roll.drag.take() {
-            let hit = notes_in_box(notes, groups, grid, stride, a, b, base, rows);
+            let hit = notes_in_box(notes, groups, grid, stride, a, b, pitches);
             if ptr.ctrl {
                 for i in hit {
                     if !sel_has(&roll.sel, i) {
@@ -1364,7 +1429,7 @@ fn editor_interact(
     }
 }
 
-fn key_at(g: &RollGeom, keys: Rect, pos: Vec2, base: u8, offset_y: f32, head_h: f32) -> Option<u8> {
+fn key_at(g: &RollGeom, keys: Rect, pos: Vec2, pitches: &[u8], offset_y: f32, head_h: f32) -> Option<u8> {
     if pos.x < keys.min.x || pos.x >= keys.max.x {
         return None;
     }
@@ -1373,13 +1438,13 @@ fn key_at(g: &RollGeom, keys: Rect, pos: Vec2, base: u8, offset_y: f32, head_h: 
     if row < 0 || row >= g.rows as i32 {
         return None;
     }
-    Some(pitch_of_row(base, row as u32, g.rows))
+    pitch_at(pitches, row as u32)
 }
 
 pub fn draw_preview(ui: &mut Ui, node: &GraphNode, monitor: &Monitor) {
     let steps = node.loop_steps();
-    let base = node.view_base_pitch();
-    let g = geom(ui.scale(), steps, node.view_pitch_count());
+    let pitches = pitches_range(node.view_base_pitch(), node.view_pitch_count());
+    let g = geom(ui.scale(), steps, pitches.len() as u32);
     let window = node.loop_beats().max(1e-9);
     let song = monitor.song_beats();
     let play_step = {
@@ -1388,7 +1453,7 @@ pub fn draw_preview(ui: &mut Ui, node: &GraphNode, monitor: &Monitor) {
     };
 
     let area = ui.area("preview", g.size);
-    let grid = draw_grid(ui, area.rect, &g, base, true, true);
+    let grid = draw_grid(ui, area.rect, &g, &pitches, true, true);
 
     let sounding = monitor.sounding_notes(&node.id);
     let mut fading = false;
@@ -1406,7 +1471,7 @@ pub fn draw_preview(ui: &mut Ui, node: &GraphNode, monitor: &Monitor) {
         let win0 = (song / window).floor() * window;
         let win1 = win0 + window;
         for gho in &st.ghosts {
-            let Some(row) = row_of_pitch(base, gho.pitch, g.rows) else {
+            let Some(row) = row_of_pitch(&pitches, gho.pitch) else {
                 continue;
             };
             let t0 = gho.on.max(win0);
@@ -1484,15 +1549,16 @@ mod tests {
         let grid = Rect::from_min_size(Vec2::new(10.0, 20.0), Vec2::new(160.0, 120.0));
         let stride = Vec2::new(10.0, 10.0);
         let base = 60;
+        let pitches = pitches_range(base, SEQ_PITCHES);
         assert_eq!(
-            cell_at(grid, stride, Vec2::new(10.0, 20.0), 16, SEQ_PITCHES, base),
+            cell_at(grid, stride, Vec2::new(10.0, 20.0), 16, &pitches),
             Some((0, pitch_of_row(base, 0, SEQ_PITCHES)))
         );
         assert_eq!(
-            cell_at(grid, stride, Vec2::new(25.0, 35.0), 16, SEQ_PITCHES, base),
+            cell_at(grid, stride, Vec2::new(25.0, 35.0), 16, &pitches),
             Some((1, pitch_of_row(base, 1, SEQ_PITCHES)))
         );
-        assert_eq!(cell_at(grid, stride, Vec2::new(9.0, 20.0), 16, SEQ_PITCHES, base), None);
+        assert_eq!(cell_at(grid, stride, Vec2::new(9.0, 20.0), 16, &pitches), None);
     }
 
     #[test]
@@ -1510,6 +1576,7 @@ mod tests {
         let grid = Rect::from_min_size(Vec2::ZERO, Vec2::new(200.0, 200.0));
         let stride = Vec2::new(12.0, 11.0);
         let base = 60;
+        let pitches = pitches_range(base, SEQ_PITCHES);
         let pitch = pitch_of_row(base, 2, SEQ_PITCHES);
         let notes = vec![SeqNote {
             step: 0,
@@ -1517,17 +1584,17 @@ mod tests {
             len: 4,
             group: 0,
         }];
-        let r = note_rect(grid, stride, notes[0], base, SEQ_PITCHES).unwrap();
+        let r = note_rect(grid, stride, notes[0], &pitches).unwrap();
         assert_eq!(
-            hit_note(&notes, &[], grid, stride, Vec2::new(r.max.x - 1.0, r.min.y + 2.0), base, SEQ_PITCHES),
+            hit_note(&notes, &[], grid, stride, Vec2::new(r.max.x - 1.0, r.min.y + 2.0), &pitches),
             Some((0, Edge::Right))
         );
         assert_eq!(
-            hit_note(&notes, &[], grid, stride, Vec2::new(r.min.x + 1.0, r.min.y + 2.0), base, SEQ_PITCHES),
+            hit_note(&notes, &[], grid, stride, Vec2::new(r.min.x + 1.0, r.min.y + 2.0), &pitches),
             Some((0, Edge::Left))
         );
         assert_eq!(
-            hit_note(&notes, &[], grid, stride, r.min + Vec2::new(r.width() * 0.5, 2.0), base, SEQ_PITCHES),
+            hit_note(&notes, &[], grid, stride, r.min + Vec2::new(r.width() * 0.5, 2.0), &pitches),
             Some((0, Edge::Body))
         );
     }
@@ -1568,11 +1635,12 @@ mod tests {
 
     #[test]
     fn key_hit_tracks_vertical_scroll() {
+        let pitches = pitches_range(EDITOR_BASE, EDITOR_ROWS);
         let g = geom_editor(1.0, 16, EDITOR_ROWS, 1.0);
         let keys = Rect::from_min_size(Vec2::ZERO, Vec2::new(g.label_w, 200.0));
-        let row = row_of_pitch(EDITOR_BASE, 60, EDITOR_ROWS).unwrap();
+        let row = row_of_pitch(&pitches, 60).unwrap();
         let pos = Vec2::new(g.label_w * 0.5, 4.0);
-        let pitch = key_at(&g, keys, pos, EDITOR_BASE, row as f32 * g.stride.y, 0.0).unwrap();
+        let pitch = key_at(&g, keys, pos, &pitches, row as f32 * g.stride.y, 0.0).unwrap();
         assert_eq!(pitch, 60);
     }
 
@@ -1637,6 +1705,13 @@ mod tests {
     }
 
     #[test]
+    fn playhead_x_moves_inside_a_step() {
+        assert!((playhead_x(0.0, 20.0) - 0.0).abs() < 1e-4);
+        assert!((playhead_x(BEATS_PER_STEP as f64 * 0.5, 20.0) - 10.0).abs() < 1e-4);
+        assert!((playhead_x(BEATS_PER_STEP as f64 * 2.0, 20.0) - 40.0).abs() < 1e-4);
+    }
+
+    #[test]
     fn full_roll_shows_c4() {
         let grid = Rect::from_min_size(Vec2::ZERO, Vec2::new(400.0, 2000.0));
         let stride = Vec2::new(20.0, 18.0);
@@ -1646,11 +1721,13 @@ mod tests {
             len: 1,
             group: 0,
         };
-        let r = note_rect(grid, stride, note, EDITOR_BASE, EDITOR_ROWS).unwrap();
-        let row = row_of_pitch(EDITOR_BASE, 60, EDITOR_ROWS).unwrap();
+        let pitches = pitches_range(EDITOR_BASE, EDITOR_ROWS);
+        let seq = pitches_range(EDITOR_BASE, SEQ_PITCHES);
+        let r = note_rect(grid, stride, note, &pitches).unwrap();
+        let row = row_of_pitch(&pitches, 60).unwrap();
         assert_eq!(r.min.y, row as f32 * stride.y);
-        assert!(hit_note(&[note], &[], grid, stride, r.min + Vec2::new(2.0, 2.0), EDITOR_BASE, EDITOR_ROWS).is_some());
-        assert!(note_rect(grid, stride, note, EDITOR_BASE, SEQ_PITCHES).is_none());
+        assert!(hit_note(&[note], &[], grid, stride, r.min + Vec2::new(2.0, 2.0), &pitches).is_some());
+        assert!(note_rect(grid, stride, note, &seq).is_none());
     }
 
     #[test]
@@ -1672,8 +1749,26 @@ mod tests {
             visible: false,
             play_inst: String::new(),
         }];
-        let r = note_rect(grid, stride, notes[0], base, SEQ_PITCHES).unwrap();
-        assert!(hit_note(&notes, &groups, grid, stride, r.min + Vec2::new(2.0, 2.0), base, SEQ_PITCHES).is_none());
+        let pitches = pitches_range(base, SEQ_PITCHES);
+        let r = note_rect(grid, stride, notes[0], &pitches).unwrap();
+        assert!(hit_note(&notes, &groups, grid, stride, r.min + Vec2::new(2.0, 2.0), &pitches).is_none());
+    }
+
+    #[test]
+    fn compact_hides_empty_octaves() {
+        let notes = vec![SeqNote {
+            step: 0,
+            pitch: 60,
+            len: 1,
+            group: 0,
+        }];
+        let full = pitches_editor(&notes, false);
+        let compact = pitches_editor(&notes, true);
+        assert_eq!(full.len(), EDITOR_ROWS as usize);
+        assert_eq!(compact.len(), 12);
+        assert!(compact.contains(&60));
+        assert!(!compact.contains(&48));
+        assert_eq!(pitches_editor(&[], true).len(), EDITOR_ROWS as usize);
     }
 
     #[test]

@@ -255,6 +255,10 @@ impl Sample {
 
 pub struct Project {
     pub main: GraphDoc,
+    pub title: String,
+    pub author: String,
+    pub original_author: String,
+    pub remix: bool,
     pub sequences: Vec<Sequence>,
     pub instruments: Vec<Instrument>,
     pub samples: Vec<Sample>,
@@ -273,6 +277,10 @@ impl Project {
     pub fn new_default() -> Self {
         let mut p = Self {
             main: GraphDoc::new_default(),
+            title: String::new(),
+            author: String::new(),
+            original_author: String::new(),
+            remix: false,
             sequences: vec![
                 Sequence {
                     id: "s1".into(),
@@ -327,6 +335,18 @@ impl Project {
         p
     }
 
+    pub fn viz_credit(&self) -> String {
+        let author = self.author.trim();
+        if author.is_empty() {
+            return String::new();
+        }
+        if self.remix {
+            format!("Remixed by: {author}")
+        } else {
+            format!("Author: {author}")
+        }
+    }
+
     pub fn add_sequence(&mut self) -> String {
         let id = format!("s{}", self.next_seq);
         self.next_seq += 1;
@@ -345,12 +365,24 @@ impl Project {
         id
     }
 
-    pub fn import_midi(&mut self, bytes: &[u8]) -> Result<usize, String> {
+    pub fn import_midi(&mut self, bytes: &[u8], as_groups: bool, name: &str) -> Result<usize, String> {
         let tracks = super::midi::parse_midi(bytes)?;
+        if as_groups {
+            self.import_midi_groups(tracks, name)
+        } else {
+            self.import_midi_sequences(tracks)
+        }
+    }
+
+    fn import_midi_sequences(&mut self, tracks: Vec<super::midi::MidiTrack>) -> Result<usize, String> {
         let n = tracks.len();
+        let mut first = None;
         for t in tracks {
             let id = format!("s{}", self.next_seq);
             self.next_seq += 1;
+            if first.is_none() {
+                first = Some(id.clone());
+            }
             self.sequences.push(Sequence {
                 id,
                 name: t.name,
@@ -362,7 +394,56 @@ impl Project {
                 next_group: 1,
             });
         }
+        if let Some(id) = first {
+            self.select_sequence(&id);
+        }
         Ok(n)
+    }
+
+    fn import_midi_groups(&mut self, tracks: Vec<super::midi::MidiTrack>, name: &str) -> Result<usize, String> {
+        let Some(first) = tracks.first() else {
+            return Err("No notes in MIDI file".into());
+        };
+        let bars = tracks.iter().map(|t| t.bars).max().unwrap_or(1);
+        let octave = tracks.iter().map(|t| t.octave).min().unwrap_or(4);
+        let id = format!("s{}", self.next_seq);
+        self.next_seq += 1;
+        let mut seq = Sequence {
+            id: id.clone(),
+            name: if name.is_empty() {
+                "MIDI".into()
+            } else {
+                name.to_string()
+            },
+            seq_loop_bars: bars,
+            seq_octave: octave,
+            notes: Vec::new(),
+            play_inst: String::new(),
+            groups: vec![default_note_group(String::new())],
+            next_group: 1,
+        };
+        seq.ensure_groups();
+        if let Some(g) = seq.groups.iter_mut().find(|g| g.id == DEFAULT_GROUP_ID) {
+            g.name = first.name.clone();
+        }
+        for (i, t) in tracks.into_iter().enumerate() {
+            let gid = if i == 0 {
+                DEFAULT_GROUP_ID
+            } else {
+                let gid = seq.add_group();
+                if let Some(g) = seq.groups.iter_mut().find(|g| g.id == gid) {
+                    g.name = t.name;
+                }
+                gid
+            };
+            for mut n in t.notes {
+                n.group = gid;
+                seq.notes.push(n);
+            }
+        }
+        self.sequences.push(seq);
+        self.select_sequence(&id);
+        Ok(1)
     }
 
     pub fn remove_sequence(&mut self, id: &str) {
@@ -895,5 +976,77 @@ mod tests {
             n1
         );
         assert!(!p.merge_sequence("s1", "s1"));
+    }
+
+    #[test]
+    fn import_midi_tracks_as_groups() {
+        use midly::{num::u15, Format, Header, MetaMessage, MidiMessage, Smf, Timing, TrackEvent, TrackEventKind};
+        fn on(delta: u32, key: u8) -> TrackEvent<'static> {
+            TrackEvent {
+                delta: delta.into(),
+                kind: TrackEventKind::Midi {
+                    channel: 0.into(),
+                    message: MidiMessage::NoteOn {
+                        key: key.into(),
+                        vel: 100.into(),
+                    },
+                },
+            }
+        }
+        fn off(delta: u32, key: u8) -> TrackEvent<'static> {
+            TrackEvent {
+                delta: delta.into(),
+                kind: TrackEventKind::Midi {
+                    channel: 0.into(),
+                    message: MidiMessage::NoteOff {
+                        key: key.into(),
+                        vel: 0.into(),
+                    },
+                },
+            }
+        }
+        let t0 = vec![
+            TrackEvent {
+                delta: 0.into(),
+                kind: TrackEventKind::Meta(MetaMessage::TrackName(b"Lead")),
+            },
+            on(0, 60),
+            off(24, 60),
+        ];
+        let t1 = vec![
+            TrackEvent {
+                delta: 0.into(),
+                kind: TrackEventKind::Meta(MetaMessage::TrackName(b"Bass")),
+            },
+            on(0, 48),
+            off(24, 48),
+        ];
+        let smf = Smf {
+            header: Header::new(Format::Parallel, Timing::Metrical(u15::new(96))),
+            tracks: vec![t0, t1],
+        };
+        let mut buf = Vec::new();
+        smf.write(&mut buf).unwrap();
+        let mut p = Project::new_default();
+        let before = p.sequences.len();
+        assert_eq!(p.import_midi(&buf, true, "Song").unwrap(), 1);
+        assert_eq!(p.sequences.len(), before + 1);
+        let seq = p.sequences.last().unwrap();
+        assert_eq!(seq.name, "Song");
+        assert_eq!(seq.groups.len(), 2);
+        assert_eq!(seq.groups[0].name, "Lead");
+        assert_eq!(seq.groups[1].name, "Bass");
+        assert!(seq.notes.iter().any(|n| n.pitch == 60 && n.group == DEFAULT_GROUP_ID));
+        assert!(seq.notes.iter().any(|n| n.pitch == 48 && n.group == seq.groups[1].id));
+    }
+
+    #[test]
+    fn viz_credit_author_and_remix() {
+        let mut p = Project::new_default();
+        assert_eq!(p.viz_credit(), "");
+        p.author = "Ada".into();
+        assert_eq!(p.viz_credit(), "Author: Ada");
+        p.remix = true;
+        assert_eq!(p.viz_credit(), "Remixed by: Ada");
     }
 }

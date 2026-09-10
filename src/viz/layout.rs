@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
 use super::frame::{
-    in_when, Note, Wave, BEHIND_BEATS, FADE_IN_X, FADE_PAST, HIT_W, HIT_X, PRESS_IN, PRESS_OUT,
-    WAVE_BINS,
+    in_when, Note, Wave, BEHIND_BEATS, FADE_IN_X, FADE_PAST, HIT_W, HIT_X, NOTE_TOP, PRESS_IN,
+    PRESS_OUT, WAVE_BINS,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -78,9 +78,11 @@ fn lane_band(i: usize, n: usize, notes_h: f32) -> (f32, f32) {
     (i as f32 * (h + gap), h)
 }
 
-pub fn note_quads(notes: &[Note], now: f64, window: f64, notes_h: f32) -> Vec<Quad> {
+pub fn note_quads(notes: &[Note], now: f64, window: f64, notes_h: f32, top: f32) -> Vec<Quad> {
     let window = window.max(0.25);
     let notes_h = notes_h.clamp(0.2, 1.0);
+    let top = top.clamp(0.0, (notes_h - 0.05).max(0.0));
+    let body = (notes_h - top).max(0.05);
     let mut lanes: Vec<u32> = notes
         .iter()
         .map(|n| n.lane)
@@ -102,7 +104,8 @@ pub fn note_quads(notes: &[Note], now: f64, window: f64, notes_h: f32) -> Vec<Qu
         let lane_notes: Vec<&Note> = notes.iter().filter(|n| n.lane == *lane).collect();
         let (lo, hi) = pitch_range_refs(&lane_notes);
         let span = (hi - lo).max(1) as f32;
-        let (band_y, band_h) = lane_band(li, lane_n, notes_h);
+        let (band_y, band_h) = lane_band(li, lane_n, body);
+        let band_y = band_y + top;
         let row = band_h / span;
         let h = (row * 0.72).max(0.008);
         for n in &lane_notes {
@@ -114,9 +117,9 @@ pub fn note_quads(notes: &[Note], now: f64, window: f64, notes_h: f32) -> Vec<Qu
 
     out.push(Quad {
         x: HIT_X - HIT_W * 0.5,
-        y: 0.0,
+        y: top,
         w: HIT_W,
-        h: notes_h,
+        h: body,
         color: [1.0, 0.94, 0.82, 0.42],
         round: 0.0,
         glow: 1.0,
@@ -218,31 +221,39 @@ pub fn wave_quads(waves: &[Wave], notes_h: f32) -> Vec<Quad> {
     }
     let top = notes_h.clamp(0.2, 0.95) + 0.014;
     let bot = 0.988;
-    let band_h = (bot - top).max(0.06);
+    let band_h = (bot - top).max(0.04);
     let n = waves.len().max(1);
     let gap = 0.01;
-    let side = band_h.min((0.976 - gap * (n.saturating_sub(1) as f32)) / n as f32);
-    let total_w = n as f32 * side + (n - 1) as f32 * gap;
+    let box_w = ((0.976 - gap * (n.saturating_sub(1) as f32)) / n as f32).max(0.04);
+    let box_h = (box_w * 0.56).min(band_h * 0.92).max(0.03);
+    let total_w = n as f32 * box_w + (n - 1) as f32 * gap;
     let x0 = ((1.0 - total_w) * 0.5).max(0.012);
     let mut out = Vec::new();
     for (i, w) in waves.iter().enumerate() {
-        let x = x0 + i as f32 * (side + gap);
-        let y = top + (band_h - side) * 0.5;
-        out.extend(outline_quads(x, y, side, side, (side * 0.012).max(0.0014), [
-            0.88, 0.88, 0.92, 0.16,
-        ]));
+        let x = x0 + i as f32 * (box_w + gap);
+        let y = top + (band_h - box_h) * 0.5;
+        out.push(Quad {
+            x,
+            y,
+            w: box_w,
+            h: box_h,
+            color: [0.16, 0.16, 0.20, 0.72],
+            round: 1.0,
+            glow: 0.0,
+        });
         let samples = downsample(&w.samples, WAVE_BINS);
         if samples.len() < 2 {
             continue;
         }
-        let pad = side * 0.08;
-        let inner_x = x + pad;
-        let inner_y = y + pad;
-        let inner_w = (side - pad * 2.0).max(0.01);
-        let inner_h = inner_w;
+        let pad_x = box_w * 0.08;
+        let pad_y = box_h * 0.14;
+        let inner_x = x + pad_x;
+        let inner_y = y + pad_y;
+        let inner_w = (box_w - pad_x * 2.0).max(0.01);
+        let inner_h = (box_h - pad_y * 2.0).max(0.01);
         let mid = inner_y + inner_h * 0.5;
         let half = inner_h * 0.42;
-        let th = (side * 0.018).max(0.0016);
+        let th = (box_h * 0.045).max(0.0014);
         let mut c = w.color;
         c[3] = 0.92;
         let n_s = (samples.len() - 1) as f32;
@@ -257,15 +268,6 @@ pub fn wave_quads(waves: &[Wave], notes_h: f32) -> Vec<Quad> {
         }
     }
     out
-}
-
-fn outline_quads(x: f32, y: f32, w: f32, h: f32, th: f32, color: [f32; 4]) -> [Quad; 4] {
-    [
-        Quad { x, y, w, h: th, color, round: 0.0, glow: 0.0 },
-        Quad { x, y: y + h - th, w, h: th, color, round: 0.0, glow: 0.0 },
-        Quad { x, y, w: th, h, color, round: 0.0, glow: 0.0 },
-        Quad { x: x + w - th, y, w: th, h, color, round: 0.0, glow: 0.0 },
-    ]
 }
 
 fn segment_quad(x0: f32, y0: f32, x1: f32, y1: f32, th: f32, color: [f32; 4]) -> Quad {
@@ -339,7 +341,7 @@ mod tests {
     #[test]
     fn future_note_sits_to_the_right_of_hit() {
         let notes = [note(60, 4.0, 1.0)];
-        let qs = note_quads(&notes, 0.0, 8.0, 1.0);
+        let qs = note_quads(&notes, 0.0, 8.0, 1.0, NOTE_TOP);
         let n = qs.iter().find(|q| q.round > 0.5).expect("note quad");
         assert!(n.x > HIT_X + 0.2, "future should be right of hit, x={}", n.x);
     }
@@ -347,7 +349,7 @@ mod tests {
     #[test]
     fn now_note_crosses_hit_line() {
         let notes = [note(60, 0.0, 1.0)];
-        let qs = note_quads(&notes, 0.2, 8.0, 1.0);
+        let qs = note_quads(&notes, 0.2, 8.0, 1.0, NOTE_TOP);
         let n = qs.iter().find(|q| q.round > 0.5).expect("note quad");
         assert!(n.x <= HIT_X + 0.02);
         assert!(n.x + n.w > HIT_X);
@@ -357,7 +359,7 @@ mod tests {
     fn past_note_keeps_full_width() {
         let notes = [note(60, 0.0, 1.0)];
         let window = 8.0;
-        let qs = note_quads(&notes, 2.0, window, 1.0);
+        let qs = note_quads(&notes, 2.0, window, 1.0, NOTE_TOP);
         let n = qs.iter().find(|q| q.round > 0.5).expect("note quad");
         let usable = 1.0 - HIT_X;
         let want = (1.0 / window) as f32 * usable;
@@ -368,8 +370,8 @@ mod tests {
     #[test]
     fn press_moves_note_down() {
         let notes = [note(60, 0.0, 2.0)];
-        let rest = note_quads(&notes, -0.5, 8.0, 1.0);
-        let down = note_quads(&notes, 0.5, 8.0, 1.0);
+        let rest = note_quads(&notes, -0.5, 8.0, 1.0, NOTE_TOP);
+        let down = note_quads(&notes, 0.5, 8.0, 1.0, NOTE_TOP);
         let y0 = rest.iter().find(|q| q.round > 0.5).unwrap().y;
         let y1 = down.iter().find(|q| q.round > 0.5).unwrap().y;
         assert!(y1 > y0 + 0.001, "pressed y={y1} rest y={y0}");
@@ -381,7 +383,7 @@ mod tests {
         lo.color = [1.0, 0.0, 0.0, 1.0];
         let mut hi = note(72, 0.0, 1.0);
         hi.color = [0.0, 1.0, 0.0, 1.0];
-        let qs = note_quads(&[lo, hi], 0.0, 8.0, 1.0);
+        let qs = note_quads(&[lo, hi], 0.0, 8.0, 1.0, NOTE_TOP);
         let loq = qs.iter().find(|q| q.color[0] > 0.5).unwrap();
         let hiq = qs.iter().find(|q| q.color[1] > 0.5).unwrap();
         assert!(hiq.y < loq.y, "high y={} low y={}", hiq.y, loq.y);
@@ -395,7 +397,7 @@ mod tests {
         let mut b = note(60, 0.0, 1.0);
         b.lane = 1;
         b.color = [0.0, 1.0, 0.0, 1.0];
-        let qs = note_quads(&[a, b], 0.0, 8.0, 1.0);
+        let qs = note_quads(&[a, b], 0.0, 8.0, 1.0, NOTE_TOP);
         let qa = qs.iter().find(|q| q.color[0] > 0.5).unwrap();
         let qb = qs.iter().find(|q| q.color[1] > 0.5).unwrap();
         assert!(qa.y + qa.h <= qb.y + 0.002 || qb.y + qb.h <= qa.y + 0.002);
@@ -409,7 +411,7 @@ mod tests {
         let mut high = note(84, 0.0, 1.0);
         high.lane = 1;
         high.color = [0.0, 1.0, 0.0, 1.0];
-        let qs = note_quads(&[low, high], 0.0, 8.0, 1.0);
+        let qs = note_quads(&[low, high], 0.0, 8.0, 1.0, NOTE_TOP);
         let loq = qs.iter().find(|q| q.color[0] > 0.5).unwrap();
         let hiq = qs.iter().find(|q| q.color[1] > 0.5).unwrap();
         assert!(hiq.y + hiq.h <= loq.y + 0.002, "high lane y={} low lane y={}", hiq.y, loq.y);
@@ -418,8 +420,8 @@ mod tests {
     #[test]
     fn played_note_fades_out() {
         let notes = [note(60, 0.0, 1.0)];
-        let live = note_quads(&notes, 0.5, 8.0, 1.0);
-        let gone = note_quads(&notes, 2.2, 8.0, 1.0);
+        let live = note_quads(&notes, 0.5, 8.0, 1.0, NOTE_TOP);
+        let gone = note_quads(&notes, 2.2, 8.0, 1.0, NOTE_TOP);
         let a0 = live
             .iter()
             .filter(|q| q.round > 0.5)
@@ -437,14 +439,29 @@ mod tests {
     #[test]
     fn incoming_note_fades_in_from_right() {
         let notes = [note(60, 7.9, 0.4)];
-        let edge = note_quads(&notes, 0.0, 8.0, 1.0);
+        let edge = note_quads(&notes, 0.0, 8.0, 1.0, NOTE_TOP);
         let n = edge.iter().find(|q| q.round > 0.5).expect("incoming note");
         assert!(n.x > 0.9, "incoming should sit near the right edge, x={}", n.x);
         assert!(n.color[3] < 0.75, "incoming should be faded, a={}", n.color[3]);
         let notes2 = [note(60, 4.0, 0.4)];
-        let solid = note_quads(&notes2, 0.0, 8.0, 1.0);
+        let solid = note_quads(&notes2, 0.0, 8.0, 1.0, NOTE_TOP);
         let n2 = solid.iter().find(|q| q.round > 0.5).unwrap();
         assert!(n2.color[3] > n.color[3], "mid a={} edge a={}", n2.color[3], n.color[3]);
+    }
+
+    #[test]
+    fn notes_leave_top_margin() {
+        let notes = [note(72, 0.0, 1.0)];
+        let qs = note_quads(&notes, 0.0, 8.0, 1.0, NOTE_TOP);
+        let n = qs.iter().find(|q| q.round > 0.5).expect("note");
+        assert!(n.y >= NOTE_TOP - 0.001, "top note y={} pad={}", n.y, NOTE_TOP);
+        let hit = qs.iter().find(|q| q.round < 0.5).expect("hit");
+        assert!(hit.y >= NOTE_TOP - 0.001);
+        let top = crate::viz::text::overlay_reserve("Title", "Author: Ada");
+        let qs = note_quads(&notes, 0.0, 8.0, 1.0, top);
+        let n = qs.iter().find(|q| q.round > 0.5).expect("note");
+        assert!(n.y >= top - 0.001, "overlay note y={} pad={}", n.y, top);
+        assert!(top > NOTE_TOP);
     }
 
     #[test]
@@ -460,15 +477,12 @@ mod tests {
             },
         ];
         let qs = wave_quads(&waves, 0.76);
-        let frames: Vec<&Quad> = qs
-            .iter()
-            .filter(|q| q.color[0] > 0.7 && q.w > q.h * 4.0)
-            .collect();
-        let y0 = frames.iter().map(|q| q.y).fold(f32::MAX, f32::min);
-        let tops: Vec<&Quad> = frames.iter().copied().filter(|q| (q.y - y0).abs() < 0.001).collect();
-        assert_eq!(tops.len(), 2);
-        assert!(tops.iter().all(|q| q.y >= 0.75));
-        assert!(tops[1].x > tops[0].x + tops[0].w * 0.4, "side by side");
-        assert!((tops[0].w - tops[1].w).abs() < 0.002, "equal squares");
+        let frames: Vec<&Quad> = qs.iter().filter(|q| q.round > 0.5 && q.glow < 0.5).collect();
+        assert_eq!(frames.len(), 2);
+        assert!(frames.iter().all(|q| q.y >= 0.75));
+        assert!(frames[1].x > frames[0].x + frames[0].w * 0.4, "side by side");
+        assert!((frames[0].w - frames[1].w).abs() < 0.002, "equal width");
+        assert!((frames[0].h - frames[1].h).abs() < 0.002, "equal height");
+        assert!(frames[0].h < frames[0].w * 0.7, "shorter than wide");
     }
 }

@@ -6,6 +6,7 @@
 mod frame;
 mod gpu;
 mod layout;
+mod text;
 
 pub use frame::{Frame, Note, Wave, MAX_WAVES, WAVE_BINS, WINDOW_BEATS};
 pub use gpu::Renderer;
@@ -39,5 +40,10 @@ mod tests {
     #[test]
     fn shaders_parse() {
         naga::front::wgsl::parse_str(include_str!("shaders.wgsl")).expect("viz wgsl");
+    }
+
+    #[test]
+    fn window_zooms_in_thirty_percent() {
+        assert!((WINDOW_BEATS * 1.3 - 8.0).abs() < 1e-9);
     }
 }

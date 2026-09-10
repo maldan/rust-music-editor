@@ -129,7 +129,9 @@ fn fs_note(in: FsOut) -> @location(0) vec4<f32> {
     let pad_px = 4.0 * in.glow;
     let outer = inner + vec2<f32>(pad_px * 2.0);
     let p = (in.uv - vec2<f32>(0.5)) * outer;
-    let r = select(0.0, min(7.0, min(inner.x, inner.y) * 0.5), in.rounded >= 0.5);
+    let r_note = min(7.0, min(inner.x, inner.y) * 0.5);
+    let r_box = min(inner.x, inner.y) * 0.18;
+    let r = select(0.0, select(r_box, r_note, in.glow >= 0.5), in.rounded >= 0.5);
     let d = sd_round_box(p, inner * 0.5, r);
     let aa = max(fwidth(d), 0.75);
     let fill = 1.0 - smoothstep(-aa, aa, d);

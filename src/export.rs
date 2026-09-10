@@ -12,7 +12,7 @@ use crate::viz::{self, Frame};
 pub const SAMPLE_RATE: f32 = 44_100.0;
 pub const MAX_BARS: i32 = 1024;
 const RENDER_BLOCK: usize = 512;
-pub const VIDEO_FPS: f32 = 30.0;
+pub const VIDEO_FPS: f32 = 60.0;
 pub const VIDEO_W: u32 = 1920;
 pub const VIDEO_H: u32 = 1080;
 
@@ -262,6 +262,8 @@ fn headless_gpu() -> Result<(wgpu::Device, wgpu::Queue), String> {
 pub fn write_mp4(
     patch: &Patch,
     sequences: &[Sequence],
+    title: &str,
+    credit: &str,
     bars: u32,
     path: &Path,
     progress: &AtomicU32,
@@ -273,6 +275,8 @@ pub fn write_mp4(
     }
     let n_frames = video_frame_count(n, SAMPLE_RATE, VIDEO_FPS);
     let notes = Arc::new(viz_notes(patch, sequences));
+    let title = title.to_string();
+    let credit = credit.to_string();
     let monitor = Arc::new(Monitor::default());
     monitor.set_horizon((*notes).clone());
     let (mut live, mut graph) =
@@ -347,6 +351,8 @@ pub fn write_mp4(
                 reset: fi == 0,
                 width: VIDEO_W,
                 height: VIDEO_H,
+                title: title.clone(),
+                credit: credit.clone(),
             };
             let rgba = viz.render_rgba(&device, &queue, VIDEO_W, VIDEO_H, &frame)?;
             stdin.write_all(&rgba).map_err(|e| format!("ffmpeg pipe: {e}"))?;

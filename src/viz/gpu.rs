@@ -1,8 +1,9 @@
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-use super::frame::{Frame, NOTES_H};
+use super::frame::{Frame, NOTES_H, NOTE_TOP};
 use super::layout::{note_quads, wave_quads};
+use super::text::{overlay_quads, overlay_reserve};
 
 const MAX_NOTES: usize = 8192;
 
@@ -236,8 +237,22 @@ impl Renderer {
             }),
         );
 
-        let mut quads = note_quads(&frame.notes, frame.now_beats, frame.window_beats, notes_h);
+        let top = overlay_reserve(&frame.title, &frame.credit).max(NOTE_TOP);
+        let mut quads = note_quads(
+            &frame.notes,
+            frame.now_beats,
+            frame.window_beats,
+            notes_h,
+            top,
+        );
         quads.extend(wave_quads(&frame.waves, notes_h));
+        let aspect = w as f32 / h as f32;
+        let overlay = overlay_quads(&frame.title, &frame.credit, aspect);
+        let note_cap = MAX_NOTES.saturating_sub(overlay.len());
+        if quads.len() > note_cap {
+            quads.truncate(note_cap);
+        }
+        quads.extend(overlay);
         let notes: Vec<NoteInst> = quads
             .iter()
             .take(MAX_NOTES)

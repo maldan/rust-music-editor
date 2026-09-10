@@ -676,7 +676,7 @@ fn draw_body(
             ui.node_port(NodePortSide::Input, "in", port::AUDIO);
             ui.node_port(NodePortSide::Input, "gain", port::AUDIO);
             if !gain_from_cv {
-                labeled_slider(ui, "Volume", &mut node.gain, 0.0..=1.5);
+                labeled_slider(ui, "Volume", &mut node.gain, 0.0..=4.0);
             }
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
