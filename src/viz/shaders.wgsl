@@ -16,6 +16,7 @@ struct FsOut {
     @location(2) size_px: vec2<f32>,
     @location(3) rounded: f32,
     @location(4) glow: f32,
+    @location(5) stroke: f32,
 }
 
 @vertex
@@ -32,6 +33,7 @@ fn vs_fs(@builtin(vertex_index) vid: u32) -> FsOut {
     out.size_px = uni.size;
     out.rounded = 0.0;
     out.glow = 0.0;
+    out.stroke = 0.0;
     return out;
 }
 
@@ -81,6 +83,7 @@ fn vs_gonio(@builtin(vertex_index) vid: u32, @location(0) lr: vec2<f32>) -> FsOu
     out.size_px = vec2<f32>(0.0);
     out.rounded = 0.0;
     out.glow = 0.0;
+    out.stroke = 0.0;
     return out;
 }
 
@@ -106,7 +109,9 @@ fn vs_note(
     );
     let uv = corners[vid % 6u];
     let glow = extra.y;
-    let pad = vec2<f32>(4.0, 4.0) * glow / max(uni.size, vec2<f32>(1.0));
+    let stroke = extra.z;
+    let pad_px = 4.0 * glow + select(0.0, 2.0, stroke > 0.5);
+    let pad = vec2<f32>(pad_px, pad_px) / max(uni.size, vec2<f32>(1.0));
     let p = rect.xy - pad + uv * (rect.zw + pad * 2.0);
     var out: FsOut;
     out.clip = vec4<f32>(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0, 0.0, 1.0);
@@ -115,6 +120,7 @@ fn vs_note(
     out.size_px = rect.zw * uni.size;
     out.rounded = extra.x;
     out.glow = glow;
+    out.stroke = stroke;
     return out;
 }
 
@@ -126,7 +132,7 @@ fn sd_round_box(p: vec2<f32>, b: vec2<f32>, r: f32) -> f32 {
 @fragment
 fn fs_note(in: FsOut) -> @location(0) vec4<f32> {
     let inner = max(in.size_px, vec2<f32>(1.0));
-    let pad_px = 4.0 * in.glow;
+    let pad_px = 4.0 * in.glow + select(0.0, 2.0, in.stroke > 0.5);
     let outer = inner + vec2<f32>(pad_px * 2.0);
     let p = (in.uv - vec2<f32>(0.5)) * outer;
     let r_note = min(7.0, min(inner.x, inner.y) * 0.5);
@@ -134,6 +140,11 @@ fn fs_note(in: FsOut) -> @location(0) vec4<f32> {
     let r = select(0.0, select(r_box, r_note, in.glow >= 0.5), in.rounded >= 0.5);
     let d = sd_round_box(p, inner * 0.5, r);
     let aa = max(fwidth(d), 0.75);
+    if in.stroke > 0.5 {
+        let outer_a = 1.0 - smoothstep(-aa, aa, d);
+        let hole = 1.0 - smoothstep(-aa, aa, d + in.stroke);
+        return vec4<f32>(in.color.rgb, in.color.a * max(outer_a - hole, 0.0));
+    }
     let fill = 1.0 - smoothstep(-aa, aa, d);
     let edge = 1.0 - smoothstep(-r * 0.35, r * 0.15, d);
     let rgb = in.color.rgb * (0.82 + 0.22 * edge);

@@ -183,12 +183,11 @@ impl GraphDoc {
     }
 
     pub fn cue_play(&mut self) {
-        self.seek_beats = tick_to_beats(self.play_from);
-        self.seek_gen = self.seek_gen.wrapping_add(1);
+        self.reset_tick();
     }
 
     pub fn reset_tick(&mut self) {
-        self.seek_beats = 0.0;
+        self.seek_beats = tick_to_beats(self.play_from);
         self.seek_gen = self.seek_gen.wrapping_add(1);
     }
 
@@ -219,6 +218,7 @@ impl GraphDoc {
             n.unison.to_bits().hash(&mut h);
             n.detune.to_bits().hash(&mut h);
             n.unison_pan.to_bits().hash(&mut h);
+            n.unison_kind.hash(&mut h);
             n.pitch.to_bits().hash(&mut h);
             n.value.to_bits().hash(&mut h);
             n.gate_pattern.hash(&mut h);
@@ -235,6 +235,10 @@ impl GraphDoc {
             n.delay_time.to_bits().hash(&mut h);
             n.delay_feedback.to_bits().hash(&mut h);
             n.delay_mix.to_bits().hash(&mut h);
+            n.delay_damp.to_bits().hash(&mut h);
+            n.delay_ping_pong.hash(&mut h);
+            n.delay_sync.hash(&mut h);
+            n.delay_div.hash(&mut h);
             n.chorus_rate.to_bits().hash(&mut h);
             n.chorus_depth.to_bits().hash(&mut h);
             n.chorus_mix.to_bits().hash(&mut h);

@@ -26,7 +26,7 @@ impl Default for Frame {
     fn default() -> Self {
         Self {
             now_beats: 0.0,
-            window_beats: 8.0,
+            window_beats: WINDOW_BEATS,
             notes: Arc::new(Vec::new()),
             gonio: Vec::new(),
             waves: Vec::new(),
@@ -87,7 +87,7 @@ pub fn in_when(song: f64, when: &[(f64, f64)]) -> bool {
 
 pub const WINDOW_BEATS: f64 = 8.0 / 1.3;
 /// Keep notes until they have fully left the left edge.
-pub const BEHIND_BEATS: f64 = 8.0 / 1.3;
+pub const BEHIND_BEATS: f64 = WINDOW_BEATS;
 /// Hit line from the left of the frame (0.5 = center).
 pub const HIT_X: f32 = 0.35;
 pub const HIT_W: f32 = 0.002;

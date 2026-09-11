@@ -34,12 +34,11 @@ pub fn draw(
             if *playing {
                 if matches!(project.view, EditorView::Sample(_)) {
                     project.sample_seek = monitor.song_beats();
+                } else {
+                    project.main.seek_beats = monitor.song_beats().max(0.0);
                 }
                 *playing = false;
-            } else if matches!(project.view, EditorView::Sample(_)) {
-                *playing = true;
             } else {
-                project.main.cue_play();
                 *playing = true;
             }
         }

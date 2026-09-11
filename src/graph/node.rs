@@ -213,6 +213,9 @@ pub struct GraphNode {
     /// Unison stereo width, 0 = center, 1 = hard L/R spread.
     #[serde(default)]
     pub unison_pan: f32,
+    /// Index into [`UNISON_NAMES`]. Shape Synth only; 0 = Classic.
+    #[serde(default)]
+    pub unison_kind: usize,
     /// Frequency multiplier for Basic Synth (1 = unchanged, 2 = octave up).
     #[serde(default = "default_pitch")]
     pub pitch: f32,
@@ -249,6 +252,15 @@ pub struct GraphNode {
     pub delay_feedback: f32,
     #[serde(default = "default_delay_mix")]
     pub delay_mix: f32,
+    #[serde(default)]
+    pub delay_damp: f32,
+    #[serde(default)]
+    pub delay_ping_pong: bool,
+    #[serde(default)]
+    pub delay_sync: bool,
+    /// Index into [`GATE_DIV_NAMES`] when `delay_sync` is on.
+    #[serde(default = "default_delay_div")]
+    pub delay_div: usize,
     #[serde(default = "default_chorus_rate")]
     pub chorus_rate: f32,
     #[serde(default = "default_chorus_depth")]
@@ -642,6 +654,9 @@ fn default_delay_feedback() -> f32 {
 fn default_delay_mix() -> f32 {
     0.38
 }
+fn default_delay_div() -> usize {
+    2
+}
 fn default_chorus_rate() -> f32 {
     0.8
 }
@@ -807,6 +822,7 @@ impl GraphNode {
             unison: 1.0,
             detune: 0.0,
             unison_pan: 0.0,
+            unison_kind: 0,
             pitch: 1.0,
             value: 0.0,
             smooth_ms: 100.0,
@@ -823,6 +839,10 @@ impl GraphNode {
             delay_time: 0.28,
             delay_feedback: 0.42,
             delay_mix: 0.38,
+            delay_damp: 0.0,
+            delay_ping_pong: false,
+            delay_sync: false,
+            delay_div: 2,
             chorus_rate: 0.8,
             chorus_depth: 0.35,
             chorus_mix: 0.45,
@@ -977,6 +997,18 @@ impl GraphNode {
             .get(self.gate_div.min(GATE_DIV_BEATS.len() - 1))
             .copied()
             .unwrap_or(0.25)
+    }
+
+    pub fn delay_time_secs(&self, bpm: f32) -> f32 {
+        if self.delay_sync {
+            let beats = GATE_DIV_BEATS
+                .get(self.delay_div.min(GATE_DIV_BEATS.len() - 1))
+                .copied()
+                .unwrap_or(1.0) as f32;
+            (beats * 60.0 / bpm.max(1.0)).clamp(0.02, 7.5)
+        } else {
+            self.delay_time.clamp(0.02, 2.0)
+        }
     }
 
     /// Root `pitch` (semitone offset) → staggered chord tones.
@@ -1140,6 +1172,15 @@ pub const CHORD_NAMES: [&str; 9] = [
 pub const ARP_NAMES: [&str; 3] = ["Up", "Down", "UpDown"];
 
 pub const FILTER_NAMES: [&str; 4] = ["Low pass", "High pass", "Band pass", "Notch"];
+
+pub const UNISON_NAMES: [&str; 6] = [
+    "Classic",
+    "Shimmer",
+    "Noise",
+    "Phase Sync",
+    "Position Spread",
+    "Random Note",
+];
 
 pub const REV_NAMES: [&str; 3] = ["Room", "Plate", "Hall"];
 
@@ -1384,6 +1425,8 @@ mod tests {
         assert_eq!(NodeKind::Shape.title(), "Shape Synth");
         let shp = GraphNode::new("shp".into(), NodeKind::Shape, Vec2::ZERO);
         assert!(!shp.wave_half && !shp.wave_pulse && !shp.wave_abs);
+        assert_eq!(shp.unison_kind, 0);
+        assert_eq!(UNISON_NAMES[0], "Classic");
         assert_eq!(shp.wave_harms.len(), mega_audio::dsp::WAVE_HARMS);
         assert!((shp.wave_harms[0] - 1.0).abs() < 1e-6);
         assert_eq!(NodeKind::Morph.title(), "Morph");
@@ -1447,6 +1490,20 @@ mod tests {
         let n = GraphNode::new("f".into(), NodeKind::Filter, Vec2::ZERO);
         assert_eq!(n.filter_kind, 0);
         assert_eq!(FILTER_NAMES[1], "High pass");
+    }
+
+    #[test]
+    fn delay_defaults_plain() {
+        let n = GraphNode::new("dl".into(), NodeKind::Delay, Vec2::ZERO);
+        assert!(!n.delay_sync);
+        assert!(!n.delay_ping_pong);
+        assert_eq!(n.delay_div, 2);
+        assert!((n.delay_damp).abs() < 1e-6);
+        assert!((n.delay_time_secs(120.0) - 0.28).abs() < 1e-6);
+        let mut sync = n;
+        sync.delay_sync = true;
+        sync.delay_div = 2;
+        assert!((sync.delay_time_secs(120.0) - 0.5).abs() < 1e-6);
     }
 
     #[test]

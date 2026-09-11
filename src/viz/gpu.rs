@@ -259,7 +259,7 @@ impl Renderer {
             .map(|q| NoteInst {
                 rect: [q.x, q.y, q.w, q.h],
                 color: q.color,
-                extra: [q.round, q.glow, 0.0, 0.0],
+                extra: [q.round, q.glow, q.stroke, 0.0],
             })
             .collect();
         let note_n = notes.len();

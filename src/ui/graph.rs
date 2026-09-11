@@ -10,7 +10,7 @@ use crate::fft::{
     freq_ticks, spec_window, t_to_freq, view_freq_ticks, view_note_ticks, SPEC_BINS, SPEC_COLS,
 };
 use crate::graph::{
-    port, ARP_NAMES, CHORD_NAMES, FILTER_NAMES, GATE_DIV_NAMES, REV_NAMES, EqPt, GraphDoc, GraphNode, NodeKind, MIX_INS,
+    port, ARP_NAMES, CHORD_NAMES, FILTER_NAMES, GATE_DIV_NAMES, REV_NAMES, UNISON_NAMES, EqPt, GraphDoc, GraphNode, NodeKind, MIX_INS,
     NOTE_JOIN_INS, SEQ_OCTAVE_MIN,
 };
 use crate::monitor::{Monitor, GONIO_BINS};
@@ -546,6 +546,7 @@ fn draw_body(
                     });
                 });
                 ui.group("Unison", |ui| {
+                    ui.select("unison_kind", &mut node.unison_kind, &UNISON_NAMES);
                     ui.horizontal(|ui| {
                         ui.knob_sized("Amount", &mut node.unison, 1.0..=16.0, ks);
                         ui.knob_sized("Detune", &mut node.detune, 0.0..=100.0, ks);
@@ -857,9 +858,17 @@ fn draw_body(
         }
         NodeKind::Delay => {
             ui.node_port(NodePortSide::Input, "in", port::AUDIO);
-            labeled_slider(ui, "Delay time, sec", &mut node.delay_time, 0.05..=1.2);
+            ui.checkbox("Sync to BPM", &mut node.delay_sync);
+            if node.delay_sync {
+                ui.select("delay_div", &mut node.delay_div, &GATE_DIV_NAMES);
+                node.delay_div = node.delay_div.min(GATE_DIV_NAMES.len() - 1);
+            } else {
+                labeled_slider(ui, "Delay time, sec", &mut node.delay_time, 0.05..=2.0);
+            }
             labeled_slider(ui, "Feedback", &mut node.delay_feedback, 0.0..=0.9);
+            labeled_slider(ui, "Damp", &mut node.delay_damp, 0.0..=1.0);
             labeled_slider(ui, "Dry / Wet", &mut node.delay_mix, 0.0..=0.8);
+            ui.checkbox("Ping-pong", &mut node.delay_ping_pong);
             ui.node_port(NodePortSide::Output, "out", port::AUDIO);
         }
         NodeKind::Distortion => {

@@ -12,7 +12,7 @@ use mega_audio::dsp::{
     TranceGate, WaveShape, Waveform, Const, CurveEnv, pan_gains,
 };
 use mega_audio::graph::{Bypass, Graph, Node, NodeId, ProcessContext};
-use mega_audio::instrument::{AdditivePiano, AnalogDrums, KarplusStrong, PolyphonicInstrument};
+use mega_audio::instrument::{AdditivePiano, AnalogDrums, KarplusStrong, PolyphonicInstrument, UnisonMode};
 use mega_audio::note::{midi_to_freq, NoteEvent};
 use mega_audio::sample::{AudioClip, SamplePlayer};
 use mega_audio::{CaptureSource, CaptureTap};
@@ -63,6 +63,14 @@ fn apply_reverb(rv: &mut Reverb, n: &crate::graph::GraphNode) {
     rv.mix = n.rev_mix.clamp(0.0, 1.0);
     rv.predelay = (n.rev_predelay * 0.001).clamp(0.0, 0.08);
     rv.modulate = n.rev_mod.clamp(0.0, 1.0);
+}
+
+fn apply_delay(d: &mut Delay, n: &crate::graph::GraphNode, bpm: f32) {
+    d.delay_time = n.delay_time_secs(bpm);
+    d.feedback = n.delay_feedback.clamp(0.0, 0.92);
+    d.mix = n.delay_mix.clamp(0.0, 1.0);
+    d.damp = n.delay_damp.clamp(0.0, 1.0);
+    d.ping_pong = n.delay_ping_pong;
 }
 
 fn audio_in_wired(patch: &Patch, node: &str, port: &str) -> bool {
@@ -729,6 +737,7 @@ fn build_graph_at(
                 inst.set_unison(n.unison.round().clamp(1.0, 16.0) as usize);
                 inst.set_detune(n.detune);
                 inst.set_unison_pan(n.unison_pan);
+                inst.set_unison_mode(UnisonMode::from_index(n.unison_kind));
                 inst.set_pitch(n.pitch);
                 inst.set_use_amp_curve(n.vol_env.enabled);
                 inst.set_use_pitch_curve(n.pitch_env.enabled);
@@ -975,10 +984,8 @@ fn build_graph_at(
                 out_port.insert((n.id.clone(), "out".into()), Wire::stereo(id, 0, 1));
             }
             NodeKind::Delay => {
-                let mut delay = Delay::new(2.0, sample_rate);
-                delay.delay_time = n.delay_time.clamp(0.02, 1.8);
-                delay.feedback = n.delay_feedback.clamp(0.0, 0.92);
-                delay.mix = n.delay_mix.clamp(0.0, 1.0);
+                let mut delay = Delay::new(8.0, sample_rate);
+                apply_delay(&mut delay, n, patch.bpm);
                 let id = graph.add_node(Box::new(delay));
                 dsp.insert(n.id.clone(), id);
                 in_port.insert((n.id.clone(), "in".into()), Wire::stereo(id, 0, 1));
@@ -1405,6 +1412,7 @@ impl Live {
                         inst.set_unison(n.unison.round().clamp(1.0, 16.0) as usize);
                         inst.set_detune(n.detune);
                         inst.set_unison_pan(n.unison_pan);
+                        inst.set_unison_mode(UnisonMode::from_index(n.unison_kind));
                         inst.set_pitch(n.pitch);
                         inst.set_amp_curve(
                             &n.vol_env.knots(),
@@ -1490,9 +1498,7 @@ impl Live {
                 }
                 NodeKind::Delay => {
                     if let Some(d) = graph.node_mut::<Delay>(id) {
-                        d.delay_time = n.delay_time.clamp(0.02, 1.8);
-                        d.feedback = n.delay_feedback.clamp(0.0, 0.92);
-                        d.mix = n.delay_mix.clamp(0.0, 1.0);
+                        apply_delay(d, n, patch.bpm);
                     }
                 }
                 NodeKind::WaveSlice => {
@@ -4227,6 +4233,24 @@ mod tests {
     }
 
     #[test]
+    fn delay_sync_uses_bpm() {
+        let mut n = crate::graph::GraphNode::new("dl".into(), NodeKind::Delay, glam::Vec2::ZERO);
+        n.delay_sync = true;
+        n.delay_div = 2;
+        n.delay_damp = 0.4;
+        n.delay_ping_pong = true;
+        let mut patch = patch_with(vec![n], vec![]);
+        patch.bpm = 120.0;
+        let mon = Monitor::default();
+        let mut build = build_graph(&patch, 48_000.0, &mon);
+        let id = *build.dsp.get("dl").unwrap();
+        let d = build.graph.node_mut::<Delay>(id).unwrap();
+        assert!((d.delay_time - 0.5).abs() < 1e-5);
+        assert!((d.damp - 0.4).abs() < 1e-5);
+        assert!(d.ping_pong);
+    }
+
+    #[test]
     fn reverb_and_comp_are_dsp() {
         assert!(dsp_kind(NodeKind::Reverb));
         assert!(dsp_kind(NodeKind::Compressor));
@@ -4440,6 +4464,16 @@ mod tests {
         let mon = Monitor::default();
         let (live, _) = Live::new(&patch, 48_000.0, std::sync::Arc::new(mon));
         assert!((live.song_beats - from).abs() < 1e-9);
+    }
+
+    #[test]
+    fn reset_tick_returns_to_from() {
+        let mut p = crate::graph::Project::new_default();
+        p.main.play_from = 5;
+        p.main.seek_beats = 99.0;
+        p.main.reset_tick();
+        let from = 4.0 * BEATS_PER_BAR as f64;
+        assert!((p.main.seek_beats - from).abs() < 1e-9);
     }
 
     #[test]

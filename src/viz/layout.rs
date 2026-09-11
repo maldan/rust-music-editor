@@ -16,6 +16,8 @@ pub struct Quad {
     pub round: f32,
     /// 1 = SDF glow (notes / playhead).
     pub glow: f32,
+    /// Outline width in pixels; 0 = filled.
+    pub stroke: f32,
 }
 
 pub fn gonio_points(lr: &[[f32; 2]], max: usize) -> Vec<[f32; 2]> {
@@ -123,6 +125,7 @@ pub fn note_quads(notes: &[Note], now: f64, window: f64, notes_h: f32, top: f32)
         color: [1.0, 0.94, 0.82, 0.42],
         round: 0.0,
         glow: 1.0,
+        stroke: 0.0,
     });
     out
 }
@@ -211,6 +214,7 @@ fn push_note_quads(
             color,
             round: 1.0,
             glow: 1.0,
+            stroke: 0.0,
         });
     }
 }
@@ -237,9 +241,10 @@ pub fn wave_quads(waves: &[Wave], notes_h: f32) -> Vec<Quad> {
             y,
             w: box_w,
             h: box_h,
-            color: [0.16, 0.16, 0.20, 0.72],
+            color: [1.0, 1.0, 1.0, 0.42],
             round: 1.0,
             glow: 0.0,
+            stroke: 1.6,
         });
         let samples = downsample(&w.samples, WAVE_BINS);
         if samples.len() < 2 {
@@ -253,7 +258,7 @@ pub fn wave_quads(waves: &[Wave], notes_h: f32) -> Vec<Quad> {
         let inner_h = (box_h - pad_y * 2.0).max(0.01);
         let mid = inner_y + inner_h * 0.5;
         let half = inner_h * 0.42;
-        let th = (box_h * 0.045).max(0.0014);
+        let th = (box_h * 0.016).max(0.0006);
         let mut c = w.color;
         c[3] = 0.92;
         let n_s = (samples.len() - 1) as f32;
@@ -281,6 +286,7 @@ fn segment_quad(x0: f32, y0: f32, x1: f32, y1: f32, th: f32, color: [f32; 4]) ->
         color,
         round: 0.0,
         glow: 0.0,
+        stroke: 0.0,
     }
 }
 
@@ -484,5 +490,6 @@ mod tests {
         assert!((frames[0].w - frames[1].w).abs() < 0.002, "equal width");
         assert!((frames[0].h - frames[1].h).abs() < 0.002, "equal height");
         assert!(frames[0].h < frames[0].w * 0.7, "shorter than wide");
+        assert!(frames.iter().all(|q| q.stroke > 0.5 && q.color[3] < 0.7));
     }
 }

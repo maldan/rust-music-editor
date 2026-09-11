@@ -62,6 +62,7 @@ fn draw_line(out: &mut Vec<Quad>, text: &str, x0: f32, y0: f32, h: f32, aspect: 
                             color: COLOR,
                             round: 0.0,
                             glow: 0.0,
+                            stroke: 0.0,
                         });
                     }
                 }
